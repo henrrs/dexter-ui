@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 from urllib.parse import urlsplit
 from dexter.services.analytics_config import load_limits
 
@@ -254,7 +255,7 @@ def _verified_chunks(operations, operation_id: str, staging, pq):
 
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
-                           minimum_free: int, lease_lost=None) -> tuple[str, int, str]:
+                           minimum_free: int, lease_lost=None) -> tuple[Path, int, str]:
     """Download a complete Arrow result link before parsing it, so retries cannot duplicate rows."""
     result_path = None
     current_link = initial_link
@@ -299,7 +300,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     if declared_bytes > MAX_ARROW_CHUNK_BYTES:
                         raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
                 with tempfile.NamedTemporaryFile(prefix=f"chunk-{chunk_index:06d}-", suffix=".arrow", dir=staging, delete=False) as spool:
-                    result_path = spool.name
+                    result_path = Path(spool.name)
                     digest = hashlib.sha256()
                     downloaded_bytes = 0
                     while True:
