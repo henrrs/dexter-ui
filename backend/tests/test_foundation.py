@@ -60,7 +60,7 @@ class RuntimeFoundationTests(unittest.TestCase):
             migrate(db)
             with connect(db) as connection:
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 3)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operations'").fetchone()[0], 1)
 
     def test_operations_persist_validate_transitions_and_recover_after_restart(self):
@@ -89,6 +89,11 @@ class RuntimeFoundationTests(unittest.TestCase):
             self.assertEqual(service.request_cancel(queued["id"])["state"], "cancelled")
             running = service.create("cancel-request")
             service.transition(running["id"], "running")
+            with connect(db) as connection:
+                first_started = connection.execute("SELECT started_at FROM operations WHERE id=?", (running["id"],)).fetchone()[0]
+            service.transition(running["id"], "running", progress=12, message="Still running")
+            with connect(db) as connection:
+                self.assertEqual(connection.execute("SELECT started_at FROM operations WHERE id=?", (running["id"],)).fetchone()[0], first_started)
             self.assertTrue(service.request_cancel(running["id"])["cancel_requested"])
             with self.assertRaises(ValueError):
                 service.transition(running["id"], "succeeded", progress=101)

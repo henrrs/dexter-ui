@@ -31,4 +31,5 @@ export type Operation = {
   cancel_requested: boolean
   created_at: string
   updated_at: string
+  details?: { phase?: string; rows?: number; bytes?: number; files?: number; environment?: string; qualified_name?: string }
 }

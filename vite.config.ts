@@ -1,7 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-const apiPort = Number(process.env.DEXTER_PORT ?? '8000')
+const runtimeProcess = (globalThis as typeof globalThis & { process?: { env?: Record<string, string | undefined> } }).process
+const apiPort = Number(runtimeProcess?.env?.DEXTER_PORT ?? '8000')
 
 export default defineConfig({
   plugins: [react()],

@@ -11,7 +11,7 @@ class InvalidTransition(ValueError):
 
 TRANSITIONS = {
     "queued": {"running", "cancelled", "failed"},
-    "running": {"succeeded", "failed", "cancelled", "interrupted"},
+    "running": {"running", "succeeded", "failed", "cancelled", "interrupted"},
     "succeeded": set(),
     "failed": set(),
     "cancelled": set(),

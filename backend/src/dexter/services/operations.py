@@ -45,7 +45,7 @@ class OperationsService:
             new_progress = row["progress"] if progress is None else progress
             if not 0 <= new_progress <= 100:
                 raise ValueError("Progress must be between 0 and 100")
-            started = stamp if state == "running" else row["started_at"]
+            started = stamp if state == "running" and row["started_at"] is None else row["started_at"]
             finished = stamp if state in {"succeeded", "failed", "cancelled", "interrupted"} else None
             conn.execute("UPDATE operations SET state=?,progress=?,message=?,error_code=?,error_message=?,updated_at=?,started_at=?,finished_at=? WHERE id=?", (state, new_progress, message, error_code, error_message, stamp, started, finished, operation_id))
             return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
@@ -67,12 +67,36 @@ class OperationsService:
     def recover(self) -> int:
         stamp = now()
         with transaction(self.db_path) as conn:
-            cursor = conn.execute("UPDATE operations SET state='interrupted',message='Process restarted before operation completed',error_code='PROCESS_RESTARTED',updated_at=?,finished_at=? WHERE state='running'", (stamp, stamp))
+            cursor = conn.execute("UPDATE operations SET state='interrupted',message='Process restarted before operation completed',error_code='PROCESS_RESTARTED',error_message='The operation did not finish before Dexter restarted.',updated_at=?,finished_at=? WHERE state='running' OR (state='queued' AND kind='make-local')", (stamp, stamp))
             return cursor.rowcount
+
+    def log(self, operation_id: str, message: str, level: str = "info") -> None:
+        with transaction(self.db_path) as conn:
+            seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM operation_logs WHERE operation_id=?", (operation_id,)).fetchone()[0]
+            conn.execute("INSERT INTO operation_logs(operation_id,seq,created_at,level,message) VALUES(?,?,?,?,?)", (operation_id, seq, now(), level, message[:500]))
+
+    def update_details(self, operation_id: str, **details) -> dict:
+        with transaction(self.db_path) as conn:
+            row = conn.execute("SELECT details_json FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not row:
+                raise KeyError(operation_id)
+            current = json.loads(row[0] or "{}")
+            current.update(details)
+            conn.execute("UPDATE operations SET details_json=?,updated_at=? WHERE id=?", (json.dumps(current, separators=(",", ":")), now(), operation_id))
+            return {"details": current}
+
+    def logs(self, operation_id: str) -> list[dict]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT created_at,level,message FROM operation_logs WHERE operation_id=? ORDER BY seq", (operation_id,)).fetchall()
+            return [dict(row) for row in rows]
 
     @staticmethod
     def _serialize(row) -> dict:
-        return {key: row[key] for key in row.keys() if key not in {"started_at", "finished_at"}} | {"cancel_requested": bool(row["cancel_requested"])}
+        result = {key: row[key] for key in row.keys() if key not in {"started_at", "finished_at"}}
+        result["cancel_requested"] = bool(row["cancel_requested"])
+        if "details_json" in row.keys():
+            result["details"] = json.loads(result.pop("details_json") or "{}")
+        return result
 
 
 class SettingsRepository:

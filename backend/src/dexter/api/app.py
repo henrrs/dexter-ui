@@ -5,6 +5,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -20,10 +23,14 @@ from dexter.adapters.databricks import discover_profiles, validate_profile
 from dexter.adapters.purview import validate_configuration, validate_endpoint
 from dexter.config import Settings
 from dexter.catalog.discovery import DiscoverService
+from dexter.catalog.unified import UnifiedDiscoverService, _variants
 from dexter.db.database import migrate
 from dexter.logging_config import configure_logging
 from dexter.paths import DexterPaths
 from dexter.services.operations import OperationsService, SettingsRepository
+from dexter.services.local_data import LocalDataService
+from dexter.services.materialize import make_local_worker
+from dexter.services.analytics_config import load_limits
 
 logger = logging.getLogger("dexter.api")
 
@@ -58,7 +65,7 @@ class LocalOriginGuard:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = {key.lower(): value.decode("latin1") for key, value in scope.get("headers", [])}
+        headers = {key.decode("latin1").lower(): value.decode("latin1") for key, value in scope.get("headers", [])}
         if not self._is_loopback_host(headers.get("host", "")):
             response = JSONResponse({"error": {"code": "LOCAL_HOST_REQUIRED", "message": "Dexter accepts requests through loopback only."}}, status_code=403)
             await response(scope, receive, send)
@@ -80,6 +87,31 @@ class PurviewConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     endpoint: str = Field(min_length=9, max_length=512)
     tenant_id: str | None = Field(default=None, max_length=256)
+
+
+class PurviewAccountSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: str = Field(min_length=1, max_length=512)
+
+
+class MakeLocalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    warehouse_id: str = Field(min_length=1, max_length=160)
+    environment: str = Field(pattern="^(dev|prod)$")
+    columns: list[str] = Field(min_length=1, max_length=500)
+    filters: list[dict] = Field(default_factory=list, max_length=100)
+
+
+class LocalQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sql: str = Field(min_length=1, max_length=20000)
+    limit: int = Field(default=500, ge=1, le=2000)
+
+
+class RemotePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    environment: str = Field(pattern="^(dev|prod)$")
+    warehouse_id: str = Field(min_length=1, max_length=160)
 
 
 def _connections(repo: SettingsRepository, settings: Settings) -> dict:
@@ -166,16 +198,24 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     operations = OperationsService(paths.database)
     settings_repo = SettingsRepository(paths.database)
     discover = DiscoverService(paths, settings_repo, settings)
+    local_data = LocalDataService(paths)
+    unified = UnifiedDiscoverService(discover, settings_repo, local_data, paths)
+    analytics_limits = load_limits(paths.config)
+    materializers = ThreadPoolExecutor(max_workers=analytics_limits.concurrent, thread_name_prefix="dexter-make-local")
+    materialization_slots = threading.BoundedSemaphore(analytics_limits.concurrent + analytics_limits.queued)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         recovered = operations.recover()
+        cleaned = local_data.recover()
         if recovered:
             logger.info("Recovered interrupted operations count=%s", recovered)
+        if cleaned:
+            logger.info("Removed abandoned local materialization staging count=%s", cleaned)
         yield
 
     app = FastAPI(title="Dexter Local API", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
-    app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:4173", "http://localhost:4173"], allow_methods=["GET", "POST", "PUT"], allow_headers=["Content-Type"], max_age=300)
+    app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:4173", "http://localhost:4173"], allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type"], max_age=300)
     app.add_middleware(LocalOriginGuard)
 
     @app.exception_handler(RequestValidationError)
@@ -209,6 +249,21 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def discover_sources():
         return {"items": discover.sources()}
 
+    @app.get("/api/discover/catalogs")
+    def discover_catalogs(force: bool = False):
+        return unified.catalogs(force)
+
+    @app.get("/api/discover/catalog-nodes/{node_id:path}/children")
+    def discover_catalog_children(node_id: str, force: bool = False):
+        return unified.children(node_id, force)
+
+    @app.get("/api/discover/catalog-nodes/{node_id:path}")
+    def discover_catalog_detail(node_id: str, environment: str | None = None):
+        result = unified.detail(node_id, environment)
+        if result is None:
+            raise HTTPException(404, detail="Asset details are unavailable")
+        return result
+
     @app.get("/api/discover/nodes/{node_id:path}/children")
     def discover_children(node_id: str, force: bool = False):
         return discover.children(node_id, force)
@@ -219,6 +274,153 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if result is None:
             raise HTTPException(404, detail="Asset details are unavailable")
         return result
+
+    @app.get("/api/discover/local-datasets")
+    def local_datasets():
+        return {"items": local_data.list()}
+
+    @app.get("/api/discover/nodes/{node_id:path}/warehouses")
+    def available_warehouses(node_id: str, environment: str = "dev"):
+        detail = unified.detail(node_id, environment) if node_id.startswith("unified:") else discover.detail(node_id)
+        if not detail or detail.get("source") != "databricks" or detail.get("access") != "read":
+            raise HTTPException(403, detail="A readable Databricks table is required")
+        env = detail.get("environment")
+        config = settings_repo.get(f"databricks.{env}")
+        if not config:
+            raise HTTPException(409, detail="The selected environment has no configured profile")
+        try:
+            from databricks.sdk import WorkspaceClient
+            from dexter.adapters.databricks import profile_config_file
+            workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
+            items = [{"id": w.id, "name": w.name, "state": str(w.state).split(".")[-1]} for w in workspace.warehouses.list() if str(w.state).upper().split(".")[-1] == "RUNNING"]
+            return {"items": items, "message": None if items else "No running SQL warehouses found. Dexter will not start one."}
+        except Exception as exc:
+            logger.info("Warehouse listing failed (%s)", type(exc).__name__)
+            raise HTTPException(503, detail="Could not list running warehouses for the selected profile") from None
+
+    @app.post("/api/discover/nodes/{node_id:path}/make-local", status_code=202)
+    def start_make_local(node_id: str, body: MakeLocalRequest):
+        environment = body.environment
+        if node_id.startswith("unified:"):
+            try:
+                kind, variants = _variants(node_id)
+            except Exception:
+                raise HTTPException(422, detail="Invalid unified table identity") from None
+            variant = next((item for item in variants if item.get("environment") == environment), None)
+            if kind not in {"table", "view"} or not variant:
+                raise HTTPException(422, detail="Select the DEV or PROD physical table variant")
+            physical_id = variant["node_id"]
+            parts = physical_id.split(":")
+        else:
+            parts = node_id.split(":")
+            environment = parts[1] if len(parts) > 1 else environment
+            physical_id = node_id
+        if len(parts) != 5 or parts[0] != "databricks" or parts[1] not in {"dev", "prod"}:
+            raise HTTPException(422, detail="Select a Databricks DEV or PROD table variant")
+        detail = discover.detail(physical_id)
+        if not detail or detail.get("access") != "read":
+            raise HTTPException(403, detail="Table read access is not confirmed for the selected environment")
+        if len(set(body.columns)) != len(body.columns):
+            raise HTTPException(422, detail="Selected columns must be unique")
+        minimum_free = analytics_limits.minimum_free_disk_mb * 1024 * 1024
+        if shutil.disk_usage(paths.datasets).free < minimum_free:
+            raise HTTPException(409, detail=f"At least {analytics_limits.minimum_free_disk_mb} MiB of local free space is required")
+        operation = operations.create("make-local", "Full snapshot queued")
+        operations.update_details(operation["id"], phase="queued", rows=0, bytes=0, files=0, environment=parts[1], qualified_name=detail.get("qualified_name"))
+        operations.log(operation["id"], f"Queued complete snapshot for {parts[1].upper()} {detail.get('qualified_name', '')}")
+        slot_acquired = False
+        try:
+            if not materialization_slots.acquire(blocking=False):
+                operations.transition(operation["id"], "failed", message="Materialization queue is full", error_code="QUEUE_FULL", error_message="Wait for a running materialization to finish.")
+                raise HTTPException(409, detail="The local materialization queue is full")
+            slot_acquired = True
+            future = materializers.submit(make_local_worker, operation_id=operation["id"], operations=operations, local_data=local_data,
+                                 paths=paths, settings_repo=settings_repo, environment=parts[1], catalog=parts[2], schema=parts[3],
+                                 table=parts[4], columns=body.columns, filters=body.filters, warehouse_id=body.warehouse_id, detail=detail)
+            future.add_done_callback(lambda _future: materialization_slots.release())
+            slot_acquired = False
+        except RuntimeError:
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation["id"])
+            if current and current["state"] == "queued":
+                operations.transition(operation["id"], "failed", message="Materialization queue is full", error_code="QUEUE_FULL", error_message="Wait for a running materialization to finish.")
+            raise HTTPException(409, detail="The local materialization queue is full") from None
+        return operations.get(operation["id"])
+
+    @app.post("/api/discover/nodes/{node_id:path}/preview")
+    def preview_remote_table(node_id: str, body: RemotePreviewRequest):
+        if node_id.startswith("unified:"):
+            try:
+                kind, variants = _variants(node_id)
+                variant = next((item for item in variants if item.get("environment") == body.environment), None)
+            except Exception:
+                variant = None
+                kind = None
+            if kind not in {"table", "view"} or not variant:
+                raise HTTPException(422, detail="Select a physical table variant")
+            physical_id = variant["node_id"]
+            parts = physical_id.split(":")
+        else:
+            physical_id = node_id
+            parts = node_id.split(":")
+        detail = discover.detail(physical_id)
+        if len(parts) != 5 or parts[0] != "databricks" or not detail or detail.get("access") != "read":
+            raise HTTPException(403, detail="Table read access is not confirmed for the selected environment")
+        config = settings_repo.get(f"databricks.{body.environment}")
+        if not config:
+            raise HTTPException(409, detail="The selected environment has no configured profile")
+        try:
+            from databricks.sdk import WorkspaceClient
+            from dexter.adapters.databricks import profile_config_file
+            workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
+            warehouse = next((item for item in workspace.warehouses.list() if item.id == body.warehouse_id and str(item.state).upper().split(".")[-1] == "RUNNING"), None)
+            if not warehouse:
+                raise HTTPException(422, detail="Select a SQL warehouse that is already running")
+            projection = ", ".join("`" + column["name"].replace("`", "``") + "`" for column in detail.get("columns", []))
+            if not projection:
+                raise HTTPException(409, detail="Column metadata is unavailable for this table")
+            sql = f"SELECT {projection} FROM `{parts[2].replace('`', '``')}`.`{parts[3].replace('`', '``')}`.`{parts[4].replace('`', '``')}` LIMIT 100"
+            response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={"statement": sql, "warehouse_id": body.warehouse_id, "wait_timeout": "50s", "on_wait_timeout": "CONTINUE", "format": "JSON_ARRAY", "disposition": "INLINE"})
+            state = str((response.get("status") or {}).get("state", "")).upper().split(".")[-1]
+            statement_id = response.get("statement_id")
+            deadline = __import__("time").monotonic() + 15
+            while state in {"PENDING", "RUNNING"} and statement_id and __import__("time").monotonic() < deadline:
+                __import__("time").sleep(0.5)
+                response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
+                state = str((response.get("status") or {}).get("state", "")).upper().split(".")[-1]
+            if state != "SUCCEEDED":
+                if statement_id and state in {"PENDING", "RUNNING"}:
+                    workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                raise HTTPException(504, detail="The remote preview did not finish in time")
+            columns = [item.get("name", "") for item in ((response.get("manifest") or {}).get("schema") or {}).get("columns", [])]
+            rows = [dict(zip(columns, row)) for row in ((response.get("result") or {}).get("data_array", []) or [])]
+            return {"columns": columns, "rows": rows, "truncated": len(rows) == 100}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.info("Remote preview failed (%s)", type(exc).__name__)
+            raise HTTPException(503, detail="The selected profile could not complete the authorized preview") from None
+
+    @app.get("/api/local-datasets")
+    def list_local_datasets():
+        return {"items": local_data.list()}
+
+    @app.post("/api/local-datasets/{dataset_id}/query")
+    def query_local_dataset(dataset_id: str, body: LocalQueryRequest):
+        try:
+            return local_data.query(dataset_id, body.sql, body.limit)
+        except KeyError:
+            raise HTTPException(404, detail="Local dataset not found") from None
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from None
+        except RuntimeError as exc:
+            raise HTTPException(503, detail=str(exc)) from None
+
+    @app.delete("/api/local-datasets/{dataset_id}")
+    def delete_local_dataset(dataset_id: str):
+        if not local_data.delete(dataset_id):
+            raise HTTPException(404, detail="Local dataset not found")
+        return {"deleted": True, "dataset_id": dataset_id}
 
     @app.put("/api/connections/databricks/{environment}")
     def save_databricks(environment: str, body: DatabricksConfig):
@@ -267,6 +469,29 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         settings_repo.put_check("purview", result["status"], result["category"], result["detail"])
         return result
 
+    @app.post("/api/connections/purview/discover")
+    def discover_purview_accounts():
+        from dexter.adapters.purview import discover_accounts
+        result = discover_accounts()
+        items = result.get("items", [])
+        if len(items) == 1:
+            account = items[0]
+            settings_repo.put("purview", {"endpoint": account["endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id")})
+            settings_repo.put_check("purview", "configured", None, "Automatically selected the only accessible Purview account with delegated Unified Catalog access.")
+            result["selected"] = account["id"]
+        return result
+
+    @app.put("/api/connections/purview/select")
+    def select_purview_account(body: PurviewAccountSelection):
+        from dexter.adapters.purview import discover_accounts
+        result = discover_accounts()
+        account = next((item for item in result.get("items", []) if item.get("id") == body.account_id), None)
+        if not account:
+            raise HTTPException(404, detail="That account is not currently accessible with Azure CLI authentication")
+        settings_repo.put("purview", {"endpoint": account["endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id")})
+        settings_repo.put_check("purview", "configured", None, "Selected an accessible Purview account using the current Azure CLI identity.")
+        return get_connections()
+
     @app.get("/api/operations")
     def list_operations(limit: int = 50):
         return operations.list(limit)
@@ -277,6 +502,12 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if result is None:
             raise HTTPException(404, detail="Operation not found")
         return result
+
+    @app.get("/api/operations/{operation_id}/logs")
+    def operation_logs(operation_id: str):
+        if not operations.get(operation_id):
+            raise HTTPException(404, detail="Operation not found")
+        return {"items": operations.logs(operation_id)}
 
     @app.post("/api/operations/{operation_id}/cancel")
     def cancel_operation(operation_id: str):

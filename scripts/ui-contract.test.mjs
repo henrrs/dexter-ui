@@ -41,6 +41,16 @@ test('layout has compact desktop and responsive breakpoints without remote asset
 })
 
 test('Vite proxies API requests to the runtime-selected loopback port', () => {
-  assert.match(vite, /process\.env\.DEXTER_PORT/)
+  assert.match(vite, /env\?\.DEXTER_PORT/)
   assert.match(vite, /target: `http:\/\/127\.0\.0\.1:\$\{apiPort\}`/)
+})
+
+test('F3 exposes the logical catalog and local snapshot workbench', () => {
+  assert.match(api, /discoverCatalogChildren/)
+  assert.match(api, /makeLocal/)
+  assert.match(api, /queryLocal/)
+  assert.match(discover, /FULL SNAPSHOT/)
+  assert.match(discover, /Query Local/)
+  assert.match(discover, /Preview first 100 rows/)
+  assert.match(app, /Discover accounts/)
 })

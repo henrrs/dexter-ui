@@ -20,12 +20,12 @@ flowchart LR
 
 ### Boundaries
 
-- `domain/` contains operation transitions and typed F2–F4 contracts; it does not import FastAPI, SQLite, or vendor SDKs.
+- `domain/` contains operation transitions and typed module contracts; it does not import FastAPI, SQLite, or vendor SDKs.
 - `services/` implements use cases and persists only metadata, profile names, endpoint coordinates, operation states, and safe validation summaries.
 - `db/` is the SQLite adapter: versioned migrations, WAL, a bounded busy timeout, serialized write transactions, and per-operation connections.
-- `adapters/` contains read-only Databricks and Purview connector checks. Secrets remain owned by host CLI tooling.
+- `adapters/` contains Databricks, Purview, and Azure CLI connectors. Credentials remain owned by host CLI tooling.
 - `api/` validates local requests, restricts origins/host headers, standardizes errors, and returns safe DTOs.
-- `src/` is a dark, responsive platform shell for Home and connection settings. Discover and Ask Dexter are represented only by navigation/context affordances; future feature screens and data behavior are absent.
+- `src/` is a dark, responsive platform shell with unified Discover and a Table Workbench alongside Home and connection settings.
 
 ```mermaid
 sequenceDiagram
@@ -47,7 +47,7 @@ sequenceDiagram
 
 ## Persistence and recovery
 
-SQLite is embedded and local. WAL permits concurrent readers while SQLite serializes writers; `busy_timeout`, a small retry loop, and short `BEGIN IMMEDIATE` transactions bound contention. Migrations are recorded in `schema_migrations` and applied atomically. `synchronous=FULL` favors durable operation state. The database is stored under the XDG data home in `metadata/dexter.sqlite3`; future Parquet data, artifacts, temporary staging, and logs use separate sibling directories.
+SQLite is embedded and local. WAL permits concurrent readers while SQLite serializes writers; `busy_timeout`, a small retry loop, and short `BEGIN IMMEDIATE` transactions bound contention. Migrations are recorded in `schema_migrations` and applied atomically. `synchronous=FULL` favors durable operation state. The database is stored under the XDG data home in `metadata/dexter.sqlite3`; Parquet data, artifacts, temporary staging, and logs use separate sibling directories.
 
 Operations use a checked state machine: `queued → running → succeeded | failed | cancelled | interrupted`. Queued work can be cancelled; running work records a cancellation request for a cooperative worker. On startup, work left in `running` becomes `interrupted` with `PROCESS_RESTARTED`. F1 does not spawn workers or claim cancellation for synchronous vendor calls.
 
@@ -78,12 +78,20 @@ The server binds to loopback only. Requests must use a loopback Host, and browse
 
 Install commands are wrapped in `scripts/dependency_tool.py`. A registry must be explicitly configured through Dexter variables, npm config, or pip/uv config. The wrapper selects one index, blocks unconfigured public defaults and Python `extra-index-url`, and keeps existing proxy/certificate settings. Public npm/PyPI use requires both a configured URL and `DEXTER_ALLOW_PUBLIC_REGISTRY=1`. npm lockfile tarball hosts are rewritten to the selected registry. `make doctor` reports configuration status without making network calls or revealing URLs.
 
-## Future module contracts (not implementations)
+## Unified catalog and local analytics
+
+Discover lazily reconciles provider pages over the F2 SQLite WAL cache. The tree is `Catalog → Schema → Table/View`, with physical variants retained on each logical node. A catalog ending exactly in `_dev` is normalized only when its non-suffixed counterpart exists in PROD; additional mappings can be supplied in `config/catalog-aliases.json` as a JSON object from physical name to logical name. Ambiguous same-environment collisions remain separate and are flagged. Tables merge across environments only when the containing logical catalog and schema/table path match and both providers expose the same metastore ID. Purview links to a Databricks table only when its `databricks://<metastore>/catalogs/.../schemas/.../tables/...` qualified name matches exactly. Purview-only assets remain visible with unknown data access. `browse_only=true` is metadata-only; `browse_only=false` is treated as read permission evidence; missing evidence stays unknown.
+
+Purview discovery uses the signed-in Azure CLI identity. Dexter lists subscriptions and Purview accounts through Azure Resource Manager, then probes the delegated Unified Catalog API with the Purview audience. A single compatible account is selected automatically; several are returned for user selection. Only account/resource IDs, tenant, subscription, and endpoint are stored. The API is preview and some tenants may not permit delegated access; failures leave Databricks discovery available and do not trigger a service-principal fallback.
+
+Make Local uses the selected DEV or PROD profile only, verifies read evidence, and requires a warehouse already in `RUNNING`. It submits a full selected-column/filter query through Databricks Statement Execution with Arrow streaming and external result links. Signed links are memory-only and fetched without the workspace authorization header. PyArrow writes batches progressively to a staged Parquet file. Publication validates the file, atomically switches the active dataset row in SQLite, then retires the previous snapshot. The source key includes environment, workspace, metastore, catalog, schema, and table; one snapshot is active per source. Each explicit run executes a fresh full query; no incremental, CDC, or previous-snapshot reuse is performed.
+
+The local dataset registry stores snapshot metadata and paths; table bytes live in Parquet. DuckDB runs in memory, with external access disabled and only the selected registered Arrow dataset exposed as `local_table`. Local SQL is limited to one SELECT statement and returned rows are bounded. A process lock protects local readers from replacement/deletion. Operations persist progress, row/byte counts, safe logs, and cancellation requests. Resource caps are configurable in `$XDG_CONFIG_HOME/dexter/analytics.json` (`max_concurrent`, `max_queued`, `memory_limit`, `minimum_free_disk_mb`); defaults are 2 active workers, 2 queued jobs, 1 GB DuckDB memory, and 256 MiB minimum free disk. Restart recovery marks work interrupted and removes abandoned staging/orphan snapshots. Existing valid F2 top-level Parquet manifests are indexed at startup without provider reload.
+
+## Future module contracts
 
 The `domain/future_contracts.py` module records typed seams only:
 
-- **F2 Unified Discover:** `DiscoverySource` and `AssetReference` allow Purview, Databricks DEV/PROD, and LOCAL providers to reconcile through one catalog. Existence, visibility, and read authorization remain separate fields. Loading, cache, reconciliation, and L/D/P indicators are not implemented.
-- **F3 Local Analytics:** `MakeLocalSpec` requires selected columns and `copy_mode="full_snapshot"`. The publisher contract stages and validates a Parquet snapshot before atomically switching the active snapshot. Old data is retired only after publication. No DuckDB, Arrow, Parquet writer, or worker is included.
 - **F4 Ask Dexter:** `ChatSessionReference` associates conversations with workspace IDs and a pinned or active-tab context. `AskSessionRepository` supports multiple sessions/conversations; no chat UI, OpenCode client, or conversation persistence is included.
 - Later capabilities can add focused providers/services for synthetic data, table compare, labs, notebooks, orchestration, data products, and repository workflows without moving integration concerns into the core domain.
 
@@ -95,8 +103,8 @@ F1 runs on the host and needs no Docker daemon or external service. Later worker
 
 Architectural trade-offs are recorded in [ADRs](decisions/). Local test strategy and this F1 verification record are in [testing](testing.md).
 
-## Unified Discover (F2)
+## Unified Discover (F2/F3)
 
 `dexter.catalog.DiscoverService` loads source roots without contacting providers. Expanding a Databricks source loads catalogs; expanding a catalog loads schemas; expanding a schema loads tables. Opening a table loads its detail and column metadata. LOCAL discovery validates each `datasets/*/manifest.json` and requires its data file to resolve below that dataset directory. Purview expansion uses the configured endpoint and existing `AzureCliCredential` scope to probe the Unified Catalog preview Data Assets API; it does not fall back to Atlas or another identity. Provider pages are stored in the versioned `discovery_cache` table with a SHA-256 context key and level TTLs. Raw credentials and tokens are not included in cache records.
 
-Databricks cache contexts include environment, profile reference, workspace host, current identity, and metastore when available. Purview contexts include endpoint, tenant, token identity claim, and audience. The explorer keeps provider trees separate, while a selected Databricks asset can show a Purview governance match when both are loaded and their metastore ID plus full qualified name match exactly. `catalog.reconcile` contains the same conservative identity rule. A single canonical tree is not yet built. Unknown permission evidence stays unknown; UC `browse_only` metadata is the only table-level read/restricted signal currently consumed.
+Databricks cache contexts include environment, profile reference, workspace host, current identity, and metastore when available. Purview contexts include endpoint, tenant, token identity claim, and audience. The unified tree groups matching physical catalogs and tables while retaining exact IDs and environment variants. `catalog/unified.py` uses the exact `_dev` rule and optional alias file; it does not infer identities from approximate names. Cache pages remain provider-specific, so tree refresh does not discard F2 pages or require a full remote reload.

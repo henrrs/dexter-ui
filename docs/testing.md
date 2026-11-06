@@ -19,6 +19,9 @@ Automated tests use Python's standard `unittest` and Node's built-in test runner
 | Purview CLI scope, audience, and read-only HTTP | Purview tests in `backend/tests/test_foundation.py` |
 | Local API and origin restriction | `ApiTests.test_health_origin_guard_and_connection_settings_round_trip` (runs when FastAPI/httpx are installed) |
 | UI shell, connection controls, and Discover endpoints | `scripts/ui-contract.test.mjs` |
+| Logical catalog normalization and DEV/PROD table reconciliation | `test_f3.UnifiedCatalogTests` covers exact `_dev` pairing, physical variants, authorization state, metastore collisions, and Purview-only metadata. |
+| Full Parquet snapshot replacement and rollback | `test_f3.MaterializationTests` covers schema/row validation, active snapshot replacement, preservation on failed staging, and DuckDB local queries. |
+| SQL identifier safety and filter binding | `test_sql_builder_quotes_identifiers_and_binds_filter_literals` |
 
 ## Execution record
 
@@ -32,4 +35,12 @@ Run on 2026-11-06 in the supplied workspace:
 - `uv pip compile --offline` — could not resolve the pinned FastAPI version from the local cache; it made no network request. The Python hash lockfile must be generated with `make lock` once the corporate PyPI/Nexus index is configured.
 - `package-lock.json` was generated in npm offline mode from the local cache. Install commands rewrite its registry host to the selected registry.
 
-No real Databricks or Purview calls were made. Databricks and Purview discovery still need provider-mocked pagination, outage, and permission tests; the API integration test and TypeScript build need dependencies from `make setup`. Remote registry smoke tests are opt-in through `make doctor NETWORK=1`; live connector checks remain explicit.
+No real Databricks or Purview calls were made. Live Statement Execution Arrow transfer, delegated Purview API compatibility, account discovery pagination, temporary-link expiry, disk exhaustion, cancellation during a provider stream, and cross-process reader coordination still need integration validation. Remote registry smoke tests are opt-in through `make doctor NETWORK=1`; live connector checks remain explicit.
+
+## F3 verification on 2026-11-06
+
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` — passed.
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — passed 40 tests, including local PyArrow/Parquet, DuckDB, Purview discovery mocks, resource limits, and the existing FastAPI API test.
+- `node --test scripts/ui-contract.test.mjs` — passed all 6 tests.
+- `npm run build` — TypeScript and Vite production build passed using the already-installed Node dependencies in a neighboring local checkout via a temporary symlink; the symlink was removed afterward. `make setup` was not run, so this did not bypass Dexter's corporate registry guard.
+- No live Azure/Databricks calls or package downloads were made. This machine did not provide the selected external workspace credentials for integration tests.

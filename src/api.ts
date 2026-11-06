@@ -22,19 +22,38 @@ export const api = {
   validateDatabricks: (environment: 'dev' | 'prod') => request(`/connections/databricks/${environment}/validate`, { method: 'POST' }),
   savePurview: (endpoint: string, tenant_id: string) => request<Connections>('/connections/purview', { method: 'PUT', body: JSON.stringify({ endpoint, tenant_id: tenant_id || null }) }),
   validatePurview: () => request('/connections/purview/validate', { method: 'POST' }),
+  discoverPurview: () => request<{ items: Array<{ id: string; name: string; endpoint: string; tenant_id: string; subscription_id: string }>; status: string; detail: string; selected?: string }>('/connections/purview/discover', { method: 'POST' }),
+  selectPurview: (account_id: string) => request<Connections>('/connections/purview/select', { method: 'PUT', body: JSON.stringify({ account_id }) }),
   operations: () => request<Operation[]>('/operations?limit=12'),
-  discoverSources: () => request<{ items: DiscoverNode[] }>('/discover/sources'),
+  discoverSources: () => request<{ items: DiscoverNode[] }>('/discover/catalogs'),
+  discoverCatalogChildren: (nodeId: string, force = false) => request<DiscoverPage>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
+  discoverCatalogDetail: (nodeId: string, environment?: string) => request<DiscoverNode>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}${environment ? `?environment=${environment}` : ''}`),
   discoverChildren: (nodeId: string, force = false) => request<DiscoverPage | DiscoverNode[]>(`/discover/nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
   discoverDetail: (nodeId: string) => request<DiscoverNode>(`/discover/nodes/${encodeURIComponent(nodeId)}`),
+  warehouses: (nodeId: string, environment: 'dev' | 'prod') => request<{ items: Array<{ id: string; name: string; state: string }>; message: string | null }>(`/discover/nodes/${encodeURIComponent(nodeId)}/warehouses?environment=${environment}`),
+  makeLocal: (nodeId: string, body: { environment: 'dev' | 'prod'; warehouse_id: string; columns: string[]; filters: Array<{ column: string; operator: string; value?: unknown }> }) => request<Operation>(`/discover/nodes/${encodeURIComponent(nodeId)}/make-local`, { method: 'POST', body: JSON.stringify(body) }),
+  previewRemote: (nodeId: string, environment: 'dev' | 'prod', warehouse_id: string) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>(`/discover/nodes/${encodeURIComponent(nodeId)}/preview`, { method: 'POST', body: JSON.stringify({ environment, warehouse_id }) }),
+  operation: (id: string) => request<Operation>(`/operations/${id}`),
+  operationLogs: (id: string) => request<{ items: Array<{ created_at: string; level: string; message: string }> }>(`/operations/${id}/logs`),
+  cancelOperation: (id: string) => request<Operation>(`/operations/${id}/cancel`, { method: 'POST' }),
+  localDatasets: () => request<{ items: LocalDataset[] }>('/local-datasets'),
+  queryLocal: (datasetId: string, sql: string, limit = 500) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>(`/local-datasets/${datasetId}/query`, { method: 'POST', body: JSON.stringify({ sql, limit }) }),
+  deleteLocal: (datasetId: string) => request<{ deleted: boolean }>(`/local-datasets/${datasetId}`, { method: 'DELETE' }),
 }
 
 export type DiscoverNode = {
   id: string; name: string; kind: 'source' | 'catalog' | 'schema' | 'table' | 'view'
   source: string; environment: string; status?: string; detail?: string
   qualified_name?: string; access?: 'read' | 'restricted' | 'unknown'; browse_only?: boolean | null
-  description?: string | null; owner?: string | null; columns?: Array<{ name: string; type?: string; type_text?: string }>
+  description?: string | null; owner?: string | null; columns?: Array<{ name: string; type?: string; type_text?: string; nullable?: boolean | null }>
   exists?: boolean; metadata_visible?: boolean; read_access?: boolean | null
   metastore_id?: string | null; classifications?: string[]
+  workspace?: string; profile?: string; logical_name?: string
+  variants?: Array<{ environment: string; catalog: string; schema?: string; table?: string; node_id: string; access?: string; metastore_id?: string; dataset_id?: string; metadata?: Record<string, unknown> }>
+  availability?: { local: 'present' | 'restricted' | 'unknown' | 'absent'; dev: 'present' | 'restricted' | 'unknown' | 'absent'; prod: 'present' | 'restricted' | 'unknown' | 'absent' }
+  ambiguous?: boolean
+  purview_metadata?: Record<string, unknown>
   children?: DiscoverNode[] | null; row_count?: number | null; format?: string
 }
 export type DiscoverPage = { items: DiscoverNode[]; fetched_at: number | null; expires_at: number | null; stale: boolean; error: string | null }
+export type LocalDataset = { dataset_id: string; name: string; qualified_name: string; snapshot_path: string; row_count: number; byte_count: number; source: { environment: string; workspace: string; catalog: string; schema: string; table: string }; manifest: { columns: Array<{ name: string; type: string; nullable: boolean }> } }

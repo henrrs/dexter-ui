@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from dexter.catalog.cache import DiscoveryCache, context_key
 
@@ -28,7 +28,10 @@ def _row(value, source, env, kind, identity, qualified_name=None):
         access = "restricted" if browse is True else "read" if browse is False else "unknown"
     else:
         access = "unknown"
-    return {"id": f"{source}:{env}:{qname}", "name": name, "qualified_name": qname, "kind": kind, "source": source, "environment": env, "identity": identity, "description": _value(value, "comment") or _value(value, "description"), "owner": _value(value, "owner"), "exists": True, "metadata_visible": True, "read_access": browse is False if kind == "table" else None, "access": access, "browse_only": browse, "children": None}
+    table_type = str(_value(value, "table_type", "") or "").upper().split(".")[-1]
+    if kind == "table" and "VIEW" in table_type:
+        kind = "view"
+    return {"id": f"{source}:{env}:{qname}", "name": name, "qualified_name": qname, "kind": kind, "source": source, "environment": env, "identity": identity, "description": _value(value, "comment") or _value(value, "description"), "owner": _value(value, "owner"), "exists": True, "metadata_visible": True, "read_access": browse is False if kind in {"table", "view"} else None, "access": access, "browse_only": browse, "children": None}
 
 
 class DiscoverService:
@@ -93,16 +96,19 @@ class DiscoverService:
                 cache_key = f"detail:{catalog}.{schema}.{table}"
                 cached = self.cache.get(context, cache_key)
                 if cached and not cached["stale"]:
-                    return cached["items"][0] if cached["items"] else None
+                    if not cached["items"]: return None
+                    return {**cached["items"][0], "workspace": _value(workspace.config, "host", ""), "profile": config["profile"]}
                 value = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
                 row = _row(value, "databricks", env, "table", str(identity_key), f"{catalog}.{schema}.{table}")
                 row["id"] = node_id
+                row["workspace"] = _value(workspace.config, "host", "")
+                row["profile"] = config["profile"]
                 try:
                     current_metastore = workspace.metastores.current()
                     row["metastore_id"] = _value(current_metastore, "metastore_id") or _value(current_metastore, "id")
                 except Exception:
                     row["metastore_id"] = None
-                row["columns"] = [{"name": _value(column, "name"), "type": _value(column, "type_text") or str(_value(column, "type_name", "unknown")), "type_text": _value(column, "type_text")} for column in (_value(value, "columns", []) or [])]
+                row["columns"] = [{"name": _value(column, "name"), "type": _value(column, "type_text") or str(_value(column, "type_name", "unknown")), "type_text": _value(column, "type_text"), "nullable": _value(column, "nullable")} for column in (_value(value, "columns", []) or [])]
                 row["access"] = "restricted" if row["browse_only"] is True else "read" if row["browse_only"] is False else "unknown"
                 self.cache.put(context, cache_key, [row], TTL["detail"])
                 return row
@@ -211,12 +217,19 @@ class DiscoverService:
             if cached and not cached["stale"] and not force:
                 return cached
             # Unified Catalog is a distinct public-preview API. Query it directly; never fall back to Atlas.
-            query = urlencode({"api-version": "2026-03-20-preview", "top": "100"})
-            url = config["endpoint"].rstrip("/") + "/datagovernance/catalog/dataAssets?" + query
-            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
-            with urllib.request.urlopen(request, timeout=12) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            entries = payload.get("value", payload.get("items", payload.get("dataAssets", []))) if isinstance(payload, dict) else []
+            base_url = config["endpoint"].rstrip("/") + "/datagovernance/catalog/dataAssets"
+            entries, payload, skip = [], {}, 0
+            for _page in range(50):
+                query = urlencode({"api-version": "2026-03-20-preview", "top": "100", "skip": str(skip)})
+                url = base_url + "?" + query
+                request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
+                with urllib.request.urlopen(request, timeout=12) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                page_entries = payload.get("value", payload.get("items", payload.get("dataAssets", []))) if isinstance(payload, dict) else []
+                if not isinstance(page_entries, list): break
+                entries.extend(page_entries)
+                if len(page_entries) < 100: break
+                skip += len(page_entries)
             nodes = []
             for item in entries if isinstance(entries, list) else []:
                 if not isinstance(item, dict):
@@ -227,7 +240,7 @@ class DiscoverService:
                 owner = contacts.get("owner") or item.get("owner")
                 nodes.append({"id": f"purview:{qname}", "name": str(name).split("/")[-1], "qualified_name": qname, "kind": "table", "source": "purview", "environment": "governance", "identity": identity, "description": item.get("description"), "owner": owner, "classifications": item.get("classifications", []), "access": "unknown", "children": []})
             page = self.cache.put(cache_context, "assets", nodes, 6 * 3600)
-            page["has_more"] = bool(payload.get("nextLink")) if isinstance(payload, dict) else False
+            page["has_more"] = len(entries) >= 5000 and len(entries) % 100 == 0
             return page
         except ImportError:
             return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Azure Identity is not installed in this Dexter environment."}

@@ -73,6 +73,82 @@ def validate_endpoint(endpoint: str, tenant_id: str | None, scope: str, api_path
         return {"status": "unavailable", "category": "connectivity", "detail": "The configured Purview endpoint could not be reached."}
 
 
+def discover_accounts() -> dict:
+    """Find Purview accounts visible to the current Azure CLI identity via ARM."""
+    try:
+        from azure.identity import AzureCliCredential
+        credential = AzureCliCredential()
+        token = credential.get_token("https://management.azure.com/.default")
+        claims = _token_claims(token.token)
+        if not claims or claims.get("aud") not in {"https://management.azure.com/", "https://management.azure.com"}:
+            return {"items": [], "status": "error", "detail": "Azure CLI returned a token for an unexpected Azure management audience."}
+    except ImportError:
+        return {"items": [], "status": "unavailable", "detail": "Azure Identity is not installed."}
+    except Exception as exc:
+        return {"items": [], "status": "unavailable", "detail": "Azure CLI authentication is unavailable. Sign in with az login and retry."}
+    headers = {"Authorization": f"Bearer {token.token}", "Accept": "application/json"}
+
+    def pages(url: str):
+        result = []
+        while url:
+            parsed_url = urlparse(url)
+            if parsed_url.scheme != "https" or parsed_url.hostname != "management.azure.com":
+                raise ValueError("Azure Resource Manager returned an unexpected pagination endpoint")
+            request = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                break
+            result.extend(payload.get("value", []))
+            url = payload.get("nextLink")
+        return result
+
+    try:
+        subscriptions = pages("https://management.azure.com/subscriptions?api-version=2022-12-01")
+        accounts = []
+        for subscription in subscriptions:
+            sub_id = subscription.get("subscriptionId")
+            if not isinstance(sub_id, str):
+                continue
+            url = f"https://management.azure.com/subscriptions/{sub_id}/providers/Microsoft.Purview/accounts?api-version=2021-12-01"
+            for account in pages(url):
+                properties = account.get("properties") if isinstance(account.get("properties"), dict) else {}
+                endpoints = properties.get("endpoints") if isinstance(properties.get("endpoints"), dict) else {}
+                endpoint = endpoints.get("catalog")
+                parsed = urlparse(endpoint or "")
+                if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                    continue
+                if parsed.hostname != "api.purview-service.microsoft.com" and not parsed.hostname.endswith(".purview.azure.com"):
+                    continue
+                accounts.append({"id": account.get("id"), "name": account.get("name"), "tenant_id": claims.get("tid"), "endpoint": endpoint.rstrip("/"), "subscription_id": sub_id})
+        # Keep only endpoints where the delegated identity can call the supported Unified Catalog API.
+        purview_token = credential.get_token("https://purview.azure.net/.default")
+        purview_claims = _token_claims(purview_token.token) or {}
+        if purview_claims.get("aud") not in {"https://purview.azure.net", "https://purview.azure.net/"}:
+            return {"items": [], "status": "error", "detail": "Azure CLI did not return a token with the Purview API audience."}
+        data_headers = {"Authorization": f"Bearer {purview_token.token}", "Accept": "application/json"}
+        supported = []
+        for account in accounts:
+            probe_url = account["endpoint"] + "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&top=1"
+            try:
+                request = urllib.request.Request(probe_url, headers=data_headers, method="GET")
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    if 200 <= response.status < 300:
+                        supported.append(account)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 403:
+                    account["diagnostic"] = "The identity can discover the account but cannot read its Unified Catalog assets."
+            except (OSError, urllib.error.URLError):
+                continue
+        return {"items": supported, "status": "connected" if supported else "unavailable", "detail": f"Found {len(supported)} Purview account(s) with delegated Unified Catalog access." if supported else "No accessible Purview account exposed the delegated Unified Catalog API."}
+    except urllib.error.HTTPError as exc:
+        category = "authorization" if exc.code == 403 else "connectivity"
+        detail = "Azure CLI identity lacks permission to list Purview accounts in one or more subscriptions." if exc.code == 403 else f"Azure management returned HTTP {exc.code}."
+        return {"items": [], "status": "no_permission" if exc.code == 403 else "error", "detail": detail, "category": category}
+    except (OSError, urllib.error.URLError, ValueError, TypeError):
+        return {"items": [], "status": "unavailable", "detail": "Could not list accessible Purview accounts through Azure Resource Manager."}
+
+
 def _token_audience(token: str) -> str | None:
     claims = _token_claims(token)
     audience = claims.get("aud") if claims else None

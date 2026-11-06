@@ -50,6 +50,36 @@ MIGRATIONS = (
     );
     CREATE INDEX discovery_cache_context_node ON discovery_cache(context_key, node_key);
     """,
+    """
+    ALTER TABLE operations ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+    CREATE TABLE operation_logs (
+      operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+      seq INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      level TEXT NOT NULL DEFAULT 'info',
+      message TEXT NOT NULL,
+      PRIMARY KEY(operation_id, seq)
+    );
+    CREATE TABLE local_datasets (
+      dataset_id TEXT PRIMARY KEY,
+      source_key TEXT NOT NULL UNIQUE,
+      source_json TEXT NOT NULL,
+      name TEXT NOT NULL,
+      qualified_name TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      snapshot_path TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      row_count INTEGER NOT NULL,
+      byte_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX local_datasets_qualified_name ON local_datasets(qualified_name);
+    CREATE TABLE local_materialization_locks (
+      source_key TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id) ON DELETE CASCADE,
+      staging_path TEXT NOT NULL
+    );
+    """,
 )
 
 
