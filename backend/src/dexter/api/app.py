@@ -337,8 +337,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         environment = body.environment
         if node_id.startswith("unified:"):
             try:
-                kind, variants = _variants(node_id)
-            except Exception:
+                kind, variants, _ = _variants(node_id)
+            except Exception as exc:
+                logger.info("Unified table identity could not be decoded for Make Local (%s)", type(exc).__name__)
                 raise HTTPException(422, detail="Invalid unified table identity") from None
             variant = next((item for item in variants if item.get("environment") == environment), None)
             if kind not in {"table", "view"} or not variant:
@@ -386,7 +387,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         node_id = body.node_id
         if node_id.startswith("unified:"):
             try:
-                kind, variants = _variants(node_id)
+                kind, variants, _ = _variants(node_id)
                 variant = next((item for item in variants if item.get("environment") == body.environment), None)
             except Exception as exc:
                 logger.info("Unified table identity could not be decoded (%s)", type(exc).__name__)
