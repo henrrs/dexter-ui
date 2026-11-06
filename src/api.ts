@@ -20,7 +20,7 @@ export const api = {
   connections: () => request<Connections>('/connections'),
   refreshConnections: () => request<Connections>('/connections/refresh', { method: 'POST' }),
   operations: () => request<Operation[]>('/operations?limit=12'),
-  discoverSources: () => request<{ items: DiscoverNode[] }>('/discover/catalogs'),
+  discoverSources: (force = false) => request<{ items: DiscoverNode[] }>(`/discover/catalogs${force ? '?force=true' : ''}`),
   discoverCatalogChildren: (nodeId: string, force = false) => request<DiscoverPage>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
   discoverCatalogDetail: (nodeId: string, environment?: string) => request<DiscoverNode>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}${environment ? `?environment=${environment}` : ''}`),
   discoverCatalogLineage: (nodeId: string) => request<{ available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/lineage`),

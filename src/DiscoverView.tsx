@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
@@ -6,8 +6,8 @@ import type { DiscoverNode, DiscoverPage } from './api'
 import type { Operation } from './types'
 
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
-type WorkbenchTab = { key: string; node: DiscoverNode; environment: 'dev' | 'prod' | 'local' }
-type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage'
+type WorkbenchTab = { key: string; node: DiscoverNode; environment: 'dev' | 'prod' | 'local'; view: 'table' | 'local-query' }
+type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage' | 'query'
 type LineageResult = { available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }
 
 export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer, rightOpen, onExpandContext }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void; rightOpen: boolean; onExpandContext: () => void }) {
@@ -17,10 +17,12 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [loading, setLoading] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<DiscoverNode | null>(null)
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([])
+  const [activeTabKey, setActiveTabKey] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<WorkbenchSection>('overview')
   const [query, setQuery] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [sourcesLoaded, setSourcesLoaded] = useState(false)
+  const sourcesLoadInFlight = useRef(false)
   const [sourcesError, setSourcesError] = useState<string | null>(null)
   const [activeEnvironment, setActiveEnvironment] = useState<'dev' | 'prod' | 'local'>('dev')
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
@@ -41,10 +43,12 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [lineage, setLineage] = useState<LineageResult | null>(null)
   const [lineageLoading, setLineageLoading] = useState(false)
 
-  const loadSources = async () => {
+  const loadSources = async (force = false) => {
+    if (sourcesLoadInFlight.current) return
+    sourcesLoadInFlight.current = true
     setRefreshing(true)
     try {
-      setSources((await api.discoverSources()).items)
+      setSources((await api.discoverSources(force)).items)
       setSourcesError(null)
     }
     catch (error) {
@@ -53,9 +57,10 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     finally {
       setSourcesLoaded(true)
       setRefreshing(false)
+      sourcesLoadInFlight.current = false
     }
   }
-  useEffect(() => { if (active) void loadSources() }, [active])
+  useEffect(() => { if (active && !sourcesLoaded) void loadSources() }, [active, sourcesLoaded])
 
   useEffect(() => {
     if (!active || activeOperation) return
@@ -86,7 +91,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
 
   const refreshLoadedNodes = async () => {
-    await loadSources()
+    await loadSources(true)
     const refreshed: DiscoverNode[] = []
     await Promise.all([...expanded].map(async (nodeId) => {
       try {
@@ -101,7 +106,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
 
   const refreshCatalog = async () => {
-    await loadSources()
+    await loadSources(true)
     await Promise.all([...expanded].map(async (nodeId) => {
       const node = [...sources, ...Object.values(pages).flatMap((page) => page.items)].find((item) => item.id === nodeId)
       if (node) await loadChildren(node, true)
@@ -117,12 +122,15 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const selectNode = async (node: DiscoverNode, environment?: 'dev' | 'prod' | 'local') => {
     if (node.kind !== 'table' && node.kind !== 'view') { setMakeLocalOpen(false); setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })); return }
     const preferred = environment ?? (node.variants?.some((variant) => variant.environment === activeEnvironment) ? activeEnvironment : node.variants?.some((variant) => variant.environment === 'dev') ? 'dev' : node.variants?.some((variant) => variant.environment === 'prod') ? 'prod' : 'local')
-    if (selected?.id !== node.id) setActiveSection('overview')
+    setActiveSection('overview')
     setMakeLocalOpen(false)
     setActiveEnvironment(preferred)
     setSelected(node)
-    const tab = { key: node.id, node, environment: preferred }
-    setWorkbenchTabs((items) => items.some((item) => item.key === tab.key) ? items.map((item) => item.key === tab.key ? tab : item) : [...items, tab])
+    const tab: WorkbenchTab = { key: node.id, node, environment: preferred, view: 'table' }
+    setActiveTabKey(tab.key)
+    setWorkbenchTabs((items) => items.some((item) => item.key === tab.key)
+      ? items.map((item) => item.key === tab.key ? tab : item)
+      : [...items, tab])
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: preferred } }))
     setRemotePreview(null); setLocalRows([]); setLocalColumns([]); setLocalQueryError('')
     try {
@@ -131,6 +139,29 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       setSelectedColumns((detail.columns ?? []).map((column) => column.name))
     }
     catch { /* Keep the list metadata visible when a detail endpoint is unavailable. */ }
+  }
+
+  const openLocalQuery = async (node: DiscoverNode) => {
+    const key = `${node.id}:local-query`
+    if (activeTabKey !== key || activeSection !== 'query') {
+      setLocalRows([])
+      setLocalColumns([])
+    }
+    const tab = { key, node, environment: 'local' as const, view: 'local-query' as const }
+    setWorkbenchTabs((items) => items.some((item) => item.key === key)
+      ? items.map((item) => item.key === key ? tab : item)
+      : [...items, tab])
+    setActiveTabKey(key)
+    setActiveSection('query')
+    setActiveEnvironment('local')
+    setSelected(node)
+    setMakeLocalOpen(false)
+    setLocalQueryError('')
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: 'local' } }))
+    try {
+      const detail = await api.discoverCatalogDetail(node.id, 'local')
+      setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
+    } catch { /* Keep the available local asset in the query workspace. */ }
   }
 
   useEffect(() => {
@@ -269,13 +300,17 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
                     ? <div className="discover-empty">Could not refresh catalog metadata. Showing the last loaded catalog.</div>
                     : <div className="discover-empty">No catalogs were found. Check that a Databricks profile is configured.</div>}
         </div>
-        <div className="discover-legend"><span><i className="access-dot read" /> Read confirmed</span><span><LockKeyhole size={10} /> Metadata only</span><span><i className="access-dot unknown" /> Unknown</span></div><div className="resize-handle" onPointerDown={onResizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
+        <div className="resize-handle" onPointerDown={onResizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
       </aside>}
     {!explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
     <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
       <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
-      {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name}</button><button aria-label={`Minimize ${tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (selected?.id === tab.node.id) { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div></div>}
-      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>
+      {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${activeTabKey === tab.key ? 'active' : ''}`} key={tab.key}><button onClick={() => tab.view === 'local-query' ? void openLocalQuery(tab.node) : void selectNode(tab.node, tab.environment)}>{tab.view === 'local-query' ? <HardDrive size={12} /> : <Database size={12} />}{tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.node.name}</button><button aria-label={`Minimize ${tab.view === 'local-query' ? `local query for ${tab.node.name}` : tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (activeTabKey === tab.key) { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.view === 'local-query' ? `local query for ${tab.node.name}` : tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (activeTabKey === tab.key) { const next = remaining.at(-1); if (next) next.view === 'local-query' ? void openLocalQuery(next.node) : void selectNode(next.node, next.environment); else { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div></div>}
+      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'query' ? <div className="workbench-section-content">
+        <div className="discover-detail-head"><div><div className="eyebrow">LOCAL QUERY · DUCKDB</div><h2>{selected.name}</h2></div></div>
+        <code className="qualified-path">{selected.qualified_name ?? selected.id}</code>
+        <div className="local-query-card"><div className="discover-section-title"><Database size={14} /> Query Local <span>DUCKDB</span><button className="icon-button tiny" aria-label="Delete local dataset" onClick={() => { const id = selected.variants?.find((variant) => variant.environment === 'local')?.dataset_id; if (id) void api.deleteLocal(id).then(() => { setSelected(null); setActiveTabKey(null); setWorkbenchTabs((items) => items.filter((item) => item.view !== 'local-query' || item.node.id !== selected.id)); void refreshLoadedNodes() }) }}><Trash2 size={13} /></button></div><textarea aria-label="Local SQL query" value={localSql} onChange={(event) => setLocalSql(event.target.value)} spellCheck={false} /><button className="button secondary small" onClick={() => void runLocalQuery()}><Play size={13} /> Run local query</button>{localQueryError && <div className="discover-error">{localQueryError}</div>}{localRows.length > 0 && <div className="local-result-table"><table><thead><tr>{localColumns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{localRows.map((row, index) => <tr key={index}>{localColumns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}</div>
+      </div> : <>
         <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div><button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
         <code className="qualified-path">{selected.qualified_name ?? selected.id}</code>
         {(selected.kind === 'table' || selected.kind === 'view') && <div className="discover-availability"><span>Availability</span><Availability node={selected} onSelect={(environment) => void selectNode(selected, environment)} /></div>}
@@ -294,7 +329,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             <button className="operation-card make-local-action" onClick={() => { setLocalQueryError(''); setMakeLocalOpen(true) }} disabled={selected.access !== 'read' || activeEnvironment !== 'prod'} title={activeEnvironment !== 'prod' ? 'Make Local is only available when viewing the PROD table.' : undefined}><HardDrive size={16} /><strong>Make Local</strong><span>{activeEnvironment === 'prod' ? 'Select columns for a local snapshot.' : 'Available only from PROD.'}</span><b>→</b></button>
             <button className="operation-card" disabled title="Planned; no generation backend is connected"><Sparkles size={16} /><strong>Generate Synthetic Data</strong><span>Mock data in DEV · planned</span><b>→</b></button>
             <button className="operation-card" disabled title="Planned; comparison is not implemented"><Layers3 size={16} /><strong>Compare Tables</strong><span>Cross environment · planned</span><b>→</b></button>
-            <button className="operation-card" disabled={!selected.variants?.some((variant) => variant.environment === 'local')} onClick={() => { setActiveSection('preview'); void selectNode(selected, 'local') }}><Database size={16} /><strong>Open Local / Query Local</strong><span>{selected.variants?.some((variant) => variant.environment === 'local') ? 'Open the valid local snapshot.' : 'No local materialization available.'}</span><b>→</b></button>
+            <button className="operation-card" disabled={!selected.variants?.some((variant) => variant.environment === 'local')} onClick={() => void openLocalQuery(selected)}><Database size={16} /><strong>Open Local / Query Local</strong><span>{selected.variants?.some((variant) => variant.environment === 'local') ? 'Open the valid local snapshot.' : 'No local materialization available.'}</span><b>→</b></button>
           </div></div>}
           {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}{['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then((operation) => { setActiveOperation(operation); return api.operationLogs(operation.id) }).then((logs) => setOperationLogs(logs.items)).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.error_message ?? activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
           {makeLocalOpen && <div className="make-local-modal-backdrop"><section className="make-local-dialog" role="dialog" aria-modal="true" aria-labelledby="make-local-dialog-title">
@@ -342,7 +377,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             {warehouseError && <div className={warehouses.length ? 'warehouse-message' : 'discover-error'} role={warehouses.length ? undefined : 'alert'}>{warehouseError}</div>}
           </div>}
           {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment !== 'local' && selected.access === 'read' && <div className="local-query-card"><div className="discover-section-title"><Database size={14} /> Preview <span>FIRST 100 ROWS</span></div><button className="button secondary small" disabled={!warehouseId || previewing} onClick={() => void runRemotePreview()}>{previewing ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />} Preview first 100 rows</button>{localQueryError && <div className="discover-error">{localQueryError}</div>}{remotePreview && <div className="local-result-table"><table><thead><tr>{remotePreview.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{remotePreview.rows.map((row, index) => <tr key={index}>{remotePreview.columns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table>{remotePreview.truncated && <small>Preview is limited to 100 rows.</small>}</div>}</div>}
-          {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment === 'local' && selected.variants?.some((variant) => variant.environment === 'local') && <div className="local-query-card"><div className="discover-section-title"><Database size={14} /> Query Local <span>DUCKDB</span><button className="icon-button tiny" aria-label="Delete local dataset" onClick={() => { const id = selected.variants?.find((variant) => variant.environment === 'local')?.dataset_id; if (id) void api.deleteLocal(id).then(() => { setSelected(null); void refreshLoadedNodes() }) }}><Trash2 size={13} /></button></div><textarea aria-label="Local SQL query" value={localSql} onChange={(event) => setLocalSql(event.target.value)} spellCheck={false} /><button className="button secondary small" onClick={() => void runLocalQuery()}><Play size={13} /> Run local query</button>{localQueryError && <div className="discover-error">{localQueryError}</div>}{localRows.length > 0 && <div className="local-result-table"><table><thead><tr>{localColumns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{localRows.map((row, index) => <tr key={index}>{localColumns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}</div>}
           <div className="discover-preview-note"><LockKeyhole size={14} /><span>Remote preview remains available only after the selected environment confirms read access.</span></div>
         </div>}
         {activeSection === 'lineage' && <div className="workbench-section-content">
@@ -360,7 +394,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
                 : <div className="lineage-empty-state"><span className="lineage-empty-icon"><Layers3 size={19} /></span><strong>{lineage?.available ? 'No lineage relationships found' : 'Lineage could not be loaded'}</strong><p>{lineage?.message ?? 'Purview did not return lineage information for this asset.'}</p><code>{selected.qualified_name ?? selected.name}</code></div>
             : <div className="lineage-empty-state"><strong>Select a table or view to inspect lineage.</strong></div>}
         </div>}
-      </> : <div className="discover-placeholder"><span className="empty-glyph"><FileStack size={17} /></span><strong>Select an asset</strong><span>Metadata and access evidence will appear here.</span></div>}</section>
+      </>}</> : <div className="discover-placeholder"><span className="empty-glyph"><FileStack size={17} /></span><strong>Select an asset</strong><span>Metadata and access evidence will appear here.</span></div>}</section>
       </div>
       <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item">Unified Discover</span></div></footer>
     </main>

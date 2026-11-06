@@ -117,10 +117,6 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .discover-node .source-icon { width:20px; height:20px; flex:0 0 20px; }
 .discover-node-name { min-width:0; flex:1 1 0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#c9cdca; font-size:10px; }
 .discover-node-kind { margin-left:auto; color:#686f6e; font:8px var(--mono); text-transform:uppercase; }
-.access-dot { width:7px; height:7px; flex:0 0 7px; border-radius:50%; display:inline-block; background:#717776; }
-.access-dot.read { background:var(--green); box-shadow:0 0 7px #64c79555; }
-.access-dot.restricted { background:#84898a; }
-.access-dot.absent { background:#454a4a; }
 .access-chip { border:1px solid #393d3e; border-radius:3px; padding:2px 4px; color:#919796; font:7px var(--mono); }
 .access-chip.read { color:#80cba2; border-color:#365342; }
 .availability-pills { width:57px; flex:0 0 57px; display:inline-flex; align-items:center; justify-content:space-between; margin-left:auto; }
@@ -130,9 +126,6 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .availability-pills button:disabled { cursor:default; opacity:.62; }
 .availability-pills button.unknown { border-style:dashed; }
 .discover-availability { display:flex; align-items:center; gap:10px; margin:0 20px 12px; color:#747b79; font:8px var(--mono); text-transform:uppercase; }
-.discover-legend { min-height:37px; display:flex; align-items:center; gap:15px; padding:0 14px; border-top:1px solid var(--border-soft); color:#737a78; font-size:8px; }
-.discover-legend span { display:flex; align-items:center; gap:6px; }
-.discover-legend .access-dot { width:6px; height:6px; }
 .discover-error,.discover-empty-child { padding-top:5px; padding-bottom:6px; color:#d9a26b; font-size:9px; }
 .discover-empty-child { color:#69706f; }
 .discover-detail-head { display:flex; justify-content:space-between; align-items:center; padding:20px 20px 12px; }
@@ -205,7 +198,6 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .discover-controls { display:block; padding:0 10px 10px; border-bottom:1px solid var(--border); }
 .discover-controls .explorer-search { height:33px; }
 .discover-tree { max-height:calc(100vh - 280px); min-height:0; }
-.discover-legend { position:absolute; bottom:0; left:0; right:0; gap:9px; font-size:8px; }
 .tree-object-icon { flex:0 0 14px; color:#e4b42e; }
 .tree-asset-icon { position:relative; width:14px; height:14px; flex:0 0 14px; display:grid; place-items:center; }
 .tree-lock-badge { position:absolute; right:-4px; bottom:-3px; color:#c0c5c2; background:#151719; border-radius:2px; }
