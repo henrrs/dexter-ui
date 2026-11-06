@@ -88,6 +88,15 @@ MIGRATIONS = (
       PRIMARY KEY(operation_id, chunk_index)
     );
     """,
+    """
+    CREATE TABLE operation_worker_leases (
+      operation_id TEXT PRIMARY KEY REFERENCES operations(id) ON DELETE CASCADE,
+      worker_id TEXT NOT NULL,
+      heartbeat_at REAL NOT NULL,
+      expires_at REAL NOT NULL
+    );
+    CREATE INDEX operation_worker_leases_expiry ON operation_worker_leases(expires_at);
+    """,
 )
 
 

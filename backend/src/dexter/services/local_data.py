@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,7 +74,11 @@ class LocalDataService:
 
     def recover(self) -> int:
         with transaction(self.db_path) as db:
-            rows = db.execute("SELECT l.operation_id,l.staging_path,o.state,o.details_json FROM local_materialization_locks l JOIN operations o ON o.id=l.operation_id").fetchall()
+            rows = db.execute(
+                "SELECT l.operation_id,l.staging_path,o.state,o.details_json,w.expires_at "
+                "FROM local_materialization_locks l JOIN operations o ON o.id=l.operation_id "
+                "LEFT JOIN operation_worker_leases w ON w.operation_id=o.id"
+            ).fetchall()
             preserved = set()
             abandoned = []
             for row in rows:
@@ -81,7 +86,10 @@ class LocalDataService:
                     details = json.loads(row["details_json"] or "{}")
                 except ValueError:
                     details = {}
-                if (row["state"] in {"interrupted", "failed"}
+                if (row["state"] in {"queued", "running"}
+                        and row["expires_at"] and row["expires_at"] > time.time()):
+                    preserved.add(str(Path(row["staging_path"]).resolve()))
+                elif (row["state"] in {"interrupted", "failed"}
                         and details.get("retry_available") is True
                         and details.get("resume_available") is True):
                     preserved.add(str(Path(row["staging_path"]).resolve()))

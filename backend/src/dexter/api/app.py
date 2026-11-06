@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,7 +27,7 @@ from dexter.catalog.unified import UnifiedDiscoverService, _variants
 from dexter.db.database import migrate
 from dexter.logging_config import configure_logging
 from dexter.paths import DexterPaths
-from dexter.services.operations import OperationsService, SettingsRepository
+from dexter.services.operations import OperationsService, SettingsRepository, QUEUED_WORKER_LEASE_SECONDS
 from dexter.services.local_data import LocalDataService
 from dexter.services.materialize import make_local_worker
 from dexter.services.analytics_config import load_limits
@@ -193,6 +194,20 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     materializers = ThreadPoolExecutor(max_workers=analytics_limits.concurrent, thread_name_prefix="dexter-make-local")
     materialization_slots = threading.BoundedSemaphore(analytics_limits.concurrent + analytics_limits.queued)
 
+    def materialization_finished(operation_id: str, worker_id: str, _future) -> None:
+        try:
+            failure = _future.exception()
+            current = operations.get(operation_id)
+            if failure and current and current["state"] == "queued":
+                operations.log(operation_id, f"Materialization worker could not start ({type(failure).__name__})", "error")
+                operations.update_details(operation_id, retry_available=False, resume_available=False)
+                operations.transition(operation_id, "failed", message="Materialization worker could not start",
+                                      error_code="WORKER_START_FAILED",
+                                      error_message="Dexter could not start the local materialization worker.")
+            operations.release_worker_lease(operation_id, worker_id)
+        finally:
+            materialization_slots.release()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         recovered = operations.recover()
@@ -201,7 +216,26 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             logger.info("Recovered interrupted operations count=%s", recovered)
         if cleaned:
             logger.info("Removed abandoned local materialization staging count=%s", cleaned)
-        yield
+        stop_lease_monitor = threading.Event()
+
+        def monitor_worker_leases():
+            while not stop_lease_monitor.wait(10):
+                try:
+                    stale = operations.recover_stale_workers()
+                    if stale:
+                        removed = local_data.recover()
+                        logger.warning("Recovered stale Make Local workers count=%s staging_removed=%s", stale, removed)
+                except Exception as exc:
+                    logger.warning("Worker lease reconciliation failed (%s)", type(exc).__name__)
+
+        lease_monitor = threading.Thread(target=monitor_worker_leases, name="dexter-worker-lease-monitor", daemon=True)
+        lease_monitor.start()
+        try:
+            yield
+        finally:
+            stop_lease_monitor.set()
+            lease_monitor.join(timeout=11)
+            materializers.shutdown(wait=False, cancel_futures=False)
 
     app = FastAPI(title="Dexter Local API", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:4173", "http://localhost:4173"], allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type"], max_age=300)
@@ -370,22 +404,46 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                   resume_available=False)
         operations.log(operation["id"], f"Queued complete snapshot for {parts[1].upper()} {detail.get('qualified_name', '')}")
         slot_acquired = False
+        worker_id = uuid.uuid4().hex
+        worker_lease_acquired = False
         try:
             if not materialization_slots.acquire(blocking=False):
                 operations.transition(operation["id"], "failed", message="Materialization queue is full", error_code="QUEUE_FULL", error_message="Wait for a running materialization to finish.")
                 raise HTTPException(409, detail="The local materialization queue is full")
             slot_acquired = True
+            worker_lease_acquired = operations.acquire_worker_lease(
+                operation["id"], worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS
+            )
+            if not worker_lease_acquired:
+                raise HTTPException(409, detail="A worker already owns this Make Local operation")
             future = materializers.submit(make_local_worker, operation_id=operation["id"], operations=operations, local_data=local_data,
                                  paths=paths, settings_repo=settings_repo, environment=parts[1], catalog=parts[2], schema=parts[3],
-                                 table=parts[4], columns=body.columns, filters=body.filters, warehouse_id=body.warehouse_id, detail=detail)
-            future.add_done_callback(lambda _future: materialization_slots.release())
+                                 table=parts[4], columns=body.columns, filters=body.filters, warehouse_id=body.warehouse_id,
+                                 detail=detail, worker_id=worker_id)
+            future.add_done_callback(lambda _future: materialization_finished(operation["id"], worker_id, _future))
             slot_acquired = False
+            worker_lease_acquired = False
         except RuntimeError:
+            if worker_lease_acquired: operations.release_worker_lease(operation["id"], worker_id)
             if slot_acquired: materialization_slots.release()
             current = operations.get(operation["id"])
             if current and current["state"] == "queued":
                 operations.transition(operation["id"], "failed", message="Materialization queue is full", error_code="QUEUE_FULL", error_message="Wait for a running materialization to finish.")
             raise HTTPException(409, detail="The local materialization queue is full") from None
+        except HTTPException:
+            if worker_lease_acquired: operations.release_worker_lease(operation["id"], worker_id)
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation["id"])
+            if current and current["state"] == "queued":
+                operations.transition(operation["id"], "failed", message="Materialization worker could not be claimed", error_code="WORKER_LEASE_BUSY", error_message="Another worker owns this operation.")
+            raise
+        except Exception:
+            if worker_lease_acquired: operations.release_worker_lease(operation["id"], worker_id)
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation["id"])
+            if current and current["state"] == "queued":
+                operations.transition(operation["id"], "failed", message="Materialization worker could not be started", error_code="WORKER_START_FAILED", error_message="Dexter could not schedule the local materialization worker.")
+            raise HTTPException(503, detail="The local materialization worker could not be started") from None
         return operations.get(operation["id"])
 
     @app.post("/api/discover/preview")
@@ -514,36 +572,57 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if not detail or detail.get("access") != "read":
             raise HTTPException(403, detail="Read access to the saved table is no longer confirmed")
         slot_acquired = False
+        worker_id = uuid.uuid4().hex
+        worker_lease_acquired = False
         try:
             if not materialization_slots.acquire(blocking=False):
                 raise HTTPException(409, detail="The local materialization queue is full")
             slot_acquired = True
             queued = operations.requeue(operation_id)
+            worker_lease_acquired = operations.acquire_worker_lease(
+                operation_id, worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS
+            )
+            if not worker_lease_acquired:
+                raise HTTPException(409, detail="A worker already owns this Make Local operation")
             operations.log(operation_id, "Retry queued; verified Parquet chunks will be checked before resuming")
             future = materializers.submit(
                 make_local_worker, operation_id=operation_id, operations=operations,
                 local_data=local_data, paths=paths, settings_repo=settings_repo,
                 environment=environment, catalog=request["catalog"], schema=request["schema"],
                 table=request["table"], columns=request["columns"], filters=request.get("filters", []),
-                warehouse_id=request["warehouse_id"], detail=detail,
+                warehouse_id=request["warehouse_id"], detail=detail, worker_id=worker_id,
             )
-            future.add_done_callback(lambda _future: materialization_slots.release())
+            future.add_done_callback(lambda _future: materialization_finished(operation_id, worker_id, _future))
             slot_acquired = False
+            worker_lease_acquired = False
             return queued
         except HTTPException:
+            if worker_lease_acquired: operations.release_worker_lease(operation_id, worker_id)
             if slot_acquired: materialization_slots.release()
+            current = operations.get(operation_id)
+            if current and current["state"] == "queued":
+                operations.transition(operation_id, "failed", message="Materialization worker could not be claimed", error_code="WORKER_LEASE_BUSY", error_message="Another worker owns this operation.")
             raise
         except (KeyError, TypeError, ValueError) as exc:
+            if worker_lease_acquired: operations.release_worker_lease(operation_id, worker_id)
             if slot_acquired: materialization_slots.release()
             current = operations.get(operation_id)
             if current and current["state"] == "queued":
                 operations.transition(operation_id, "failed", message="The resume worker could not be started", error_code="WORKER_START_FAILED", error_message="The saved Make Local request could not be resumed.")
             raise HTTPException(409, detail="The saved Make Local request could not be resumed") from exc
         except RuntimeError:
+            if worker_lease_acquired: operations.release_worker_lease(operation_id, worker_id)
             if slot_acquired: materialization_slots.release()
             current = operations.get(operation_id)
             if current and current["state"] == "queued":
                 operations.transition(operation_id, "failed", message="The resume worker could not be started", error_code="WORKER_START_FAILED", error_message="The local materialization worker could not be started.")
+            raise HTTPException(503, detail="The local materialization worker could not be started") from None
+        except Exception:
+            if worker_lease_acquired: operations.release_worker_lease(operation_id, worker_id)
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation_id)
+            if current and current["state"] == "queued":
+                operations.transition(operation_id, "failed", message="The resume worker could not be started", error_code="WORKER_START_FAILED", error_message="Dexter could not schedule the saved materialization request.")
             raise HTTPException(503, detail="The local materialization worker could not be started") from None
 
     frontend_dist = Path.cwd() / "dist"

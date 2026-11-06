@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dexter.db.database import transaction
 from dexter.domain.operations import ensure_transition
+
+WORKER_LEASE_SECONDS = 90
+QUEUED_WORKER_LEASE_SECONDS = 24 * 60 * 60
 
 
 def now() -> str:
@@ -73,6 +77,7 @@ class OperationsService:
             if row["kind"] != "make-local" or row["state"] not in {"failed", "interrupted"}:
                 raise ValueError("Only failed or interrupted Make Local operations can be resumed")
             ensure_transition(row["state"], "queued")
+            conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (operation_id,))
             conn.execute("UPDATE operations SET state='queued',message='Resuming verified local snapshot chunks',error_code=NULL,error_message=NULL,cancel_requested=0,updated_at=?,finished_at=NULL WHERE id=?", (stamp, operation_id))
             return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
 
@@ -96,11 +101,171 @@ class OperationsService:
         with transaction(self.db_path) as conn:
             conn.execute("DELETE FROM materialization_chunks WHERE operation_id=?", (operation_id,))
 
+    def acquire_worker_lease(self, operation_id: str, worker_id: str,
+                             lease_seconds: int = WORKER_LEASE_SECONDS) -> bool:
+        stamp = time.time()
+        expires = stamp + max(WORKER_LEASE_SECONDS, lease_seconds)
+        with transaction(self.db_path) as conn:
+            operation = conn.execute("SELECT state,kind FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not operation or operation["kind"] != "make-local" or operation["state"] not in {"queued", "running"}:
+                return False
+            lease = conn.execute("SELECT worker_id,expires_at FROM operation_worker_leases WHERE operation_id=?", (operation_id,)).fetchone()
+            if lease and lease["worker_id"] != worker_id and lease["expires_at"] > stamp:
+                return False
+            conn.execute(
+                "INSERT INTO operation_worker_leases(operation_id,worker_id,heartbeat_at,expires_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(operation_id) DO UPDATE SET worker_id=excluded.worker_id,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at",
+                (operation_id, worker_id, stamp, expires),
+            )
+            return True
+
+    def renew_worker_lease(self, operation_id: str, worker_id: str) -> bool:
+        stamp = time.time()
+        with transaction(self.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE operation_worker_leases SET heartbeat_at=?,expires_at=? WHERE operation_id=? AND worker_id=?",
+                (stamp, stamp + WORKER_LEASE_SECONDS, operation_id, worker_id),
+            )
+            return cursor.rowcount == 1
+
+    def worker_lease_owned(self, operation_id: str, worker_id: str) -> bool:
+        with transaction(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM operation_worker_leases WHERE operation_id=? AND worker_id=? AND expires_at>?",
+                (operation_id, worker_id, time.time()),
+            ).fetchone()
+            return row is not None
+
+    def release_worker_lease(self, operation_id: str, worker_id: str) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=? AND worker_id=?", (operation_id, worker_id))
+
+    def mark_statement_submitting(self, operation_id: str, worker_id: str) -> bool:
+        stamp = time.time()
+        with transaction(self.db_path) as conn:
+            lease = conn.execute(
+                "SELECT 1 FROM operation_worker_leases WHERE operation_id=? AND worker_id=? AND expires_at>?",
+                (operation_id, worker_id, stamp),
+            ).fetchone()
+            row = conn.execute("SELECT details_json FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not lease or not row:
+                return False
+            details = json.loads(row["details_json"] or "{}")
+            details.update({"phase": "submitting_query", "submission_state": "submitting",
+                            "statement_id": None, "result_fingerprint": None,
+                            "submission_started_at": stamp, "retry_available": True,
+                            "resume_available": False})
+            conn.execute("UPDATE operations SET details_json=?,updated_at=? WHERE id=?",
+                         (json.dumps(details, separators=(",", ":")), now(), operation_id))
+            return True
+
+    def record_statement_id(self, operation_id: str, worker_id: str, statement_id: str) -> bool:
+        stamp = time.time()
+        with transaction(self.db_path) as conn:
+            lease = conn.execute(
+                "SELECT 1 FROM operation_worker_leases WHERE operation_id=? AND worker_id=? AND expires_at>?",
+                (operation_id, worker_id, stamp),
+            ).fetchone()
+            row = conn.execute("SELECT details_json FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not lease or not row:
+                return False
+            details = json.loads(row["details_json"] or "{}")
+            details.update({"phase": "query", "statement_id": statement_id,
+                            "submission_state": "accepted", "retry_available": True,
+                            "resume_available": False})
+            conn.execute("UPDATE operations SET details_json=?,updated_at=? WHERE id=?",
+                         (json.dumps(details, separators=(",", ":")), now(), operation_id))
+            return True
+
+    def mark_submission_unknown(self, operation_id: str, worker_id: str) -> bool:
+        stamp = time.time()
+        with transaction(self.db_path) as conn:
+            lease = conn.execute(
+                "SELECT 1 FROM operation_worker_leases WHERE operation_id=? AND worker_id=? AND expires_at>?",
+                (operation_id, worker_id, stamp),
+            ).fetchone()
+            row = conn.execute("SELECT details_json FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not lease or not row:
+                return False
+            details = json.loads(row["details_json"] or "{}")
+            details.update({"phase": "submission_unknown", "submission_state": "unknown",
+                            "retry_available": False, "resume_available": False})
+            conn.execute("UPDATE operations SET details_json=?,updated_at=? WHERE id=?",
+                         (json.dumps(details, separators=(",", ":")), now(), operation_id))
+            return True
+
+    def mark_submission_rejected(self, operation_id: str, worker_id: str) -> bool:
+        stamp = time.time()
+        with transaction(self.db_path) as conn:
+            lease = conn.execute(
+                "SELECT 1 FROM operation_worker_leases WHERE operation_id=? AND worker_id=? AND expires_at>?",
+                (operation_id, worker_id, stamp),
+            ).fetchone()
+            row = conn.execute("SELECT details_json FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if not lease or not row:
+                return False
+            details = json.loads(row["details_json"] or "{}")
+            details.update({"submission_state": "rejected", "phase": "query_rejected"})
+            conn.execute("UPDATE operations SET details_json=?,updated_at=? WHERE id=?",
+                         (json.dumps(details, separators=(",", ":")), now(), operation_id))
+            return True
+
     def recover(self) -> int:
         stamp = now()
+        clock = time.time()
         with transaction(self.db_path) as conn:
-            cursor = conn.execute("UPDATE operations SET state='interrupted',message='Process restarted before operation completed',error_code='PROCESS_RESTARTED',error_message='The operation did not finish before Dexter restarted.',updated_at=?,finished_at=? WHERE state='running' OR (state='queued' AND kind='make-local')", (stamp, stamp))
-            return cursor.rowcount
+            rows = conn.execute(
+                "SELECT o.id,o.kind,o.state,o.details_json,l.worker_id,l.expires_at "
+                "FROM operations o LEFT JOIN operation_worker_leases l ON l.operation_id=o.id "
+                "WHERE o.state='running' OR (o.state='queued' AND o.kind='make-local')"
+            ).fetchall()
+            recovered = 0
+            for row in rows:
+                if (row["state"] == "running" and row["kind"] == "make-local"
+                        and row["expires_at"] and row["expires_at"] > clock):
+                    continue
+                self._interrupt_row(conn, row, stamp, "PROCESS_RESTARTED")
+                conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (row["id"],))
+                recovered += 1
+            conn.execute("DELETE FROM operation_worker_leases WHERE expires_at<=?", (clock,))
+            return recovered
+
+    def recover_stale_workers(self) -> int:
+        stamp = now()
+        clock = time.time()
+        with transaction(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT o.id,o.kind,o.state,o.details_json,l.worker_id,l.expires_at "
+                "FROM operations o LEFT JOIN operation_worker_leases l ON l.operation_id=o.id "
+                "WHERE o.kind='make-local' AND o.state IN ('queued','running') "
+                "AND ((o.state='running' AND l.operation_id IS NULL) OR (l.operation_id IS NOT NULL AND l.expires_at<=?))",
+                (clock,),
+            ).fetchall()
+            for row in rows:
+                self._interrupt_row(conn, row, stamp, "WORKER_LEASE_EXPIRED")
+                conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (row["id"],))
+            return len(rows)
+
+    @staticmethod
+    def _interrupt_row(conn, row, stamp: str, reason: str) -> None:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        submission_uncertain = details.get("submission_state") in {"submitting", "unknown"} and not details.get("statement_id")
+        can_retry = bool(details.get("materialization_request")) and not submission_uncertain
+        details["retry_available"] = can_retry
+        error_code = "SUBMISSION_UNKNOWN" if submission_uncertain else reason
+        error_message = (
+            "Databricks may have accepted the query, but Dexter did not save its statement ID. "
+            "Check Databricks query history before starting another copy."
+            if submission_uncertain else
+            "The Make Local worker stopped. Resume is available only when the remote submission state is known."
+        )
+        conn.execute(
+            "UPDATE operations SET state='interrupted',message='Worker stopped before operation completed',error_code=?,error_message=?,details_json=?,updated_at=?,finished_at=? WHERE id=?",
+            (error_code, error_message, json.dumps(details, separators=(",", ":")), stamp, stamp, row["id"]),
+        )
 
     def log(self, operation_id: str, message: str, level: str = "info") -> None:
         with transaction(self.db_path) as conn:

@@ -13,6 +13,7 @@ import socket
 import ssl
 import stat
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,10 +25,127 @@ MAX_ARROW_CHUNK_BYTES = 2 * 1024 ** 3
 CHUNK_RETRY_ATTEMPTS = 4
 CHUNK_DOWNLOAD_TIMEOUT_SECONDS = 120
 MAX_RESULT_CHUNKS = 100_000
+WORKER_HEARTBEAT_SECONDS = 10
+
+
+class SubmissionOutcomeUnknown(RuntimeError):
+    """The remote statement may exist, but Dexter did not persist its identifier."""
+
+
+class RemoteResultExpired(RuntimeError):
+    """Databricks no longer exposes the completed statement result."""
+
+
+class WorkerLeaseLost(RuntimeError):
+    """This worker no longer owns the durable operation lease."""
 
 
 def _get(value, key, default=None):
     return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+
+
+def _http_status(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+    return status if isinstance(status, int) else None
+
+
+def _is_transient_failure(exc: Exception) -> bool:
+    if isinstance(exc, (SubmissionOutcomeUnknown, RemoteResultExpired, WorkerLeaseLost)):
+        return False
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28:
+        return False
+    status = _http_status(exc)
+    if status is not None:
+        return status in {408, 425, 429, 500, 502, 503, 504}
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, socket.timeout,
+                            ssl.SSLError, ConnectionError, ConnectionResetError,
+                            ConnectionRefusedError))
+
+
+def _submit_read_statement(*, workspace, operations, operation_id: str, statement: str,
+                           warehouse_id: str, parameters: list[dict], worker_id: str,
+                           assert_lease) -> tuple[str, object]:
+    details = (operations.get(operation_id) or {}).get("details", {})
+    if not details.get("statement_id") and details.get("submission_state") in {"submitting", "unknown"}:
+        raise SubmissionOutcomeUnknown(
+            "Databricks may have accepted the query, but Dexter did not save its statement ID. "
+            "Check Databricks query history before starting a new copy."
+        )
+
+    if not operations.mark_statement_submitting(operation_id, worker_id):
+        raise WorkerLeaseLost("The Make Local worker lease expired before query submission")
+    assert_lease()
+    current = operations.get(operation_id)
+    if current and current["cancel_requested"]:
+        raise InterruptedError("Materialization cancelled before query submission")
+    try:
+        response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
+            "statement": statement, "warehouse_id": warehouse_id, "wait_timeout": "0s",
+            "on_wait_timeout": "CONTINUE", "format": "ARROW_STREAM",
+            "disposition": "EXTERNAL_LINKS", "parameters": parameters,
+        })
+    except Exception as exc:
+        status = _http_status(exc)
+        if status is not None and 400 <= status < 500 and status != 408:
+            # A definitive client response means Databricks rejected the request.
+            if not operations.mark_submission_rejected(operation_id, worker_id):
+                raise WorkerLeaseLost("The worker lost its lease after Databricks rejected the query") from exc
+            raise
+        if not operations.mark_submission_unknown(operation_id, worker_id):
+            raise WorkerLeaseLost("The worker lost its lease while the submission outcome was uncertain") from exc
+        raise SubmissionOutcomeUnknown(
+            "The Databricks submission outcome is unknown. Check query history before starting a new copy."
+        ) from exc
+
+    assert_lease()
+    statement_id = _get(response, "statement_id")
+    if not isinstance(statement_id, str) or not statement_id:
+        raise SubmissionOutcomeUnknown(
+            "Databricks accepted the submission request without returning a statement ID. "
+            "Check query history before starting a new copy."
+        )
+    try:
+        if not operations.record_statement_id(operation_id, worker_id, statement_id):
+            raise SubmissionOutcomeUnknown(
+                "Databricks accepted the query, but this worker could not persist its statement ID. "
+                "Check query history before starting a new copy."
+            )
+    except Exception as exc:
+        if isinstance(exc, SubmissionOutcomeUnknown):
+            raise
+        # The POST succeeded, but without a durable statement ID an automatic retry could duplicate it.
+        raise SubmissionOutcomeUnknown(
+            "Databricks accepted the query, but Dexter could not persist its statement ID. "
+            "Check query history before starting a new copy."
+        ) from exc
+    return statement_id, response
+
+
+def _get_result_chunk(*, workspace, operations, operation_id: str, statement_id: str,
+                      chunk_index: int):
+    for attempt in range(CHUNK_RETRY_ATTEMPTS):
+        try:
+            return workspace.api_client.do(
+                "GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}"
+            )
+        except Exception as exc:
+            status = _http_status(exc)
+            if status in {404, 410}:
+                raise RemoteResultExpired(
+                    "Databricks no longer exposes this statement result. Start a new Make Local operation."
+                ) from None
+            if not _is_transient_failure(exc) or attempt + 1 >= CHUNK_RETRY_ATTEMPTS:
+                raise
+            operations.log(
+                operation_id,
+                f"Result chunk {chunk_index + 1} metadata retry {attempt + 2}/{CHUNK_RETRY_ATTEMPTS}: "
+                f"reason={_transfer_failure_reason(exc)}, http_status={status or 'none'}",
+                "warning",
+            )
+            time.sleep(min(4.0, 0.25 * (2 ** attempt) + random.uniform(0.0, 0.25)))
+    raise AssertionError("unreachable result metadata retry state")
 
 
 def _quote(identifier: str) -> str:
@@ -136,7 +254,7 @@ def _verified_chunks(operations, operation_id: str, staging, pq):
 
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
-                           minimum_free: int) -> tuple[str, int, str]:
+                           minimum_free: int, lease_lost=None) -> tuple[str, int, str]:
     """Download a complete Arrow result link before parsing it, so retries cannot duplicate rows."""
     result_path = None
     current_link = initial_link
@@ -185,6 +303,8 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     digest = hashlib.sha256()
                     downloaded_bytes = 0
                     while True:
+                        if lease_lost is not None and lease_lost.is_set():
+                            raise WorkerLeaseLost("The Make Local worker lease expired or was taken over")
                         current = operations.get(operation_id)
                         if current and current["cancel_requested"]:
                             raise InterruptedError("Materialization cancelled")
@@ -218,6 +338,10 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
             raise
         except urllib.error.HTTPError as exc:
             last_error = exc
+            if exc.code == 410:
+                raise RemoteResultExpired(
+                    "Databricks no longer exposes this statement result. Start a new Make Local operation."
+                ) from None
             if exc.code not in {401, 403, 404, 408, 429, 500, 502, 503, 504}:
                 operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer stopped: http_{exc.code}", "error")
                 raise RuntimeError(f"Databricks rejected result chunk download (HTTP {exc.code})") from None
@@ -242,7 +366,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 result_path = None
 
         link_renewed = False
-        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404}:
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404, 410}:
             try:
                 refreshed = workspace.api_client.do(
                     "GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}"
@@ -250,10 +374,18 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 refreshed_links = _get(_get(refreshed, "result", refreshed), "external_links", []) or []
                 renewed_link = _link_for_chunk(refreshed_links, chunk_index, link_index)
                 if renewed_link is None:
-                    raise TimeoutError("Databricks result link expired and could not be renewed")
+                    raise RemoteResultExpired(
+                        "Databricks no longer exposes this statement result. Start a new Make Local operation."
+                    )
                 current_link = renewed_link
                 link_renewed = True
             except Exception as exc:
+                if isinstance(exc, RemoteResultExpired):
+                    raise
+                if _http_status(exc) in {404, 410}:
+                    raise RemoteResultExpired(
+                        "Databricks no longer exposes this statement result. Start a new Make Local operation."
+                    ) from None
                 last_error = exc
         reason = _transfer_failure_reason(last_error)
         elapsed = time.monotonic() - started_at
@@ -270,6 +402,10 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 pass
         time.sleep(delay)
 
+    if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404}:
+        raise RemoteResultExpired(
+            "Databricks no longer exposes this statement result. Start a new Make Local operation."
+        ) from None
     raise TimeoutError(f"Databricks result chunk failed after {CHUNK_RETRY_ATTEMPTS} attempts: {_transfer_failure_reason(last_error)}") from last_error
 
 
@@ -300,12 +436,42 @@ def build_select(catalog: str, schema: str, table: str, columns: list[str], filt
 
 def make_local_worker(*, operation_id: str, operations, local_data, paths, settings_repo,
                       environment: str, catalog: str, schema: str, table: str, columns: list[str],
-                      filters: list[dict], warehouse_id: str, detail: dict) -> None:
+                      filters: list[dict], warehouse_id: str, detail: dict,
+                      worker_id: str | None = None) -> None:
     """Materialize a full result with durable, independently verified Parquet chunk checkpoints."""
     staging = paths.temporary / f"make-local-{operation_id}"
     statement_id = None
     reservation = None
+    worker_id = worker_id or uuid.uuid4().hex
+    lease_acquired = False
+    worker_lease_lost = False
+    heartbeat_stop = threading.Event()
+    heartbeat_lost = threading.Event()
+    heartbeat_thread = None
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(WORKER_HEARTBEAT_SECONDS):
+            try:
+                if not operations.renew_worker_lease(operation_id, worker_id):
+                    heartbeat_lost.set()
+                    return
+            except Exception:
+                heartbeat_lost.set()
+                return
+
+    def assert_lease() -> None:
+        if heartbeat_lost.is_set() or not operations.worker_lease_owned(operation_id, worker_id):
+            heartbeat_lost.set()
+            raise WorkerLeaseLost("The Make Local worker lease expired or was taken over")
+
     try:
+        lease_acquired = operations.acquire_worker_lease(operation_id, worker_id)
+        if not lease_acquired:
+            worker_lease_lost = True
+            return
+        heartbeat_thread = threading.Thread(target=heartbeat, name=f"dexter-make-local-{operation_id[:8]}", daemon=True)
+        heartbeat_thread.start()
+        assert_lease()
         current = operations.get(operation_id)
         if not current or current["state"] == "cancelled":
             return
@@ -333,6 +499,7 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         sql, parameters = build_select(catalog, schema, table, columns, filters, schema_columns)
         # Databricks Statement Execution parameters use typed literal values, never string interpolation.
         statement_parameters = [{"name": f"p{i}", "value": _sql_literal(value), "type": _parameter_type(value)} for i, value in enumerate(parameters)]
+        assert_lease()
         operations.transition(operation_id, "running", progress=2, message="Checking selected warehouse and materialization checkpoint")
         published_id = uuid.uuid5(uuid.NAMESPACE_URL, reservation).hex
         already_published = local_data.get(published_id)
@@ -349,11 +516,18 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         operations.log(operation_id, "Validating selected PROD profile, table access, schema, and SQL warehouse")
         current_details = (operations.get(operation_id) or {}).get("details", {})
         statement_id = current_details.get("statement_id")
+        if (not statement_id
+                and current_details.get("submission_state") in {"submitting", "unknown"}):
+            raise SubmissionOutcomeUnknown(
+                "Databricks may have accepted the query, but Dexter did not save its statement ID. "
+                "Check Databricks query history before starting a new copy."
+            )
         status_response = None
         resuming_statement = bool(statement_id)
         if statement_id:
             try:
                 status_response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
+                assert_lease()
             except Exception as exc:
                 if getattr(exc, "status_code", None) == 404:
                     status_response = None
@@ -382,24 +556,22 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         if not statement_id:
             operations.update_details(operation_id, phase="warehouse", rows=0, bytes=0, files=0)
             operations.transition(operation_id, "running", progress=3, message="Starting selected SQL warehouse if needed")
+            assert_lease()
             ensure_sql_warehouse_running(workspace, warehouse_id)
             operations.log(operation_id, "Submitting a read-only full snapshot query")
             operations.transition(operation_id, "running", progress=5, message="Submitting full snapshot query")
-            response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
-                "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
-                "format": "ARROW_STREAM", "disposition": "EXTERNAL_LINKS", "parameters": statement_parameters,
-            })
-            statement_id = _get(response, "statement_id")
-            if not statement_id:
-                raise RuntimeError("Databricks did not return a statement identifier")
+            statement_id, response = _submit_read_statement(
+                workspace=workspace, operations=operations, operation_id=operation_id,
+                statement=sql, warehouse_id=warehouse_id, parameters=statement_parameters,
+                worker_id=worker_id, assert_lease=assert_lease,
+            )
             status_response = response
-            operations.update_details(operation_id, phase="query", statement_id=statement_id,
-                                      result_fingerprint=None, resume_available=False, retry_available=True)
             resuming_statement = False
 
         # Continue polling an existing statement after a process restart; the query is never reissued just because the worker died.
         query_deadline = time.monotonic() + 48 * 60 * 60
         while True:
+            assert_lease()
             current = operations.get(operation_id)
             if current and current["cancel_requested"]:
                 try:
@@ -412,6 +584,7 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 finally:
                     raise TimeoutError("Databricks statement exceeded Dexter's 48-hour maximum duration")
             status_response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
+            assert_lease()
             status = _get(_get(status_response, "status", {}), "state", "").upper().split(".")[-1]
             if status == "SUCCEEDED":
                 break
@@ -423,18 +596,16 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                     for path in staging.glob("chunk-*.parquet"):
                         if not path.is_symlink():
                             path.unlink(missing_ok=True)
-                    operations.update_details(operation_id, statement_id=None, result_fingerprint=None, resume_available=False)
+                    operations.update_details(operation_id, statement_id=None, result_fingerprint=None,
+                                              resume_available=False, submission_state="terminal")
                     ensure_sql_warehouse_running(workspace, warehouse_id)
-                    response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
-                        "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
-                        "format": "ARROW_STREAM", "disposition": "EXTERNAL_LINKS", "parameters": statement_parameters,
-                    })
-                    statement_id = _get(response, "statement_id")
-                    if not statement_id:
-                        raise RuntimeError("Databricks did not return a statement identifier")
+                    statement_id, response = _submit_read_statement(
+                        workspace=workspace, operations=operations, operation_id=operation_id,
+                        statement=sql, warehouse_id=warehouse_id, parameters=statement_parameters,
+                        worker_id=worker_id, assert_lease=assert_lease,
+                    )
                     resuming_statement = False
                     status_response = response
-                    operations.update_details(operation_id, phase="query", statement_id=statement_id)
                     continue
                 raise RuntimeError("Databricks did not complete the authorized read query")
             operations.transition(operation_id, "running", progress=12, message="Waiting for Databricks query")
@@ -488,20 +659,24 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                                   source_bytes=source_bytes, files=len(records))
 
         for chunk_index in range(chunk_count):
+            assert_lease()
             if chunk_index in completed:
                 continue
             current = operations.get(operation_id)
             if current and current["cancel_requested"]:
                 workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
                 raise InterruptedError("Materialization cancelled")
-            chunk = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}")
+            chunk = _get_result_chunk(workspace=workspace, operations=operations,
+                                      operation_id=operation_id, statement_id=statement_id,
+                                      chunk_index=chunk_index)
+            assert_lease()
             links = _get(_get(chunk, "result", chunk), "external_links", []) or []
             if not links:
-                raise RuntimeError(f"Databricks returned no signed URL for result chunk {chunk_index}")
+                raise RemoteResultExpired("Databricks no longer exposes the completed result. Start a new Make Local operation.")
             link_index = 0
             link = _link_for_chunk(links, chunk_index, link_index)
             if link is None:
-                raise RuntimeError(f"Databricks returned no signed URL for result chunk {chunk_index}")
+                raise RemoteResultExpired("Databricks no longer exposes the completed result. Start a new Make Local operation.")
             expected_chunk_bytes = _get(link, "byte_count")
             if isinstance(expected_chunk_bytes, int):
                 free_bytes = shutil.disk_usage(staging).free
@@ -515,9 +690,11 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 workspace=workspace, statement_id=statement_id, chunk_index=chunk_index,
                 link_index=link_index, initial_link=link, staging=staging,
                 operations=operations, operation_id=operation_id, minimum_free=minimum_free,
+                lease_lost=heartbeat_lost,
             )
+            assert_lease()
             chunk_path = staging / f"chunk-{chunk_index:06d}.parquet"
-            temporary_parquet = staging / f".chunk-{chunk_index:06d}.parquet.tmp"
+            temporary_parquet = staging / f".chunk-{chunk_index:06d}-{worker_id}.parquet.tmp"
             writer = None
             chunk_rows = 0
             try:
@@ -531,12 +708,14 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                         output_columns = [{"name": field.name, "type": str(field.type), "nullable": field.nullable} for field in reader_schema]
                     writer = pq.ParquetWriter(temporary_parquet, reader_schema, compression="zstd")
                     for batch in reader:
+                        assert_lease()
                         current = operations.get(operation_id)
                         if current and current["cancel_requested"]:
                             workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
                             raise InterruptedError("Materialization cancelled")
                         writer.write_batch(batch)
                         chunk_rows += batch.num_rows
+                assert_lease()
                 writer.close()
                 writer = None
                 with open(temporary_parquet, "rb") as completed_file:
@@ -554,11 +733,13 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 parquet_file_bytes = temporary_parquet.stat().st_size
                 parquet_digest = _file_sha256(temporary_parquet)
                 os.chmod(temporary_parquet, stat.S_IRUSR | stat.S_IWUSR)
+                assert_lease()
                 os.replace(temporary_parquet, chunk_path)
                 record = {"index": chunk_index, "rows": chunk_rows, "arrow_bytes": arrow_bytes,
                           "parquet_bytes": parquet_file_bytes, "arrow_sha256": arrow_digest,
                           "parquet_sha256": parquet_digest, "schema_fingerprint": schema_fingerprint,
                           "columns": output_columns, "file": chunk_path.name}
+                assert_lease()
                 operations.record_chunk(operation_id, record)
                 records.append(record)
                 records.sort(key=lambda item: item["index"])
@@ -614,6 +795,7 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         if not output_columns or [column["name"] for column in output_columns] != columns:
             raise RuntimeError("The final Parquet schema did not match the selected columns")
         current = operations.get(operation_id)
+        assert_lease()
         if current and current["cancel_requested"]:
             raise InterruptedError("Materialization cancelled")
         operations.update_details(operation_id, phase="validating", rows=rows, bytes=parquet_bytes,
@@ -627,20 +809,62 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         operations.transition(operation_id, "succeeded", progress=100, message=f"Snapshot ready · {rows:,} rows")
         operations.update_details(operation_id, resume_available=False, retry_available=False)
     except InterruptedError as exc:
+        if not operations.worker_lease_owned(operation_id, worker_id):
+            worker_lease_lost = True
+            return
         operations.log(operation_id, str(exc), "warning")
         operations.update_details(operation_id, resume_available=False, retry_available=False)
         operations.transition(operation_id, "cancelled", message=str(exc))
+    except WorkerLeaseLost as exc:
+        worker_lease_lost = True
+        operations.log(operation_id, f"Materialization worker stopped after losing its lease: {type(exc).__name__}", "warning")
+    except SubmissionOutcomeUnknown as exc:
+        operations.log(operation_id, "Databricks query submission outcome is unknown; automatic retry is disabled", "error")
+        if not operations.worker_lease_owned(operation_id, worker_id):
+            worker_lease_lost = True
+            return
+        current = operations.get(operation_id)
+        if current and current["state"] in {"queued", "running"}:
+            operations.update_details(operation_id, submission_state="unknown", retry_available=False,
+                                      resume_available=False)
+            operations.transition(operation_id, "failed", progress=current["progress"],
+                                  message="Databricks submission outcome is unknown",
+                                  error_code="SUBMISSION_UNKNOWN", error_message=str(exc))
+    except RemoteResultExpired as exc:
+        if not operations.worker_lease_owned(operation_id, worker_id):
+            worker_lease_lost = True
+            return
+        operations.log(operation_id, "The Databricks result expired or could not be renewed; its checkpoints were discarded", "error")
+        operations.clear_chunks(operation_id)
+        current = operations.get(operation_id)
+        if current and current["state"] in {"queued", "running"}:
+            operations.update_details(operation_id, phase="result_expired", retry_available=False,
+                                      resume_available=False, result_fingerprint=None,
+                                      submission_state="result_expired")
+            operations.transition(operation_id, "failed", progress=current["progress"],
+                                  message="Databricks result expired; start a new Make Local operation",
+                                  error_code="REMOTE_RESULT_EXPIRED", error_message=str(exc))
     except Exception as exc:
+        if not operations.worker_lease_owned(operation_id, worker_id):
+            worker_lease_lost = True
+            return
         operations.log(operation_id, f"Materialization failed ({type(exc).__name__}): {_safe_error(exc)}", "error")
         current = operations.get(operation_id)
         if current and current["state"] in {"queued", "running"}:
             can_resume = bool((current.get("details") or {}).get("resume_available"))
-            operations.update_details(operation_id, retry_available=True, resume_available=can_resume)
+            retryable = _is_transient_failure(exc)
+            operations.update_details(operation_id, retry_available=retryable,
+                                      resume_available=can_resume and retryable)
             operations.transition(operation_id, "failed", progress=current["progress"], message="Materialization failed; the previous local snapshot remains active", error_code=_error_code(exc), error_message=_safe_error(exc))
     finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=WORKER_HEARTBEAT_SECONDS + 1)
         current = operations.get(operation_id) or {}
         details = current.get("details") or {}
-        if current.get("state") in {"failed", "interrupted"} and details.get("resume_available") is True:
+        if worker_lease_lost:
+            pass
+        elif current.get("state") in {"failed", "interrupted"} and details.get("resume_available") is True:
             operations.log(operation_id, "Verified result chunks and the remote statement were preserved for retry")
         elif reservation is not None:
             try:
@@ -649,6 +873,8 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 shutil.rmtree(staging, ignore_errors=True)
         elif staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+        if lease_acquired:
+            operations.release_worker_lease(operation_id, worker_id)
 
 
 def _sql_literal(value):
@@ -670,6 +896,12 @@ def _parameter_type(value):
 
 
 def _safe_error(exc: Exception) -> str:
+    if isinstance(exc, SubmissionOutcomeUnknown):
+        return "Databricks may have accepted the query, but Dexter did not save its statement ID. Check query history before starting another copy."
+    if isinstance(exc, RemoteResultExpired):
+        return "The Databricks result expired and could not be renewed. Start a new Make Local operation."
+    if isinstance(exc, WorkerLeaseLost):
+        return "This worker no longer owns the materialization operation. Resume after the current worker is reconciled."
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     name = type(exc).__name__.lower()
     message = str(exc).lower()
@@ -714,6 +946,9 @@ def _safe_error(exc: Exception) -> str:
 
 
 def _error_code(exc: Exception) -> str:
+    if isinstance(exc, SubmissionOutcomeUnknown): return "SUBMISSION_UNKNOWN"
+    if isinstance(exc, RemoteResultExpired): return "REMOTE_RESULT_EXPIRED"
+    if isinstance(exc, WorkerLeaseLost): return "WORKER_LEASE_LOST"
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     name = type(exc).__name__.lower()
     if "warehouse" in str(exc).lower() and (isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name): return "WAREHOUSE_FORBIDDEN"
