@@ -15,7 +15,6 @@ setup:
 	./scripts/dependency_tool.py npm ci
 
 lock:
-	@command -v uv >/dev/null || { echo "uv is required to generate the Python lockfile."; exit 1; }
 	@command -v npm >/dev/null || { echo "npm is required to generate the frontend lockfile."; exit 1; }
 	$(PYTHON) scripts/lock_dependencies.py
 

@@ -9,26 +9,22 @@ Dexter is a local-first data engineering workspace. F1 provides the React/TypeSc
 - npm
 - A configured corporate Nexus/registry for setup; public package registries are disabled by default
 
-## Configure package registries
+## Package registry discovery
 
-Dexter reads existing pip/npm configuration and environment variables. You can also set the registries explicitly for this shell:
+Dexter automatically reads the local npm and Python package-manager configuration, including project/user/system `.npmrc`, `pip.conf`, and `uv.toml` files, along with their existing proxy, certificate, and authentication settings. No environment variables are required when those registries are already configured on the machine.
 
-```sh
-export DEXTER_NPM_REGISTRY="https://nexus.example/repository/npm/"
-export DEXTER_PYPI_INDEX="https://nexus.example/repository/pypi/simple"
-```
-
-The setup wrappers preserve proxy, certificate, and authentication configuration from the host. They fail when no index is configured, when extra Python indexes could act as fallback sources, or when an unauthorised public index is selected. To use public registries, configure their URLs and set `DEXTER_ALLOW_PUBLIC_REGISTRY=1` only when that use is authorized by your organization. Credentials belong in your existing npm/pip configuration or environment, never in the repository.
+Setup fails when no index is configured, when extra Python indexes could act as fallback sources, or when an unauthorized public index is selected. Credentials belong in the machine's existing npm/pip configuration or credential store, never in the repository.
 
 ## Install and run
 
 ```sh
 make doctor  # local diagnostics; no network
-make lock    # resolve/update both lockfiles through configured registries
 make setup   # creates .venv and installs from the configured registries
 make dev     # API on 127.0.0.1:8000; UI on 127.0.0.1:5173
 make stop
 ```
+
+If a lockfile is missing, `make setup` generates it using the configured registries. When `uv` is not already installed, setup installs it into the ignored `.run/setup-tools/` directory; it does not modify the system Python environment.
 
 The Vite server proxies `/api` to FastAPI. After a build, the API can also serve `dist/` from the same local origin.
 
@@ -36,7 +32,7 @@ The Vite server proxies `/api` to FastAPI. After a build, the API can also serve
 
 | Command | Purpose |
 | --- | --- |
-| `make lock` | Resolve and hash the Python requirements and update the npm lockfile through configured registries. |
+| `make lock` | Resolve and hash the Python requirements and update the npm lockfile through configured registries, bootstrapping a local `uv` tool if needed. |
 | `make setup` | Create `.venv` and install exact, locked Python and npm dependencies through the selected registries. |
 | `make dev` | Start the backend and frontend on loopback. |
 | `make build` | Type-check and bundle the frontend, then compile-check the backend. |

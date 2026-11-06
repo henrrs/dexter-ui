@@ -22,28 +22,50 @@ def report(label: str, ok: bool, detail: str) -> bool:
     return ok
 
 
+def info(label: str, detail: str) -> None:
+    print(f"INFO   {label}: {detail}")
+
+
 def main() -> int:
     network_requested = "--network" in sys.argv[1:]
     checks = []
     checks.append(report("Python", sys.version_info >= (3, 11), sys.version.split()[0] + " (3.11+ required)"))
     checks.append(report("Node.js", shutil.which("node") is not None, "available" if shutil.which("node") else "not installed"))
     checks.append(report("npm", shutil.which("npm") is not None, "available" if shutil.which("npm") else "not installed"))
-    checks.append(report("uv", shutil.which("uv") is not None, "available" if shutil.which("uv") else "not installed; needed for lockfile updates"))
+    if shutil.which("uv"):
+        checks.append(report("uv", True, "available"))
+    else:
+        info("uv", "not installed; lock generation bootstraps it locally from the configured Python registry")
     for package, module in (("FastAPI", "fastapi"), ("Uvicorn", "uvicorn"), ("Databricks SDK", "databricks"), ("Azure Identity", "azure")):
         checks.append(report(package, importlib.util.find_spec(module) is not None, "installed" if importlib.util.find_spec(module) else "not installed"))
     for name, registry in status().items():
         detail = "explicitly configured and allowed" if registry.url and registry.public else "configured corporate registry detected" if registry.url else registry.blocked_reason or "not configured"
         checks.append(report(f"{name} dependency registry", registry.url is not None, detail))
-    checks.append(report("Proxy configuration", proxy_configured(), "present" if proxy_configured() else "not set"))
+    if proxy_configured():
+        checks.append(report("Proxy configuration", True, "present"))
+    else:
+        info("Proxy configuration", "not set; direct network access may still work")
     custom_ca = bool(python_certificate() or npm_custom_ca_configured() or os.environ.get("SSL_CERT_DIR") or os.environ.get("UV_NATIVE_TLS"))
-    checks.append(report("Custom CA configuration", custom_ca, "present" if custom_ca else "not set; system/package-manager defaults apply"))
-    checks.append(report("Dependency lockfiles", Path("package-lock.json").is_file() and Path("requirements.lock").is_file(), "npm and Python lockfiles present" if Path("package-lock.json").is_file() and Path("requirements.lock").is_file() else "one or more lockfiles missing; use make lock with a configured corporate registry"))
-    checks.append(report("Databricks CLI", shutil.which("databricks") is not None, "available" if shutil.which("databricks") else "not installed"))
-    checks.append(report("Azure CLI", shutil.which("az") is not None, "available" if shutil.which("az") else "not installed"))
+    if custom_ca:
+        checks.append(report("Custom CA configuration", True, "present"))
+    else:
+        info("Custom CA configuration", "not set; system/package-manager defaults apply")
+    if Path("package-lock.json").is_file() and Path("requirements.lock").is_file():
+        checks.append(report("Dependency lockfiles", True, "npm and Python lockfiles present"))
+    else:
+        info("Dependency lockfiles", "missing; make setup generates them from the configured registries")
+    for label, executable in (("Databricks CLI", "databricks"), ("Azure CLI", "az")):
+        if shutil.which(executable):
+            checks.append(report(label, True, "available"))
+        else:
+            info(label, "not installed; only needed for its corresponding connection validation")
     try:
         from dexter.adapters.databricks import discover_profiles
         profiles, profile_file = discover_profiles()
-        checks.append(report("Databricks profiles", bool(profiles), f"{len(profiles)} named profile(s) in {profile_file}" if profiles else "no named profiles found"))
+        if profiles:
+            checks.append(report("Databricks profiles", True, f"{len(profiles)} named profile(s) in {profile_file}"))
+        else:
+            info("Databricks profiles", f"no named profiles in {profile_file}; required only to validate a Databricks connection")
     except ImportError:
         pass
     try:
