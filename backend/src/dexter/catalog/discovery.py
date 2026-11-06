@@ -91,18 +91,19 @@ class DiscoverService:
                 from databricks.sdk import WorkspaceClient
                 from dexter.adapters.databricks import profile_config_file
                 workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-                identity = workspace.current_user.me()
-                identity_key = _value(identity, "id") or _value(identity, "user_name") or "unknown"
-                context = context_key("databricks", env, config["profile"], str(identity_key), str(_value(workspace.config, "host", "")))
+                workspace_host = str(_value(workspace.config, "host", ""))
+                context = context_key("databricks", env, config["profile"], workspace_host)
                 cache_key = f"detail:{catalog}.{schema}.{table}"
                 cached = self.cache.get(context, cache_key)
                 if cached and not cached["stale"]:
                     if not cached["items"]: return None
-                    return {**cached["items"][0], "workspace": _value(workspace.config, "host", ""), "profile": config["profile"]}
+                    return {**cached["items"][0], "workspace": workspace_host, "profile": config["profile"]}
+                identity = workspace.current_user.me()
+                identity_key = _value(identity, "id") or _value(identity, "user_name") or "unknown"
                 value = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
                 row = _row(value, "databricks", env, "table", str(identity_key), f"{catalog}.{schema}.{table}")
                 row["id"] = node_id
-                row["workspace"] = _value(workspace.config, "host", "")
+                row["workspace"] = workspace_host
                 row["profile"] = config["profile"]
                 try:
                     current_metastore = workspace.metastores.current()
@@ -147,15 +148,21 @@ class DiscoverService:
         if not config:
             return []
         profile = config["profile"]
-        cache_context = context_key("databricks", env, profile)
+        try:
+            from databricks.sdk import WorkspaceClient
+            from dexter.adapters.databricks import profile_config_file
+            workspace = WorkspaceClient(profile=profile, config_file=str(profile_config_file(profile)))
+            workspace_host = str(_value(workspace.config, "host", ""))
+        except Exception as exc:
+            logger.info("Databricks client configuration failed (%s)", type(exc).__name__)
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False,
+                    "error": "Databricks discovery is unavailable. Check the selected profile and permissions."}
+        cache_context = context_key("databricks", env, profile, workspace_host)
         node_key = "/".join(path) or "catalogs"
         cached = self.cache.get(cache_context, node_key)
         if cached and not cached["stale"] and not force:
             return cached
         try:
-            from databricks.sdk import WorkspaceClient
-            from dexter.adapters.databricks import profile_config_file
-            workspace = WorkspaceClient(profile=profile, config_file=str(profile_config_file(profile)))
             me = workspace.current_user.me()
             identity = _value(me, "id") or _value(me, "user_name") or "unknown"
             metastore_id = None
@@ -165,10 +172,6 @@ class DiscoverService:
             except Exception:
                 # Workspace metadata remains discoverable if this identity cannot inspect its metastore assignment.
                 pass
-            cache_context = context_key("databricks", env, profile, str(identity), str(_value(workspace.config, "host", "")), str(metastore_id or "unknown-metastore"))
-            cached = self.cache.get(cache_context, node_key)
-            if cached and not cached["stale"] and not force:
-                return cached
             if not path:
                 rows = [_row(x, "databricks", env, "catalog", str(identity)) for x in workspace.catalogs.list(include_browse=True)]
                 for row in rows:
