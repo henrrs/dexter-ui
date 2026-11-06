@@ -12,6 +12,7 @@ import shutil
 import socket
 import ssl
 import stat
+import tempfile
 import threading
 import time
 import traceback
@@ -348,7 +349,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                            initial_link, staging, operations, operation_id: str,
                            minimum_free: int, lease_lost=None,
                            stop_event: threading.Event | None = None) -> tuple:
-    """Stream one Arrow result chunk directly into a temporary Parquet checkpoint."""
+    """Download one complete Arrow chunk, then convert it to a Parquet checkpoint."""
     import pyarrow.ipc as ipc
     import pyarrow.parquet as pq
 
@@ -373,6 +374,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         if isinstance(expected_bytes, int) and expected_bytes > MAX_ARROW_CHUNK_BYTES:
             raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
         temporary_parquet = staging / f".chunk-{chunk_index:06d}-{uuid.uuid4().hex}.parquet.tmp"
+        temporary_arrow = None
         stream = None
         writer = None
         read_seconds = 0.0
@@ -397,12 +399,38 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                         raise RuntimeError("Databricks returned an invalid result chunk length") from None
                     if declared_bytes > MAX_ARROW_CHUNK_BYTES:
                         raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
-                stream = _ChunkStreamReader(
-                    response_body, operations=operations, operation_id=operation_id,
-                    staging=staging, minimum_free=minimum_free,
-                    lease_lost=lease_lost, stop_event=stop_event,
-                )
-                reader = ipc.open_stream(stream)
+                # PyArrow's stream reader expects a real, open file object. Keep the
+                # HTTP stream out of PyArrow's IO wrapper; buffering also means an
+                # interrupted transfer is never mistaken for a valid partial result.
+                with tempfile.NamedTemporaryFile(
+                    prefix=f".chunk-{chunk_index:06d}-{uuid.uuid4().hex}-",
+                    suffix=".arrow.tmp", dir=staging, delete=False,
+                ) as arrow_spool:
+                    temporary_arrow = Path(arrow_spool.name)
+                    stream = _ChunkStreamReader(
+                        response_body, operations=operations, operation_id=operation_id,
+                        staging=staging, minimum_free=minimum_free,
+                        lease_lost=lease_lost, stop_event=stop_event,
+                    )
+                    while True:
+                        block = stream.read(1024 * 1024)
+                        if not block:
+                            break
+                        arrow_spool.write(block)
+                    arrow_spool.flush()
+                    os.fsync(arrow_spool.fileno())
+                stream.check(force=True)
+                read_seconds = stream.read_seconds
+                downloaded_bytes = stream.bytes_read
+                arrow_digest = stream.digest.hexdigest()
+
+            if declared_bytes is not None and downloaded_bytes != declared_bytes:
+                raise TimeoutError("Databricks returned an incomplete result chunk")
+            if isinstance(expected_bytes, int) and downloaded_bytes != expected_bytes:
+                raise TimeoutError("Databricks returned an incomplete result chunk")
+
+            with temporary_arrow.open("rb") as arrow_file:
+                reader = ipc.open_stream(arrow_file)
                 schema = reader.schema
                 writer = pq.ParquetWriter(temporary_parquet, schema, compression="zstd")
                 while True:
@@ -416,21 +444,10 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     chunk_rows += batch.num_rows
                     if shutil.disk_usage(staging).free < minimum_free:
                         raise OSError(28, "Insufficient free disk space for snapshot")
-                # Consume any bytes buffered after Arrow's end marker so length and digest cover the HTTP body.
-                while stream.read(1024 * 1024):
-                    pass
-                stream.check(force=True)
                 write_started_at = time.monotonic()
                 writer.close()
                 writer = None
                 write_seconds += time.monotonic() - write_started_at
-                read_seconds = stream.read_seconds
-                downloaded_bytes = stream.bytes_read
-                arrow_digest = stream.digest.hexdigest()
-            if declared_bytes is not None and downloaded_bytes != declared_bytes:
-                raise TimeoutError("Databricks returned an incomplete result chunk")
-            if isinstance(expected_bytes, int) and downloaded_bytes != expected_bytes:
-                raise TimeoutError("Databricks returned an incomplete result chunk")
             with temporary_parquet.open("rb") as completed_file:
                 os.fsync(completed_file.fileno())
             parquet_file = pq.ParquetFile(temporary_parquet)
@@ -469,9 +486,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 raise
             raise
         except Exception as exc:
-            if type(exc).__name__.startswith("Arrow"):
-                last_error = TimeoutError("Databricks returned an incomplete result chunk")
-            elif isinstance(exc, ValueError):
+            if type(exc).__name__.startswith("Arrow") or isinstance(exc, ValueError):
                 last_error = InvalidArrowResult("Databricks returned a result chunk that failed Arrow/Parquet validation")
                 last_error.__cause__ = exc
                 frames = traceback.extract_tb(exc.__traceback__)
@@ -493,6 +508,8 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     pass
             if not succeeded:
                 temporary_parquet.unlink(missing_ok=True)
+            if temporary_arrow is not None:
+                temporary_arrow.unlink(missing_ok=True)
 
         downloaded_bytes = stream.bytes_read if stream is not None else 0
 
@@ -907,7 +924,7 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             assert_lease()
             operations.log(
                 operation_id,
-                f"Chunk {chunk_index + 1}/{chunk_count} streamed: bytes={arrow_bytes}, "
+                f"Chunk {chunk_index + 1}/{chunk_count} downloaded and converted: bytes={arrow_bytes}, "
                 f"read_duration={read_seconds:.2f}s, read_throughput={_throughput_mib_s(arrow_bytes, read_seconds):.2f}MiB/s, "
                 f"parquet_write_duration={write_seconds:.2f}s, parquet_bytes={parquet_file_bytes}, "
                 f"chunk_elapsed={chunk_elapsed:.2f}s, sha256={arrow_digest}",
