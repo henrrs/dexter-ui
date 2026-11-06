@@ -418,12 +418,6 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
             break
         operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer retry {attempt + 2}/{CHUNK_RETRY_ATTEMPTS}: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "warning")
         delay = min(4.0, 0.25 * (2 ** attempt) + random.uniform(0.0, 0.25))
-        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {429, 503}:
-            try:
-                retry_after = float(last_error.headers.get("Retry-After", ""))
-                delay = min(30.0, max(delay, retry_after))
-            except (TypeError, ValueError):
-                pass
         time.sleep(delay)
 
     if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404}:
