@@ -260,9 +260,9 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .toolbar-updated { display:flex; align-items:center; gap:6px; font:8px var(--mono); color:#737977; }
 .toolbar-updated .live-dot { height:5px; width:5px; }
 .tab-strip { min-height:36px; display:flex; align-items:stretch; border-bottom:1px solid #252829; padding-left:12px; background:#131516; }
-.explorer-minimized-tab { flex:0 0 auto; align-self:flex-end; height:30px; display:flex; align-items:center; gap:6px; margin:0 5px 0 0; padding:0 10px; border:1px solid #373d3e; border-bottom:0; border-radius:5px 5px 0 0; color:#a9b0ad; background:#191c1d; font-size:9px; cursor:pointer; }
-.explorer-minimized-tab svg { color:#eab83f; }
-.explorer-minimized-tab:hover { color:#e4e7e4; background:#202425; border-color:#555d5d; }
+.discover-explorer-rail { width:38px; height:100%; flex:0 0 38px; display:flex; justify-content:center; align-items:flex-start; padding-top:12px; border-right:1px solid #292e2f; background:#151719; }
+.discover-explorer-rail button { width:25px; height:25px; display:grid; place-items:center; border:1px solid #303637; border-radius:4px; color:#9aa19e; background:#1a1d1e; cursor:pointer; }
+.discover-explorer-rail button:hover { color:#f0c34e; border-color:#5b5137; background:#202323; }
 .workspace-tab { display:flex; align-items:center; gap:8px; min-width:115px; padding:0 10px; border-bottom:2px solid var(--amber); background:#191b1d; color:#d8dad7; font-size:10px; }
 .workspace-tab > button { margin-left:auto; display:grid; place-items:center; border:0; padding:3px; color:#777d7c; background:transparent; cursor:pointer; }
 .tab-icon { color:#eab83f; display:grid; place-items:center; }
