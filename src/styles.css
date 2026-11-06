@@ -212,9 +212,10 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .workbench-tab button { display:flex; align-items:center; gap:6px; min-width:0; padding:8px; overflow:hidden; color:#c4cbc7; background:none; border:0; font-size:9px; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
 .workbench-tab button:first-child { flex:1; }
 .workbench-tab button:last-child { color:#8a918e; }
-.workbench-section-tabs { position:sticky; top:0; z-index:2; display:flex; gap:19px; padding:0 19px; border-bottom:1px solid #303535; background:#131617; }
-.workbench-section-tabs a { padding:12px 0 9px; color:#aeb6b2; text-decoration:none; font-size:10px; }
-.workbench-section-tabs a:first-child { color:#efbc36; border-bottom:2px solid #eab72c; }
+.workbench-section-tabs { position:sticky; top:0; z-index:2; display:flex; gap:19px; padding:0 19px; overflow-x:auto; border-bottom:1px solid #303535; background:#131617; }
+.workbench-section-tabs button { flex:0 0 auto; padding:12px 0 9px; color:#aeb6b2; background:none; border:0; border-bottom:2px solid transparent; font-size:10px; cursor:pointer; white-space:nowrap; }
+.workbench-section-tabs button.active { color:#efbc36; border-bottom-color:#eab72c; }
+.workbench-section-content { min-height:0; padding-bottom:18px; }
 .workbench-overview { display:flex; flex-direction:column; gap:6px; margin:13px 16px 0; padding:13px 15px; border:1px solid #343b3c; border-radius:6px; background:#181c1d; }
 .workbench-overview strong { color:#e4e8e5; font:600 16px Manrope,sans-serif; }
 .workbench-overview>span { color:#909a95; font:9px var(--mono); overflow-wrap:anywhere; }
