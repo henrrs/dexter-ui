@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, PanelLeftClose, PanelLeftOpen, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Star, Table2, Trash2, X, XCircle } from 'lucide-react'
+import { ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelLeftOpen, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
 import type { DiscoverNode, DiscoverPage } from './api'
 import type { Operation } from './types'
@@ -16,8 +16,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [selected, setSelected] = useState<DiscoverNode | null>(null)
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([])
   const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState('all')
   const [refreshing, setRefreshing] = useState(false)
+  const [sourcesLoaded, setSourcesLoaded] = useState(false)
+  const [sourcesError, setSourcesError] = useState<string | null>(null)
   const [activeEnvironment, setActiveEnvironment] = useState<'dev' | 'prod' | 'local'>('dev')
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
   const [warehouseId, setWarehouseId] = useState('')
@@ -33,17 +34,20 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [localQueryError, setLocalQueryError] = useState('')
   const [remotePreview, setRemotePreview] = useState<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } | null>(null)
   const [previewing, setPreviewing] = useState(false)
-  const [favorites, setFavorites] = useState<DiscoverNode[]>(() => { try { return JSON.parse(localStorage.getItem('dexter.discover.favorites') ?? '[]') } catch { return [] } })
-  const [recent, setRecent] = useState<DiscoverNode[]>(() => { try { return JSON.parse(localStorage.getItem('dexter.discover.recent') ?? '[]') } catch { return [] } })
-
-  useEffect(() => { localStorage.setItem('dexter.discover.favorites', JSON.stringify(favorites.slice(0, 30))) }, [favorites])
-  useEffect(() => { localStorage.setItem('dexter.discover.recent', JSON.stringify(recent.slice(0, 12))) }, [recent])
 
   const loadSources = async () => {
     setRefreshing(true)
-    try { setSources((await api.discoverSources()).items) }
-    catch { /* Keep the last local view and let the user retry. */ }
-    finally { setRefreshing(false) }
+    try {
+      setSources((await api.discoverSources()).items)
+      setSourcesError(null)
+    }
+    catch (error) {
+      setSourcesError(error instanceof Error ? error.message : 'Catalog metadata could not be loaded.')
+    }
+    finally {
+      setSourcesLoaded(true)
+      setRefreshing(false)
+    }
   }
   useEffect(() => { if (active) void loadSources() }, [active])
 
@@ -96,7 +100,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const preferred = environment ?? (node.variants?.some((variant) => variant.environment === activeEnvironment) ? activeEnvironment : node.variants?.some((variant) => variant.environment === 'dev') ? 'dev' : node.variants?.some((variant) => variant.environment === 'prod') ? 'prod' : 'local')
     setActiveEnvironment(preferred)
     setSelected(node)
-    setRecent((items) => [node, ...items.filter((item) => item.id !== node.id)].slice(0, 12))
     const tab = { key: node.id, node, environment: preferred }
     setWorkbenchTabs((items) => items.some((item) => item.key === tab.key) ? items.map((item) => item.key === tab.key ? tab : item) : [...items, tab])
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: preferred } }))
@@ -158,9 +161,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
 
   const matches = (node: DiscoverNode) => {
     const text = `${node.name} ${node.qualified_name ?? ''} ${node.source} ${node.environment}`.toLowerCase()
-    const queryMatch = text.includes(query.trim().toLowerCase())
-    const sourceMatch = filter === 'all' || (filter === 'restricted' && (node.access === 'restricted' || node.source === 'purview')) || (filter === 'favorites' && favorites.some((item) => item.id === node.id))
-    return queryMatch && sourceMatch
+    return text.includes(query.trim().toLowerCase())
   }
 
   const loadedNodes = [...Object.values(pages).flatMap((page) => page.items), ...sources]
@@ -190,7 +191,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         <button className="discover-expander" aria-label={`${open ? 'Collapse' : 'Expand'} ${node.name}`} onClick={() => void toggle(node)} disabled={!expandable}>{pending ? <LoaderCircle size={13} className="spin" /> : expandable ? open ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : <span className="tree-spacer" />}</button>
         <button className="discover-node" onClick={() => expandable ? void toggle(node) : void selectNode(node)}>
           {node.kind === 'catalog' ? <Database size={14} className="tree-object-icon" /> : node.kind === 'schema' ? <Layers3 size={14} className="tree-object-icon" /> : node.kind === 'view' ? <Eye size={14} className="tree-object-icon tree-view-icon" aria-label="View" /> : <Table2 size={14} className="tree-object-icon tree-table-icon" aria-label="Table" />}
-          {(node.kind === 'table' || node.kind === 'view') && (restricted || metadataOnly) && <LockKeyhole size={12} className="tree-lock" aria-label="Metadata visible; data access restricted" />}
+          {(node.kind === 'table' || node.kind === 'view') && (restricted || metadataOnly)
+            ? <LockKeyhole size={12} className="tree-lock" aria-label="Metadata visible; data access restricted" />
+            : (node.kind === 'table' || node.kind === 'view') && <span className="tree-lock-placeholder" aria-hidden="true" />}
           <span className={`discover-node-name ${metadataOnly ? 'metadata-only' : ''}`} title={node.name}>{node.name}</span>{node.kind === 'source' && <span className="discover-node-kind">{node.status}</span>}{node.ambiguous && <span className="discover-node-kind" title="Name collision; physical variants are kept separate">COLLISION</span>}
           {(node.kind === 'table' || node.kind === 'view') && <Availability node={node} onSelect={(environment) => void selectNode(node, environment)} />}
         </button>
@@ -201,18 +204,30 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     </div>
   })
 
-  const visible = useMemo(() => filter === 'favorites' ? [] : sources.filter(matches), [sources, query, filter, favorites])
+  const visible = useMemo(() => sources.filter(matches), [sources, query])
   if (!active) return null
   return <>
-    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><div className="discover-subnav"><button className={filter !== 'favorites' ? 'active' : ''} onClick={() => setFilter('all')}><Database size={12} /> Catalog</button><button className={filter === 'favorites' ? 'active' : ''} onClick={() => setFilter(filter === 'favorites' ? 'all' : 'favorites')}><Star size={12} /> Favorites</button></div><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
-        <div className="discover-tree">{filter === 'favorites' ? favorites.length ? <div className="discover-shortcuts favorites-only"><div><span className="eyebrow"><Star size={10} /> FAVORITES</span>{favorites.map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div></div> : <div className="discover-empty">No favorites yet.</div> : <>{(favorites.length > 0 || recent.length > 0) && <div className="discover-shortcuts">{favorites.length > 0 && <div><span className="eyebrow"><Star size={10} /> FAVORITES</span>{favorites.map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div>}{recent.length > 0 && <div><span className="eyebrow">RECENT</span>{recent.slice(0, 5).map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div>}</div>}{visible.length ? renderNodes(visible) : <div className="discover-empty">No catalog metadata matches this search.</div>}</>}</div>
+    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+        <div className="discover-tree">
+          {sources.length === 0 && (!sourcesLoaded || refreshing)
+            ? <div className="loading-state"><LoaderCircle size={15} className="spin" /> Loading catalog metadata…</div>
+            : sources.length === 0 && sourcesError
+              ? <div className="discover-empty"><span>{sourcesError}</span><button className="button secondary small" onClick={() => void loadSources()}>Retry</button></div>
+              : visible.length
+                ? renderNodes(visible)
+                : query.trim()
+                  ? <div className="discover-empty">No catalog metadata matches this search.</div>
+                  : sourcesError
+                    ? <div className="discover-empty">Could not refresh catalog metadata. Showing the last loaded catalog.</div>
+                    : <div className="discover-empty">No catalogs were found. Check that a Databricks profile is configured.</div>}
+        </div>
         <div className="discover-legend"><span><i className="access-dot read" /> Read confirmed</span><span><LockKeyhole size={10} /> Metadata only</span><span><i className="access-dot unknown" /> Unknown</span></div><div className="resize-handle" onPointerDown={onResizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
       </aside>}
     <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
       <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!explorerOpen && <button className="icon-button subtle" onClick={onExpandExplorer} aria-label="Show explorer"><PanelLeftOpen size={16} /></button>}<button className="toolbar-refresh" onClick={() => void refreshCatalog()} disabled={refreshing}>{refreshing ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />} Refresh metadata</button>{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
-      <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon"><Search size={13} /></span>Discover</div>{workbenchTabs.length > 0 && <div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name} · {tab.environment.toUpperCase()}</button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div>}</div>
+      <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon"><Search size={13} /></span>Discover</div>{workbenchTabs.length > 0 && <div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name} · {tab.environment.toUpperCase()}</button><button aria-label={`Minimize ${tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (selected?.id === tab.node.id) { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div>}</div>
       <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>
-        <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div>{(selected.kind === 'table' || selected.kind === 'view') && <button className={`icon-button subtle ${favorites.some((item) => item.id === selected.id) ? 'active' : ''}`} aria-label="Toggle favorite" onClick={() => setFavorites((items) => items.some((item) => item.id === selected.id) ? items.filter((item) => item.id !== selected.id) : [selected, ...items])}><Star size={14} /></button>}<button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
+        <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div><button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
         <code className="qualified-path">{selected.qualified_name ?? selected.id}</code>
         <div className="discover-detail-status"><span className={`access-dot ${selected.access ?? 'unknown'}`} />{accessLabel(selected.access ?? 'unknown')}{selected.access !== 'read' && selected.variants?.some((variant) => variant.environment === 'purview') && <LockKeyhole size={12} aria-label="Purview metadata only; data access is restricted" />}<span className="detail-separator">·</span>{selected.kind}</div>
         {(selected.kind === 'table' || selected.kind === 'view') && <div className="discover-availability"><span>Availability</span><Availability node={selected} onSelect={(environment) => void selectNode(selected, environment)} /></div>}
