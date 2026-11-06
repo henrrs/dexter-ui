@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +29,26 @@ logger = logging.getLogger("dexter.api")
 class LocalOriginGuard:
     """Reject DNS-rebinding hosts and browser origins outside the local UI."""
 
+    @staticmethod
+    def _is_loopback_host(host_header: str) -> bool:
+        try:
+            parsed = urlsplit("//" + host_header)
+            host = parsed.hostname
+            port = parsed.port  # Validate the optional port syntax and range.
+        except ValueError:
+            return False
+        if port is not None and not 1 <= port <= 65535:
+            return False
+        if not host or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return False
+        normalized = host.rstrip(".").lower()
+        if normalized == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            return False
+
     def __init__(self, app):
         self.app = app
 
@@ -36,8 +57,7 @@ class LocalOriginGuard:
             await self.app(scope, receive, send)
             return
         headers = {key.lower(): value.decode("latin1") for key, value in scope.get("headers", [])}
-        host = urlsplit("//" + headers.get("host", "")).hostname
-        if host not in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+        if not self._is_loopback_host(headers.get("host", "")):
             response = JSONResponse({"error": {"code": "LOCAL_HOST_REQUIRED", "message": "Dexter accepts requests through loopback only."}}, status_code=403)
             await response(scope, receive, send)
             return

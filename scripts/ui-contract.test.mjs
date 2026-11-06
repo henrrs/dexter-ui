@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 const app = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8')
 const api = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8')
+const vite = await readFile(new URL('../vite.config.ts', import.meta.url), 'utf8')
 
 test('platform shell exposes F1 navigation and links connection controls to the local API', () => {
   assert.match(app, /Home/)
@@ -26,4 +27,9 @@ test('layout has compact desktop and responsive breakpoints without remote asset
   assert.match(styles, /@media \(min-width:2500px\)/)
   assert.match(styles, /@media \(max-width:760px\)/)
   assert.doesNotMatch(styles, /@import\s+url\(['"]?https?:/i)
+})
+
+test('Vite proxies API requests to the runtime-selected loopback port', () => {
+  assert.match(vite, /process\.env\.DEXTER_PORT/)
+  assert.match(vite, /target: `http:\/\/127\.0\.0\.1:\$\{apiPort\}`/)
 })

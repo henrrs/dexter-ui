@@ -254,6 +254,8 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(invalid.json()["error"]["code"], "INVALID_REQUEST")
                     blocked = client.get("/api/health", headers={"Origin": "https://attacker.invalid"})
                     self.assertEqual(blocked.status_code, 403)
+                with TestClient(app, base_url="http://127.0.0.1:8001") as alternate_api_port:
+                    self.assertEqual(alternate_api_port.get("/api/health").status_code, 200)
 
 
 if __name__ == "__main__":

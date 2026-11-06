@@ -20,7 +20,7 @@ Setup fails when no index is configured, when extra Python indexes could act as 
 ```sh
 make doctor  # local diagnostics; no network
 make setup   # creates .venv and installs from the configured registries
-make dev     # API on 127.0.0.1:8000; UI on 127.0.0.1:5173
+make dev     # UI on 127.0.0.1:5173; API uses the first free port from 8000-8100
 make stop
 ```
 
