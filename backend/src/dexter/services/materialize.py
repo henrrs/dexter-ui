@@ -14,6 +14,7 @@ import ssl
 import stat
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -38,6 +39,10 @@ class SubmissionOutcomeUnknown(RuntimeError):
 
 class RemoteResultExpired(RuntimeError):
     """Databricks no longer exposes the completed statement result."""
+
+
+class InvalidArrowResult(RuntimeError):
+    """A downloaded result chunk could not be parsed as a complete Arrow stream."""
 
 
 class WorkerLeaseLost(RuntimeError):
@@ -254,6 +259,8 @@ def _link_for_chunk(links, chunk_index: int, fallback_index: int):
 
 def _transfer_failure_reason(exc: Exception) -> str:
     """Return a small, safe diagnostic category; never include signed URLs or raw errors."""
+    if isinstance(exc, InvalidArrowResult):
+        return "invalid_arrow_result"
     if isinstance(exc, urllib.error.HTTPError):
         return f"http_{exc.code}"
     if isinstance(exc, http.client.IncompleteRead):
@@ -464,6 +471,18 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         except Exception as exc:
             if type(exc).__name__.startswith("Arrow"):
                 last_error = TimeoutError("Databricks returned an incomplete result chunk")
+            elif isinstance(exc, ValueError):
+                last_error = InvalidArrowResult("Databricks returned a result chunk that failed Arrow/Parquet validation")
+                last_error.__cause__ = exc
+                frames = traceback.extract_tb(exc.__traceback__)
+                origin = frames[-1] if frames else None
+                origin_detail = f"{Path(origin.filename).name}:{origin.lineno}:{origin.name}" if origin else "unknown"
+                operations.log(
+                    operation_id,
+                    f"Result chunk {chunk_index + 1} validation rejected: exception={type(exc).__name__}, "
+                    f"cause={type(_root_cause(exc)).__name__}, origin={origin_detail}",
+                    "warning",
+                )
             else:
                 raise
         finally:
@@ -479,7 +498,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
 
         link_renewed = False
         status = _http_status(last_error) if last_error is not None else None
-        refresh_link = status in {401, 403, 404, 410} or _transfer_failure_reason(last_error) == "incomplete_chunk"
+        refresh_link = status in {401, 403, 404, 410} or _transfer_failure_reason(last_error) in {"incomplete_chunk", "invalid_arrow_result"}
         if refresh_link and attempt + 1 < CHUNK_RETRY_ATTEMPTS:
             try:
                 refreshed = _get_result_chunk(workspace=workspace, operations=operations,
@@ -1048,11 +1067,13 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             return
         current = operations.get(operation_id)
         phase = ((current or {}).get("details") or {}).get("phase", "unknown")
+        root_cause = _root_cause(exc)
+        cause_detail = f", cause={type(root_cause).__name__}" if root_cause is not exc else ""
         operations.log(
             operation_id,
             f"Materialization failed in phase={phase} after "
             f"{time.monotonic() - operation_started_at:.2f}s "
-            f"({type(exc).__name__}): {_safe_error(exc)}",
+            f"({type(exc).__name__}{cause_detail}): {_safe_error(exc)}",
             "error",
         )
         if current and current["state"] in {"queued", "running"}:
@@ -1121,6 +1142,8 @@ def _safe_error(exc: Exception) -> str:
                 return f"The Databricks result transfer repeatedly stalled for over {CHUNK_DOWNLOAD_TIMEOUT_SECONDS} seconds; see operation logs for bytes received per attempt."
             if reason == "incomplete_chunk":
                 return "The Databricks result chunk repeatedly arrived with fewer bytes than declared."
+            if reason == "invalid_arrow_result":
+                return "The Databricks result chunk failed Arrow/Parquet validation on all four attempts. See the operation logs for the failing code location."
             if reason == "http_stream_error":
                 return "The Databricks result stream was interrupted or malformed on all four attempts."
             if reason.startswith("http_401") or reason.startswith("http_403") or reason.startswith("http_404") or reason.startswith("http_410"):
@@ -1146,8 +1169,36 @@ def _safe_error(exc: Exception) -> str:
         return "The Databricks statement or result transfer timed out."
     if isinstance(exc, urllib.error.URLError): return "The Databricks workspace could not be reached."
     if isinstance(exc, OSError) and getattr(exc, "errno", None) == 28: return "There is not enough local disk space for this snapshot."
-    if isinstance(exc, ValueError): return "The selected table, filters, warehouse, or Arrow result did not pass validation."
+    if isinstance(exc, ValueError):
+        cause = _root_cause(exc)
+        diagnostic = str(cause or exc).casefold()
+        if "checkpoint" in diagnostic or "verified chunk" in diagnostic:
+            return "A downloaded Parquet chunk did not match its verified checkpoint. The operation log identifies the failing validation."
+        if "inconsistent schemas" in diagnostic or "schema or row count" in diagnostic:
+            return "The downloaded Parquet chunks do not match the selected columns or expected row count."
+        if "byte count" in diagnostic or "file sizes" in diagnostic:
+            return "The downloaded Parquet file sizes do not match the transfer checkpoints."
+        if "no valid parquet chunks" in diagnostic or "no readable parquet data" in diagnostic:
+            return "Databricks returned no readable Parquet data for this snapshot."
+        if cause and type(cause).__module__.startswith("pyarrow"):
+            return "The downloaded Arrow result could not be converted into a valid Parquet snapshot. See the operation logs for the Arrow error type."
+        if "select unique columns" in diagnostic:
+            return "The selected columns no longer match the table schema. Refresh the table metadata and retry."
+        if "filter uses an unknown column" in diagnostic:
+            return "A selected filter column or operator is not present in the table schema."
+        if "invalid sql identifier" in diagnostic:
+            return "The selected table identity contains an invalid SQL name. Refresh the catalog and retry."
+        return "The selected table, filters, warehouse, or Arrow result did not pass validation. See the operation logs for the failing phase."
     return "The provider or local storage could not complete the snapshot. Check the selected profile, permissions, and local disk space."
+
+
+def _root_cause(exc: Exception) -> Exception:
+    cause = exc
+    visited = {id(cause)}
+    while cause.__cause__ is not None and id(cause.__cause__) not in visited:
+        cause = cause.__cause__
+        visited.add(id(cause))
+    return cause
 
 
 def _error_code(exc: Exception) -> str:
