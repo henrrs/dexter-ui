@@ -4,10 +4,33 @@ from __future__ import annotations
 
 import configparser
 import os
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
 from dexter.paths import DexterPaths
+
+
+def ensure_sql_warehouse_running(workspace, warehouse_id: str):
+    """Validate access to a listed warehouse and start it when necessary."""
+    def field(value, name, default=None):
+        return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+    warehouse = next((item for item in workspace.warehouses.list() if field(item, "id") == warehouse_id), None)
+    if warehouse is None:
+        raise PermissionError("The selected SQL warehouse is not available to this Databricks profile")
+
+    state = str(field(warehouse, "state", "")).upper().split(".")[-1]
+    if state == "RUNNING":
+        return warehouse
+    timeout = timedelta(minutes=20)
+    if state == "STARTING":
+        return workspace.warehouses.wait_get_warehouse_running(id=warehouse_id, timeout=timeout)
+    if state == "STOPPING":
+        workspace.warehouses.wait_get_warehouse_stopped(id=warehouse_id, timeout=timeout)
+    elif state != "STOPPED":
+        raise RuntimeError(f"The selected SQL warehouse cannot be started from state {state or 'UNKNOWN'}")
+    return workspace.warehouses.start_and_wait(id=warehouse_id, timeout=timeout)
 
 
 def profile_config_file(profile: str | None = None) -> Path:

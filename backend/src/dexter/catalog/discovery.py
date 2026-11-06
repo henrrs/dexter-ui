@@ -7,6 +7,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -295,6 +296,77 @@ class DiscoverService:
                 return cached
             logger.info("Purview authentication failed (%s)", type(exc).__name__)
             return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}
+
+    def purview_lineage(self, guid: str, depth: int = 2) -> dict:
+        """Load one Purview asset's lineage lazily through the Data Map API."""
+        config = self.settings_repo.get("purview")
+        if not config:
+            return {"available": False, "items": [], "relations": [], "message": "Purview is not configured."}
+        try:
+            guid = str(uuid.UUID(guid))
+        except (ValueError, TypeError, AttributeError):
+            return {"available": False, "items": [], "relations": [], "message": "Purview did not provide an asset ID for lineage lookup."}
+
+        try:
+            from azure.identity import AzureCliCredential
+            from dexter.adapters.purview import _http_diagnostic, _token_claims, resolve_api_endpoint
+
+            token = AzureCliCredential(tenant_id=config.get("tenant_id") or None).get_token(self.settings.purview_scope)
+            claims = _token_claims(token.token) or {}
+            expected = self.settings.purview_scope.removesuffix("/.default").rstrip("/")
+            if claims.get("aud") not in {expected, expected + "/"}:
+                return {"available": False, "items": [], "relations": [], "message": "The Azure CLI token audience does not match the Purview Data Map API."}
+
+            api_path = "/datamap/api/atlas/v2/lineage/" + quote(guid, safe="")
+            endpoint = resolve_api_endpoint(config["endpoint"], api_path).rstrip("/")
+            query = urlencode({"api-version": "2023-09-01", "direction": "BOTH", "depth": max(1, min(depth, 3))})
+            request = urllib.request.Request(
+                f"{endpoint}{api_path}?{query}",
+                headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Purview returned an invalid lineage response.")
+
+            base_guid = str(payload.get("baseEntityGuid") or guid)
+            entity_map = payload.get("guidEntityMap") if isinstance(payload.get("guidEntityMap"), dict) else {}
+            raw_relations = payload.get("relations") if isinstance(payload.get("relations"), list) else []
+            parent_relations = payload.get("parentRelations") if isinstance(payload.get("parentRelations"), list) else []
+            raw_relations = [item for item in [*raw_relations, *parent_relations] if isinstance(item, dict)]
+            items = []
+            for entity_guid, entity in entity_map.items():
+                if not isinstance(entity, dict) or str(entity_guid) == base_guid:
+                    continue
+                attributes = entity.get("attributes") if isinstance(entity.get("attributes"), dict) else {}
+                item_relations = [item for item in raw_relations if str(item.get("fromEntityId")) == str(entity_guid) or str(item.get("toEntityId")) == str(entity_guid)]
+                incoming = any(str(item.get("toEntityId")) == base_guid and str(item.get("fromEntityId")) == str(entity_guid) for item in item_relations)
+                outgoing = any(str(item.get("fromEntityId")) == base_guid and str(item.get("toEntityId")) == str(entity_guid) for item in item_relations)
+                items.append({
+                    "guid": str(entity_guid),
+                    "name": entity.get("displayText") or attributes.get("name") or attributes.get("qualifiedName") or str(entity_guid),
+                    "qualified_name": attributes.get("qualifiedName"),
+                    "entity_type": entity.get("typeName"),
+                    "direction": "upstream" if incoming else "downstream" if outgoing else "related",
+                    "classifications": entity.get("classificationNames") or [],
+                })
+            relations = [{
+                "from_guid": str(item.get("fromEntityId") or ""),
+                "to_guid": str(item.get("toEntityId") or ""),
+                "column_mapping": item.get("columnMapping"),
+            } for item in raw_relations]
+            return {"available": True, "items": items, "relations": relations, "message": None if items else "Purview returned no lineage relationships for this asset."}
+        except ImportError:
+            return {"available": False, "items": [], "relations": [], "message": "Azure Identity is not installed in this Dexter environment."}
+        except urllib.error.HTTPError as exc:
+            from dexter.adapters.purview import _http_diagnostic
+            return {"available": False, "items": [], "relations": [], "message": _http_diagnostic(exc.code)["detail"]}
+        except (TimeoutError, OSError, urllib.error.URLError):
+            return {"available": False, "items": [], "relations": [], "message": "Purview lineage could not be reached."}
+        except Exception as exc:
+            logger.info("Purview lineage lookup failed (%s)", type(exc).__name__)
+            return {"available": False, "items": [], "relations": [], "message": "Purview lineage could not be loaded. Check the Azure CLI session and Data Map permissions."}
 
     def _purview_schema(self, metastore_id: str, catalog: str, schema: str, force: bool = False):
         """Load governed tables for one Unity Catalog schema from Data Map."""

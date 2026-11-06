@@ -23,6 +23,7 @@ export const api = {
   discoverSources: () => request<{ items: DiscoverNode[] }>('/discover/catalogs'),
   discoverCatalogChildren: (nodeId: string, force = false) => request<DiscoverPage>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
   discoverCatalogDetail: (nodeId: string, environment?: string) => request<DiscoverNode>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}${environment ? `?environment=${environment}` : ''}`),
+  discoverCatalogLineage: (nodeId: string) => request<{ available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/lineage`),
   discoverChildren: (nodeId: string, force = false) => request<DiscoverPage | DiscoverNode[]>(`/discover/nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
   discoverDetail: (nodeId: string) => request<DiscoverNode>(`/discover/nodes/${encodeURIComponent(nodeId)}`),
   warehouses: (nodeId: string, environment: 'dev' | 'prod') => request<{ items: Array<{ id: string; name: string; state: string }>; message: string | null }>(`/discover/nodes/${encodeURIComponent(nodeId)}/warehouses?environment=${environment}`),

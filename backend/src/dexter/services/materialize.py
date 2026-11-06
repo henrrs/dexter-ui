@@ -71,17 +71,18 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         staging.mkdir(mode=0o700)
         reservation = local_data.reserve(operation_id, source_record, table, f"{catalog}.{schema}.{table}", staging)
         from databricks.sdk import WorkspaceClient
-        from dexter.adapters.databricks import profile_config_file
+        from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
         workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-        warehouse = next((w for w in workspace.warehouses.list() if _get(w, "id") == warehouse_id), None)
-        if not warehouse or str(_get(warehouse, "state", "")).upper().split(".")[-1] != "RUNNING":
-            raise ValueError("Select a SQL warehouse that is already running. Dexter will not start it.")
+        operations.update_details(operation_id, phase="warehouse", rows=0, bytes=0, files=0)
+        operations.transition(operation_id, "running", progress=2, message="Starting selected SQL warehouse if needed")
+        operations.log(operation_id, "Validating access to the selected SQL warehouse and waiting for it to be ready")
+        ensure_sql_warehouse_running(workspace, warehouse_id)
         schema_columns = {str(c.get("name")) for c in detail.get("columns", []) if c.get("name")}
         sql, parameters = build_select(catalog, schema, table, columns, filters, schema_columns)
         # Databricks Statement Execution parameters use typed literal values, never string interpolation.
         statement_parameters = [{"name": f"p{i}", "value": _sql_literal(value), "type": _parameter_type(value)} for i, value in enumerate(parameters)]
         parquet_path.touch(mode=0o600)
-        operations.log(operation_id, "Validated selected profile, table access, schema, and running warehouse")
+        operations.log(operation_id, "Validated selected profile, table access, schema, and SQL warehouse")
         operations.transition(operation_id, "running", progress=5, message="Submitting full snapshot query")
         response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
             "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
@@ -223,6 +224,9 @@ def _parameter_type(value):
 def _safe_error(exc: Exception) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    if "warehouse" in message and (isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name): return "The selected SQL warehouse is not accessible to this Databricks profile."
+    if "warehouse" in message: return "The selected SQL warehouse could not be started or used."
     if isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name: return "The selected identity is not authorized to read this table."
     if status == 401 or "unauthenticated" in name: return "Authentication for the selected local profile failed."
     if isinstance(exc, TimeoutError): return "The Databricks read exceeded its allowed time."
@@ -235,6 +239,8 @@ def _safe_error(exc: Exception) -> str:
 def _error_code(exc: Exception) -> str:
     status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     name = type(exc).__name__.lower()
+    if "warehouse" in str(exc).lower() and (isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name): return "WAREHOUSE_FORBIDDEN"
+    if "warehouse" in str(exc).lower(): return "WAREHOUSE_UNAVAILABLE"
     if isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name: return "READ_FORBIDDEN"
     if status == 401 or "unauthenticated" in name: return "AUTHENTICATION_FAILED"
     if isinstance(exc, InterruptedError): return "CANCELLED"

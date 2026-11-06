@@ -8,6 +8,7 @@ import type { Operation } from './types'
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
 type WorkbenchTab = { key: string; node: DiscoverNode; environment: 'dev' | 'prod' | 'local' }
 type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage'
+type LineageResult = { available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }
 
 export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer, rightOpen, onExpandContext }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void; rightOpen: boolean; onExpandContext: () => void }) {
   const [sources, setSources] = useState<DiscoverNode[]>([])
@@ -24,6 +25,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [activeEnvironment, setActiveEnvironment] = useState<'dev' | 'prod' | 'local'>('dev')
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
   const [warehouseId, setWarehouseId] = useState('')
+  const [warehousesLoading, setWarehousesLoading] = useState(false)
+  const [warehouseError, setWarehouseError] = useState('')
   const [selectedColumns, setSelectedColumns] = useState<string[]>([])
   const [filterColumn, setFilterColumn] = useState('')
   const [filterOperator, setFilterOperator] = useState('=')
@@ -36,6 +39,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [localQueryError, setLocalQueryError] = useState('')
   const [remotePreview, setRemotePreview] = useState<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean } | null>(null)
   const [previewing, setPreviewing] = useState(false)
+  const [lineage, setLineage] = useState<LineageResult | null>(null)
+  const [lineageLoading, setLineageLoading] = useState(false)
 
   const loadSources = async () => {
     setRefreshing(true)
@@ -116,11 +121,23 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
 
   useEffect(() => {
-    if (!selected?.id.startsWith('unified:table:') || !['dev', 'prod'].includes(activeEnvironment) || selected.access !== 'read') { setWarehouses([]); setWarehouseId(''); return }
+    if (!selected || !['table', 'view'].includes(selected.kind) || !['dev', 'prod'].includes(activeEnvironment) || selected.access !== 'read') {
+      setWarehouses([]); setWarehouseId(''); setWarehousesLoading(false); setWarehouseError('')
+      return
+    }
     let alive = true
-    void api.warehouses(selected.id, activeEnvironment as 'dev' | 'prod').then((result) => { if (alive) { setWarehouses(result.items); setWarehouseId((current) => current || result.items[0]?.id || '') } }).catch(() => { if (alive) setWarehouses([]) })
+    setWarehouses([]); setWarehouseId(''); setWarehousesLoading(true); setWarehouseError('')
+    void api.warehouses(selected.id, activeEnvironment as 'dev' | 'prod')
+      .then((result) => {
+        if (!alive) return
+        setWarehouses(result.items)
+        setWarehouseId(result.items[0]?.id ?? '')
+        setWarehouseError(result.message ?? '')
+      })
+      .catch((error) => { if (alive) { setWarehouses([]); setWarehouseError(error instanceof Error ? error.message : 'Could not load SQL warehouses.') } })
+      .finally(() => { if (alive) setWarehousesLoading(false) })
     return () => { alive = false }
-  }, [selected?.id, selected?.access, activeEnvironment])
+  }, [selected?.id, selected?.kind, selected?.access, activeEnvironment])
 
   useEffect(() => {
     if (!activeOperation || ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(activeOperation.state)) return
@@ -134,6 +151,20 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     }, 1200)
     return () => window.clearInterval(timer)
   }, [activeOperation?.id, activeOperation?.state, expanded])
+
+  useEffect(() => {
+    if (activeSection !== 'lineage' || !selected || !['table', 'view'].includes(selected.kind)) {
+      setLineage(null); setLineageLoading(false)
+      return
+    }
+    let alive = true
+    setLineage(null); setLineageLoading(true)
+    void api.discoverCatalogLineage(selected.id)
+      .then((result) => { if (alive) setLineage(result) })
+      .catch((error) => { if (alive) setLineage({ available: false, items: [], relations: [], message: error instanceof Error ? error.message : 'Purview lineage could not be loaded.' }) })
+      .finally(() => { if (alive) setLineageLoading(false) })
+    return () => { alive = false }
+  }, [activeSection, selected?.id, selected?.kind])
 
   const runMakeLocal = async () => {
     if (!selected || !warehouseId || !selectedColumns.length) return
@@ -170,17 +201,18 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const matchesLoadedBranch = (node: DiscoverNode): boolean => matches(node) || loadedChildren(node).some(matchesLoadedBranch)
 
   const loadedNodes = [...Object.values(pages).flatMap((page) => page.items), ...sources]
-  const matchingGovernance = (asset: DiscoverNode | null) => {
-    if (!asset || asset.source !== 'databricks' || !asset.metastore_id || !asset.qualified_name) return undefined
-    return loadedNodes.find((candidate) => {
-      if (candidate.source !== 'purview' || !candidate.qualified_name) return false
-      const match = candidate.qualified_name.match(/^databricks:\/\/([^/]+)\/catalogs\/([^/]+)\/schemas\/([^/]+)\/(?:tables|views)\/([^/]+)$/i)
-      if (!match) return false
-      const [catalog, schema, table] = match.slice(2).map((part) => decodePart(part).toLowerCase())
-      return decodePart(match[1]).toLowerCase() === asset.metastore_id?.toLowerCase() && `${catalog}.${schema}.${table}` === asset.qualified_name?.toLowerCase()
-    })
-  }
-  const governanceMatch = matchingGovernance(selected)
+  const purviewMetadata = selected?.purview_metadata ?? selected?.variants?.find((variant) => variant.environment === 'purview')?.metadata
+  const purviewRecord = asRecord(purviewMetadata)
+  const purviewAttributes = asRecord(purviewRecord?.attributes)
+  const metadataField = (key: string) => purviewRecord?.[key] ?? purviewAttributes?.[key]
+  const classifications = metadataValues(metadataField('classifications') ?? metadataField('classification') ?? selected?.classifications)
+  const labels = metadataValues(metadataField('labels') ?? metadataField('label'))
+  const metadataDescription = metadataValues(metadataField('description')).join(', ')
+  const metadataOwner = metadataValues(metadataField('owner')).join(', ')
+  const metadataType = metadataValues(metadataField('entityType') ?? metadataField('typeName')).join(', ')
+  const metadataQualifiedName = metadataValues(metadataField('qualifiedName') ?? selected?.qualified_name).join(', ')
+  const hasPurviewMetadata = Boolean(purviewRecord && Object.keys(purviewRecord).length)
+  const hasPurviewDetails = Boolean(metadataDescription || metadataOwner || classifications.length || labels.length || metadataType)
 
   const renderNodes = (nodes: DiscoverNode[], depth = 0): ReactNode => nodes.filter((node) => !query.trim() || matchesLoadedBranch(node)).map((node) => {
     const children = loadedChildren(node)
@@ -258,18 +290,49 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             : <div className="loading-state"><FileStack size={15} /> Column metadata is not loaded for this asset.</div>}
         </div>}
         {activeSection === 'metadata' && <div className="workbench-section-content">
-          {selected.purview_metadata && <div className="governance-match"><div className="eyebrow">PURVIEW GOVERNANCE METADATA</div><strong>{String(selected.purview_metadata.name ?? selected.name)}</strong>{Boolean(selected.purview_metadata.description) && <p>{String(selected.purview_metadata.description)}</p>}{Boolean(selected.purview_metadata.owner) && <small>Owner · {String(selected.purview_metadata.owner)}</small>}{Array.isArray(selected.purview_metadata.classifications) && <small>Classifications · {selected.purview_metadata.classifications.map(String).join(', ')}</small>}</div>}
-          {governanceMatch && <div className="governance-match"><div className="eyebrow">PURVIEW GOVERNANCE MATCH</div><strong>{governanceMatch.name}</strong><span>Matched by metastore ID and full qualified name.</span>{governanceMatch.description && <p>{governanceMatch.description}</p>}{governanceMatch.owner && <small>Owner · {governanceMatch.owner}</small>}{governanceMatch.classifications?.length ? <small>Classifications · {governanceMatch.classifications.join(', ')}</small> : null}</div>}
-          <div className="discover-facts"><Fact label="Source" value={selected.source === 'databricks' ? `Databricks ${selected.environment.toUpperCase()}` : selected.source} /><Fact label="Owner" value={selected.owner ?? 'Not provided by source'} />{selected.format && <Fact label="Local format" value={selected.format} />}{selected.row_count != null && <Fact label="Rows" value={selected.row_count.toLocaleString()} />}</div>
+          <div className="metadata-card">
+            <div className="metadata-card-heading"><span className="eyebrow">PURVIEW GOVERNANCE</span><span className={`metadata-match-status ${hasPurviewMetadata ? 'matched' : ''}`}>{hasPurviewMetadata ? 'MATCHED' : 'NO MATCH LOADED'}</span></div>
+            {hasPurviewMetadata && hasPurviewDetails
+              ? <div className="metadata-grid">
+                  <div className="metadata-row"><span>Description</span><p>{metadataDescription || 'Not provided by Purview.'}</p></div>
+                  <div className="metadata-row"><span>Owner</span><p>{metadataOwner || 'Not provided by Purview.'}</p></div>
+                  <div className="metadata-row"><span>Classifications</span><div className="metadata-tags">{classifications.length ? classifications.map((item) => <span className="metadata-tag" key={item}>{item}</span>) : <p>None reported.</p>}</div></div>
+                  {labels.length > 0 && <div className="metadata-row"><span>Labels</span><div className="metadata-tags">{labels.map((item) => <span className="metadata-tag" key={item}>{item}</span>)}</div></div>}
+                  <div className="metadata-row"><span>Asset type</span><p>{metadataType || 'Not provided by Purview.'}</p></div>
+                  <div className="metadata-row"><span>Qualified name</span><p className="metadata-qualified-name">{metadataQualifiedName || selected.qualified_name || selected.name}</p></div>
+                </div>
+              : <p className="metadata-empty-note">{hasPurviewMetadata ? 'Purview matched this asset but returned no description, owner, classification, or label details.' : 'No matching Purview asset metadata was loaded for this table.'} Databricks details are shown below.</p>}
+          </div>
+          <div className="discover-facts"><Fact label="Databricks source" value={selected.source === 'databricks' ? `${selected.environment.toUpperCase()} · ${selected.source}` : selected.source} /><Fact label="Owner" value={selected.owner ?? 'Not provided by source'} />{selected.format && <Fact label="Local format" value={selected.format} />}{selected.row_count != null && <Fact label="Rows" value={selected.row_count.toLocaleString()} />}</div>
         </div>}
         {activeSection === 'preview' && <div className="workbench-section-content">
-          {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment !== 'local' && selected.access === 'read' && selected.columns?.length ? <div className="make-local-card"><div className="discover-section-title"><HardDrive size={14} /> Make Local <span>FULL SNAPSHOT</span></div><p>Copies the selected columns and filter result into a new Parquet snapshot.</p><label className="field-label">COLUMNS</label><div className="local-column-picker">{selected.columns.map((column) => <label key={column.name}><input type="checkbox" checked={selectedColumns.includes(column.name)} onChange={(event) => setSelectedColumns((prior) => event.target.checked ? [...prior, column.name] : prior.filter((item) => item !== column.name))} />{column.name}<code>{column.type_text ?? column.type}</code></label>)}</div><div className="local-filter-row"><select aria-label="Filter column" value={filterColumn} onChange={(event) => setFilterColumn(event.target.value)}><option value="">No filter</option>{selected.columns.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select><select aria-label="Filter operator" value={filterOperator} onChange={(event) => setFilterOperator(event.target.value)}><option>=</option><option>!=</option><option>&gt;</option><option>&gt;=</option><option>&lt;</option><option>&lt;=</option><option value="contains">contains</option><option value="is_null">is null</option><option value="not_null">is not null</option></select>{!['is_null', 'not_null'].includes(filterOperator) && <input aria-label="Filter value" value={filterValue} onChange={(event) => setFilterValue(event.target.value)} placeholder="Filter value" />}</div><div className="local-filter-row"><select aria-label="Running SQL warehouse" value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}><option value="">Select a running warehouse</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}</select><button className="button primary small" disabled={!warehouseId || !selectedColumns.length || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void runMakeLocal()}><Play size={13} /> Make Local</button></div><small>Only running warehouses are listed. Dexter will not start remote compute.</small></div> : null}
+          {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment !== 'local' && selected.access === 'read' && <div className="make-local-card warehouse-picker">
+            <div className="discover-section-title"><Database size={14} /> SQL Warehouse</div>
+            <div className="local-filter-row"><select aria-label="SQL warehouse" value={warehouseId} disabled={warehousesLoading || warehouses.length === 0} onChange={(event) => setWarehouseId(event.target.value)}><option value="">{warehousesLoading ? 'Loading warehouses…' : warehouses.length ? 'Select a SQL warehouse' : 'No accessible warehouses'}</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}</select></div>
+            <small>Dexter starts the selected warehouse automatically when Preview or Make Local runs.</small>
+            {warehouseError && <div className={warehouses.length ? 'warehouse-message' : 'discover-error'} role={warehouses.length ? undefined : 'alert'}>{warehouseError}</div>}
+          </div>}
+          {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment !== 'local' && selected.access === 'read' && selected.columns?.length ? <div className="make-local-card"><div className="discover-section-title"><HardDrive size={14} /> Make Local <span>FULL SNAPSHOT</span></div><p>Copies the selected columns and filter result into a new Parquet snapshot.</p><label className="field-label">COLUMNS</label><div className="local-column-picker">{selected.columns.map((column) => <label key={column.name}><input type="checkbox" checked={selectedColumns.includes(column.name)} onChange={(event) => setSelectedColumns((prior) => event.target.checked ? [...prior, column.name] : prior.filter((item) => item !== column.name))} />{column.name}<code>{column.type_text ?? column.type}</code></label>)}</div><div className="local-filter-row"><select aria-label="Filter column" value={filterColumn} onChange={(event) => setFilterColumn(event.target.value)}><option value="">No filter</option>{selected.columns.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select><select aria-label="Filter operator" value={filterOperator} onChange={(event) => setFilterOperator(event.target.value)}><option>=</option><option>!=</option><option>&gt;</option><option>&gt;=</option><option>&lt;</option><option>&lt;=</option><option value="contains">contains</option><option value="is_null">is null</option><option value="not_null">is not null</option></select>{!['is_null', 'not_null'].includes(filterOperator) && <input aria-label="Filter value" value={filterValue} onChange={(event) => setFilterValue(event.target.value)} placeholder="Filter value" />}</div><div className="local-filter-row"><button className="button primary small" disabled={!warehouseId || !selectedColumns.length || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void runMakeLocal()}><Play size={13} /> Make Local</button></div></div> : null}
           {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment !== 'local' && selected.access === 'read' && <div className="local-query-card"><div className="discover-section-title"><Database size={14} /> Preview <span>FIRST 100 ROWS</span></div><button className="button secondary small" disabled={!warehouseId || previewing} onClick={() => void runRemotePreview()}>{previewing ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />} Preview first 100 rows</button>{localQueryError && <div className="discover-error">{localQueryError}</div>}{remotePreview && <div className="local-result-table"><table><thead><tr>{remotePreview.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{remotePreview.rows.map((row, index) => <tr key={index}>{remotePreview.columns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table>{remotePreview.truncated && <small>Preview is limited to 100 rows.</small>}</div>}</div>}
           {(selected.kind === 'table' || selected.kind === 'view') && activeEnvironment === 'local' && selected.variants?.some((variant) => variant.environment === 'local') && <div className="local-query-card"><div className="discover-section-title"><Database size={14} /> Query Local <span>DUCKDB</span><button className="icon-button tiny" aria-label="Delete local dataset" onClick={() => { const id = selected.variants?.find((variant) => variant.environment === 'local')?.dataset_id; if (id) void api.deleteLocal(id).then(() => { setSelected(null); void refreshLoadedNodes() }) }}><Trash2 size={13} /></button></div><textarea aria-label="Local SQL query" value={localSql} onChange={(event) => setLocalSql(event.target.value)} spellCheck={false} /><button className="button secondary small" onClick={() => void runLocalQuery()}><Play size={13} /> Run local query</button>{localQueryError && <div className="discover-error">{localQueryError}</div>}{localRows.length > 0 && <div className="local-result-table"><table><thead><tr>{localColumns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{localRows.map((row, index) => <tr key={index}>{localColumns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}</div>}
           {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
           <div className="discover-preview-note"><LockKeyhole size={14} /><span>Remote preview remains available only after the selected environment confirms read access.</span></div>
         </div>}
-        {activeSection === 'lineage' && <div className="workbench-section-content">{(selected.kind === 'table' || selected.kind === 'view') && <div className="lineage-unavailable"><div className="discover-section-title"><Layers3 size={14} /> Lineage</div><span>Lineage is not available from the connected metadata providers for this table.</span></div>}</div>}
+        {activeSection === 'lineage' && <div className="workbench-section-content">
+          {(selected.kind === 'table' || selected.kind === 'view')
+            ? lineageLoading
+              ? <div className="lineage-empty-state"><LoaderCircle size={17} className="spin" /><strong>Loading Purview lineage…</strong></div>
+              : lineage?.available && lineage.items.length > 0
+                ? <div className="lineage-results">
+                    <div className="lineage-results-heading"><Layers3 size={15} /><strong>Purview lineage</strong><span>{lineage.items.length} related assets</span></div>
+                    {(['upstream', 'downstream', 'related'] as const).map((direction) => {
+                      const items = lineage.items.filter((item) => item.direction === direction)
+                      return items.length ? <section className="lineage-group" key={direction}><h3>{direction === 'upstream' ? 'Upstream' : direction === 'downstream' ? 'Downstream' : 'Related'}</h3>{items.map((item) => <div className="lineage-asset" key={item.guid}><div><strong>{item.name}</strong><span>{item.qualified_name ?? item.entity_type ?? 'Purview asset'}</span></div><small>{item.entity_type ?? 'Asset'}</small></div>)}</section> : null
+                    })}
+                  </div>
+                : <div className="lineage-empty-state"><span className="lineage-empty-icon"><Layers3 size={19} /></span><strong>{lineage?.available ? 'No lineage relationships found' : 'Lineage could not be loaded'}</strong><p>{lineage?.message ?? 'Purview did not return lineage information for this asset.'}</p><code>{selected.qualified_name ?? selected.name}</code></div>
+            : <div className="lineage-empty-state"><strong>Select a table or view to inspect lineage.</strong></div>}
+        </div>}
       </> : <div className="discover-placeholder"><span className="empty-glyph"><FileStack size={17} /></span><strong>Select an asset</strong><span>Metadata and access evidence will appear here.</span></div>}</section>
       </div>
       <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item">Unified Discover</span></div></footer>
@@ -278,6 +341,18 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
 }
 
 function Fact({ label, value }: { label: string; value: string }) { return <div className="discover-fact"><span>{label}</span><strong>{value}</strong></div> }
+function asRecord(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null }
+function metadataValues(value: unknown): string[] {
+  if (Array.isArray(value)) return [...new Set(value.flatMap(metadataValues))]
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value).trim() ? [String(value).trim()] : []
+  const record = asRecord(value)
+  if (!record) return []
+  for (const key of ['displayName', 'displayText', 'name', 'classificationName', 'label', 'qualifiedName', 'termName', 'term', 'description', 'email', 'value', 'typeName', 'id']) {
+    const result = metadataValues(record[key])
+    if (result.length) return result
+  }
+  return []
+}
 function Availability({ node, onSelect }: { node: DiscoverNode; onSelect?: (environment: 'local' | 'dev' | 'prod') => void }) {
   const availability = node.availability
   const states = availability ?? { local: 'unknown', dev: 'unknown', prod: 'unknown' }
@@ -286,4 +361,3 @@ function Availability({ node, onSelect }: { node: DiscoverNode; onSelect?: (envi
   </span>
 }
 function accessLabel(access: string) { return access === 'read' || access === 'present' ? 'Read access confirmed' : access === 'restricted' ? 'Metadata visible · no read access' : access === 'absent' ? 'Not present in this environment' : 'Access unknown' }
-function decodePart(value: string) { try { return decodeURIComponent(value) } catch { return value } }

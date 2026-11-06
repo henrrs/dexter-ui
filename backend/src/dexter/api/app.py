@@ -273,6 +273,21 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def discover_catalog_children(node_id: str, force: bool = False):
         return unified.children(node_id, force)
 
+    @app.get("/api/discover/catalog-nodes/{node_id:path}/lineage")
+    def discover_catalog_lineage(node_id: str):
+        try:
+            kind, variants, _ = _variants(node_id)
+        except Exception:
+            raise HTTPException(422, detail="Invalid unified asset identity") from None
+        if kind not in {"table", "view"}:
+            raise HTTPException(422, detail="Select a table or view to inspect lineage")
+        purview_variant = next((item for item in variants if item.get("environment") == "purview"), None)
+        metadata = purview_variant.get("metadata") if isinstance(purview_variant, dict) else None
+        asset_guid = metadata.get("asset_id") or metadata.get("id") if isinstance(metadata, dict) else None
+        if not asset_guid:
+            return {"available": False, "items": [], "relations": [], "message": "No matching Purview asset is available for lineage lookup."}
+        return discover.purview_lineage(str(asset_guid))
+
     @app.get("/api/discover/catalog-nodes/{node_id:path}")
     def discover_catalog_detail(node_id: str, environment: str | None = None):
         result = unified.detail(node_id, environment)
@@ -308,11 +323,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             from databricks.sdk import WorkspaceClient
             from dexter.adapters.databricks import profile_config_file
             workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-            items = [{"id": w.id, "name": w.name, "state": str(w.state).split(".")[-1]} for w in workspace.warehouses.list() if str(w.state).upper().split(".")[-1] == "RUNNING"]
-            return {"items": items, "message": None if items else "No running SQL warehouses found. Dexter will not start one."}
+            items = [{"id": w.id, "name": w.name, "state": str(w.state).upper().split(".")[-1]} for w in workspace.warehouses.list()]
+            return {"items": items, "message": None if items else "No SQL warehouses are available to this Databricks profile."}
         except Exception as exc:
             logger.info("Warehouse listing failed (%s)", type(exc).__name__)
-            raise HTTPException(503, detail="Could not list running warehouses for the selected profile") from None
+            raise HTTPException(503, detail="Could not list SQL warehouses accessible to the selected profile") from None
 
     @app.post("/api/discover/nodes/{node_id:path}/make-local", status_code=202)
     def start_make_local(node_id: str, body: MakeLocalRequest):
@@ -387,19 +402,16 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(409, detail="The selected environment has no configured profile")
         try:
             from databricks.sdk import WorkspaceClient
-            from dexter.adapters.databricks import profile_config_file
+            from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
             workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-            warehouse = next((item for item in workspace.warehouses.list() if item.id == body.warehouse_id and str(item.state).upper().split(".")[-1] == "RUNNING"), None)
-            if not warehouse:
-                raise HTTPException(422, detail="Select a SQL warehouse that is already running")
+            ensure_sql_warehouse_running(workspace, body.warehouse_id)
             projection = ", ".join("`" + column["name"].replace("`", "``") + "`" for column in detail.get("columns", []))
-            if not projection:
-                raise HTTPException(409, detail="Column metadata is unavailable for this table")
+            projection = projection or "*"
             sql = f"SELECT {projection} FROM `{parts[2].replace('`', '``')}`.`{parts[3].replace('`', '``')}`.`{parts[4].replace('`', '``')}` LIMIT 100"
             response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={"statement": sql, "warehouse_id": body.warehouse_id, "wait_timeout": "50s", "on_wait_timeout": "CONTINUE", "format": "JSON_ARRAY", "disposition": "INLINE"})
             state = str((response.get("status") or {}).get("state", "")).upper().split(".")[-1]
             statement_id = response.get("statement_id")
-            deadline = __import__("time").monotonic() + 15
+            deadline = __import__("time").monotonic() + 60
             while state in {"PENDING", "RUNNING"} and statement_id and __import__("time").monotonic() < deadline:
                 __import__("time").sleep(0.5)
                 response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
@@ -413,6 +425,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             return {"columns": columns, "rows": rows, "truncated": len(rows) == 100}
         except HTTPException:
             raise
+        except PermissionError:
+            raise HTTPException(403, detail="The selected SQL warehouse is not accessible to this Databricks profile") from None
+        except RuntimeError as exc:
+            if "warehouse" in str(exc).lower():
+                raise HTTPException(503, detail="The selected SQL warehouse could not be started") from None
+            logger.info("Remote preview failed (%s)", type(exc).__name__)
+            raise HTTPException(503, detail="The selected profile could not complete the authorized preview") from None
         except Exception as exc:
             logger.info("Remote preview failed (%s)", type(exc).__name__)
             raise HTTPException(503, detail="The selected profile could not complete the authorized preview") from None
