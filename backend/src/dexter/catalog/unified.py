@@ -48,12 +48,12 @@ class UnifiedDiscoverService:
         self.provider, self.settings_repo, self.local_data, self.paths = provider, settings_repo, local_data, paths
 
     def catalogs(self, force: bool = False) -> dict:
+        """Build catalog roots from Databricks metadata; Purview is queried per schema."""
         pages = {}
         errors = []
         error_envs = set()
-        purview_assets, purview_error = self._purview_assets()
-        if purview_error: errors.append(purview_error)
-        for env in ("dev", "prod"):
+        # PROD is the complete structural inventory; DEV adds environment variants.
+        for env in ("prod", "dev"):
             page = self._fetch_children(f"databricks:{env}", force)
             if isinstance(page, dict):
                 pages[env] = page.get("items", [])
@@ -72,7 +72,7 @@ class UnifiedDiscoverService:
             for row in rows:
                 if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("name"), str) or not row["name"]:
                     continue
-                logical = normalize_catalog(str(row.get("name", "")), paired, aliases)
+                logical = normalize_catalog(str(row["name"]), paired, aliases)
                 key = logical.casefold()
                 existing = groups.get(key, [])
                 conflicting_metastore = any(item.get("environment") != env and item.get("metastore_id") and row.get("metastore_id") and item["metastore_id"].casefold() != str(row["metastore_id"]).casefold() for item in existing)
@@ -85,65 +85,42 @@ class UnifiedDiscoverService:
                 groups.setdefault(key, []).append({"environment": env, "catalog": row["name"], "logical_catalog": logical, "node_id": row["id"], "metastore_id": row.get("metastore_id"), "ambiguous": key != logical.casefold()})
         for variants in groups.values():
             if any((variant.get("logical_catalog") or "").casefold() in collision_keys for variant in variants):
-                for variant in variants: variant["ambiguous"] = True
-        for asset in purview_assets:
-            identity = self._purview_identity(asset)
-            if not identity:
-                continue
-            catalog, schema, table, metastore = identity
-            logical_catalog = normalize_catalog(catalog, prod_names, aliases).casefold()
-            candidates = groups.get(logical_catalog, [])
-            # Governance matches only a fully qualified UC URI with the same metastore.
-            if any((candidate.get("metastore_id") or "").casefold() == metastore.casefold() for candidate in candidates):
-                candidates.append({"environment": "purview", "catalog": catalog, "schema": schema, "table": table, "node_id": asset["id"], "metadata": asset})
+                for variant in variants:
+                    variant["ambiguous"] = True
         successful_roots = set()
         for env in ("dev", "prod"):
             config = self.settings_repo.get(f"databricks.{env}")
-            page = pages.get(env, [])
-            # A configured provider with a returned page can confirm a missing catalog; errors leave it unknown.
-            if config and env not in error_envs and isinstance(page, list):
+            if config and env not in error_envs and isinstance(pages.get(env), list):
                 successful_roots.add(env)
         nodes = []
         for variants in groups.values():
             availability = {"local": "unknown", "dev": "unknown", "prod": "unknown"}
             for variant in variants:
                 env = variant.get("environment")
-                if env in availability and env != "purview": availability[env] = "present"
+                if env in availability:
+                    availability[env] = "present"
             for env in successful_roots:
-                if availability[env] == "unknown": availability[env] = "absent"
-            logical_name = variants[0].get("logical_catalog") or next((normalize_catalog(v["catalog"], prod_names if v["environment"] == "dev" else dev_names, aliases) for v in variants), variants[0]["catalog"])
+                if availability[env] == "unknown":
+                    availability[env] = "absent"
+            logical_name = variants[0].get("logical_catalog") or variants[0]["catalog"]
             node_id = _variants_id("catalog", variants, availability)
             ambiguous = any(v.get("ambiguous") for v in variants) or any(sum(1 for v in variants if v.get("environment") == env) > 1 for env in ("dev", "prod"))
             nodes.append({"id": node_id, "name": logical_name, "qualified_name": logical_name, "kind": "catalog", "source": "unified", "environment": "logical", "access": "unknown", "ambiguous": ambiguous, "variants": variants, "availability": availability, "children": None})
-        # Keep unmatched governance assets in their own catalog root; never merge by display name alone.
-        for asset in purview_assets:
-            parts = self._asset_parts(asset)
-            if not parts: continue
-            catalog, schema, table = parts
-            linked = any(variant.get("environment") == "purview" and variant.get("node_id") == asset.get("id") for variants in groups.values() for variant in variants)
-            if linked: continue
-            key = "purview-only:" + catalog.casefold()
-            variants = groups.setdefault(key, [])
-            variants.append({"environment": "purview", "catalog": catalog, "schema": schema, "table": table, "node_id": asset["id"], "metadata": asset})
-            node = next((item for item in nodes if item["variants"] is variants), None)
-            if node is None:
-                node = {"id": _variants_id("catalog", variants), "name": catalog, "qualified_name": catalog, "kind": "catalog", "source": "unified", "environment": "logical", "access": "unknown", "ambiguous": any(item["name"].casefold() == catalog.casefold() for item in nodes), "variants": variants, "availability": self._availability(variants), "children": None}
-                nodes.append(node)
         for dataset in self.local_data.list():
             parts = dataset["qualified_name"].split(".")
-            if len(parts) != 3: continue
+            if len(parts) != 3:
+                continue
             catalog, schema, table = parts
-            key = catalog.casefold()
-            variants = groups.setdefault(key, [])
+            variants = groups.setdefault(catalog.casefold(), [])
             if not any(v.get("environment") == "local" and v.get("table", "").casefold() == table.casefold() and v.get("schema", "").casefold() == schema.casefold() for v in variants):
                 variants.append({"environment": "local", "catalog": catalog, "schema": schema, "table": table, "node_id": f"local:table:{dataset['dataset_id']}", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "access": "read"})
-            if not any(node["name"].casefold() == key for node in nodes):
+            if not any(node["name"].casefold() == catalog.casefold() for node in nodes):
                 nodes.append({"id": _variants_id("catalog", variants), "name": catalog, "qualified_name": catalog, "kind": "catalog", "source": "unified", "environment": "logical", "access": "unknown", "variants": variants, "availability": self._availability(variants), "children": None})
         for node in nodes:
-            # Keep availability state out of the physical provider variants.
             observed = self._availability(node["variants"])
             for env, state in observed.items():
-                if state == "present": node["availability"][env] = "present"
+                if state == "present":
+                    node["availability"][env] = "present"
             node["id"] = _variants_id("catalog", node["variants"], node["availability"])
         nodes.sort(key=lambda node: node["name"].casefold())
         return {"items": nodes, "fetched_at": None, "expires_at": None, "stale": bool(errors), "error": "; ".join(dict.fromkeys(errors)) or None}
@@ -169,7 +146,7 @@ class UnifiedDiscoverService:
                         if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("name"), str) or not row["name"]:
                             page_errors.append("Provider returned malformed schema metadata.")
                             continue
-                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "schema": row["name"], "node_id": row["id"], "metastore_id": row.get("metastore_id")})
+                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "logical_catalog": variant.get("logical_catalog", variant["catalog"]), "schema": row["name"], "node_id": row["id"], "metastore_id": row.get("metastore_id")})
                 elif variant.get("environment") == "purview" and variant.get("node_id"):
                     asset = variant.get("metadata", {})
                     groups.setdefault(variant["schema"].casefold(), []).append({"environment": "purview", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "metadata": asset})
@@ -184,6 +161,7 @@ class UnifiedDiscoverService:
             groups: dict[str, list[dict]] = {}
             successful_pages: dict[str, set[str]] = {}
             page_errors = []
+            schema_scopes: set[tuple[str, str, str, str]] = set()
             for variant in variants:
                 if variant.get("environment") in {"dev", "prod"} and variant.get("node_id"):
                     page = self._fetch_children(variant["node_id"], force)
@@ -196,26 +174,43 @@ class UnifiedDiscoverService:
                         if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("name"), str) or not row["name"]:
                             page_errors.append("Provider returned malformed table metadata.")
                             continue
-                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "schema": variant["schema"], "table": row["name"], "kind": row.get("kind", "table"), "node_id": row["id"], "metastore_id": row.get("metastore_id"), "access": row.get("access", "unknown"), "description": row.get("description"), "owner": row.get("owner")})
-                elif variant.get("environment") == "purview" and variant.get("node_id"):
-                    asset = variant.get("metadata", {})
-                    groups.setdefault(variant["table"].casefold(), []).append({"environment": "purview", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "metadata": asset, "access": "unknown", "description": asset.get("description"), "owner": asset.get("owner")})
+                        table_kind = row.get("kind", "table")
+                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "logical_catalog": variant.get("logical_catalog", variant["catalog"]), "schema": variant["schema"], "table": row["name"], "kind": table_kind, "node_id": row["id"], "metastore_id": row.get("metastore_id") or variant.get("metastore_id"), "access": row.get("access", "unknown"), "description": row.get("description"), "owner": row.get("owner")})
+                    # PROD is the authoritative structural inventory and the source
+                    # whose qualified names are registered in the corporate map.
+                    metastore_id = variant.get("metastore_id")
+                    if variant.get("environment") == "prod" and isinstance(metastore_id, str) and metastore_id:
+                        schema_scopes.add((metastore_id, variant["catalog"], variant["schema"], variant.get("logical_catalog", variant["catalog"])))
                 elif variant.get("environment") == "local" and variant.get("node_id"):
-                    groups.setdefault(variant["table"].casefold(), []).append(variant)
+                    groups.setdefault(variant["table"].casefold(), []).append({**variant, "kind": variant.get("kind", "table")})
+            for metastore_id, catalog, schema, logical_catalog in sorted(schema_scopes):
+                try:
+                    page = self.provider._purview_schema(metastore_id, catalog, schema, force)
+                except Exception as exc:
+                    logger.info("Purview schema metadata unavailable (%s)", type(exc).__name__)
+                    page = {"items": [], "error": "Purview metadata could not be loaded for this schema."}
+                purview_rows = page.get("items", []) if isinstance(page, dict) else []
+                if isinstance(page, dict) and page.get("error"):
+                    page_errors.append(page["error"])
+                for asset in purview_rows:
+                    identity = self._purview_identity(asset)
+                    if not identity:
+                        continue
+                    p_catalog, p_schema, p_table, p_metastore = identity
+                    if p_metastore.casefold() != metastore_id.casefold() or p_catalog.casefold() != catalog.casefold() or p_schema.casefold() != schema.casefold():
+                        continue
+                    groups.setdefault(p_table.casefold(), []).append({"environment": "purview", "catalog": p_catalog, "logical_catalog": logical_catalog, "schema": p_schema, "table": p_table, "kind": asset.get("kind", "table"), "node_id": asset["id"], "metastore_id": p_metastore, "metadata": asset, "access": "unknown", "description": asset.get("description"), "owner": asset.get("owner")})
             items = []
             for name, values in sorted(groups.items()):
-                # Exact physical path and metastore identities are retained. Same-name collisions across metastores stay separate.
                 subgroups: dict[tuple, list[dict]] = {}
                 for value in values:
                     if not isinstance(value, dict) or not value.get("environment") or not value.get("node_id"):
                         continue
                     if value["environment"] == "local":
-                        identity = (value["metastore_id"].casefold(), value["schema"].casefold(), value["table"].casefold(), value.get("kind", "table")) if value.get("metastore_id") else ("local", value.get("dataset_id"))
-                    elif value["environment"] in {"dev", "prod"} and value.get("metastore_id"):
-                        # Parent catalog identity was reconciled already; physical catalog names may differ by environment.
-                        identity = (value["metastore_id"].casefold(), value["schema"].casefold(), value["table"].casefold(), value.get("kind", "table"))
+                        identity = (value["metastore_id"].casefold(), value.get("logical_catalog", value["catalog"]).casefold(), value["schema"].casefold(), value["table"].casefold(), value.get("kind", "table")) if value.get("metastore_id") else ("local", value.get("dataset_id"))
+                    elif value["environment"] in {"dev", "prod", "purview"} and value.get("metastore_id"):
+                        identity = (value["metastore_id"].casefold(), value.get("logical_catalog", value["catalog"]).casefold(), value["schema"].casefold(), value["table"].casefold(), value.get("kind", "table"))
                     else:
-                        # Missing metastore evidence is ambiguous, so retain this physical table separately.
                         identity = (value["environment"], value["node_id"])
                     subgroups.setdefault(identity, []).append(value)
                 same_name_collision = len(subgroups) > 1
@@ -224,20 +219,6 @@ class UnifiedDiscoverService:
                     node = self._node("view" if all(value.get("kind") == "view" for value in subset) else "table", name, subset, availability)
                     node["ambiguous"] = same_name_collision
                     items.append(node)
-            # Link Purview governance only when its full Databricks URI and metastore match exactly.
-            purview_assets, purview_error = self._purview_assets()
-            if purview_error: page_errors.append(purview_error)
-            for asset in purview_assets:
-                identity = self._purview_identity(asset)
-                if not identity: continue
-                p_catalog, p_schema, p_table, p_metastore = identity
-                if p_schema.casefold() != variants[0].get("schema", "").casefold(): continue
-                if not any((v.get("metastore_id") or "").casefold() == p_metastore.casefold() and v.get("catalog", "").casefold() == p_catalog.casefold() for v in variants): continue
-                target = next((item for item in items if item["name"].casefold() == p_table.casefold() and any((v.get("metastore_id") or "").casefold() == p_metastore.casefold() for v in item.get("variants", []))), None)
-                if target:
-                    target.setdefault("variants", []).append({"environment": "purview", "catalog": p_catalog, "schema": p_schema, "table": p_table, "node_id": asset["id"], "metadata": asset})
-                    target["availability"] = self._child_availability(target["variants"], {}, p_table, target.get("availability", {}))
-                    target["id"] = _variants_id("table", target["variants"], target["availability"])
             return {"items": items, "fetched_at": None, "expires_at": None, "stale": bool(page_errors), "error": "; ".join(dict.fromkeys(page_errors)) or None}
         return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": None}
 
@@ -264,7 +245,7 @@ class UnifiedDiscoverService:
                 return {**detail, "logical_name": variants[0]["table"], "variants": variants, "availability": availability or self._availability(variants)}
         asset = next((v.get("metadata") for v in variants if v.get("metadata")), None)
         if asset:
-            return {**asset, "id": node_id, "kind": "table", "source": "purview", "environment": "governance", "access": "unknown", "read_access": None, "variants": variants, "availability": availability or self._availability(variants)}
+            return {**asset, "id": node_id, "kind": kind, "source": "purview", "environment": "governance", "access": "unknown", "read_access": None, "variants": variants, "availability": availability or self._availability(variants)}
         return None
 
     def _node(self, kind: str, name: str, variants: list[dict], availability: dict | None = None) -> dict:
@@ -301,16 +282,6 @@ class UnifiedDiscoverService:
             if env in result: result[env] = "present"
         return result
 
-    def _purview_assets(self) -> tuple[list[dict], str | None]:
-        try:
-            page = self.provider._purview()
-        except Exception as exc:
-            logger.info("Purview metadata unavailable (%s)", type(exc).__name__)
-            return [], "Purview metadata could not be loaded; Databricks and local results remain available."
-        if not isinstance(page, dict) or not isinstance(page.get("items", []), list):
-            return [], "Purview returned an invalid metadata page."
-        return page.get("items", []), page.get("error")
-
     def _fetch_children(self, node_id: str, force: bool) -> dict:
         try:
             page = self.provider.children(node_id, force)
@@ -322,17 +293,6 @@ class UnifiedDiscoverService:
         if not isinstance(page, dict) or not isinstance(page.get("items", []), list):
             return {"items": [], "stale": False, "error": "Provider returned an invalid catalog page."}
         return page
-
-    @staticmethod
-    def _asset_parts(asset: dict) -> tuple[str, str, str] | None:
-        qname = str(asset.get("qualified_name", ""))
-        match = re.search(r"/catalogs/([^/]+)/schemas/([^/]+)/(?:tables|views)/([^/?]+)$", qname, re.I)
-        if match:
-            from urllib.parse import unquote
-            return tuple(unquote(part) for part in match.groups())
-        if qname.count(".") == 2 and not qname.startswith("http"):
-            return tuple(qname.split("."))
-        return None
 
     @staticmethod
     def _purview_identity(asset: dict) -> tuple[str, str, str, str] | None:

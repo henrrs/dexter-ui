@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from dexter.catalog.cache import DiscoveryCache, context_key
 
@@ -294,4 +294,128 @@ class DiscoverService:
                 cached.update(stale=True, error=f"{detail} Showing cached metadata.")
                 return cached
             logger.info("Purview authentication failed (%s)", type(exc).__name__)
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}
+
+    def _purview_schema(self, metastore_id: str, catalog: str, schema: str, force: bool = False):
+        """Load governed tables for one Unity Catalog schema from Data Map."""
+        config = self.settings_repo.get("purview")
+        if not config:
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Purview is unavailable; Databricks metadata remains available."}
+        cached = None
+        try:
+            from azure.identity import AzureCliCredential
+            from dexter.adapters.purview import _http_diagnostic, _token_claims, resolve_api_endpoint
+
+            token = AzureCliCredential(tenant_id=config.get("tenant_id") or None).get_token(self.settings.purview_scope)
+            claims = _token_claims(token.token) or {}
+            audience = claims.get("aud")
+            expected = self.settings.purview_scope.removesuffix("/.default").rstrip("/")
+            if not isinstance(audience, str) or audience not in {expected, expected + "/"}:
+                return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Purview token audience does not match the configured scope."}
+
+            tenant = str(claims.get("tid") or config.get("tenant_id") or "unknown")
+            identity = str(claims.get("oid") or claims.get("appid") or "unknown")
+            cache_context = context_key("purview-data-map", config["endpoint"], tenant, identity, str(audience), metastore_id)
+            cache_key = "schema-assets:" + context_key(catalog.casefold(), schema.casefold())
+            cached = self.cache.get(cache_context, cache_key)
+            if cached and not cached["stale"] and not force:
+                return cached
+
+            api_path = "/datamap/api/search/query"
+            endpoint = resolve_api_endpoint(config["endpoint"], api_path).rstrip("/")
+            url = endpoint + api_path + "?api-version=2023-09-01"
+            prefix = (
+                f"databricks://{metastore_id}/catalogs/{quote(catalog, safe='')}"
+                f"/schemas/{quote(schema, safe='')}/"
+            )
+            base_body = {
+                "keywords": None,
+                "limit": 1000,
+                "filter": {
+                    "and": [
+                        {"objectType": "Tables"},
+                        {"attributeName": "qualifiedName", "operator": "prefix", "attributeValue": prefix},
+                    ]
+                },
+            }
+            entries: list[dict] = []
+            continuation: str | None = None
+            seen_tokens: set[str] = set()
+            while True:
+                body = {**base_body, **({"continuationToken": continuation} if continuation else {})}
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode(),
+                    headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=12) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if not isinstance(payload, dict) or not isinstance(payload.get("value", []), list):
+                    raise ValueError("Purview returned an invalid Data Map search page.")
+                entries.extend(item for item in payload.get("value", []) if isinstance(item, dict))
+                next_token = payload.get("continuationToken")
+                if not next_token:
+                    break
+                if not isinstance(next_token, str) or next_token in seen_tokens:
+                    raise ValueError("Purview repeated a Data Map continuation token.")
+                seen_tokens.add(next_token)
+                continuation = next_token
+
+            nodes = []
+            seen_qualified_names: set[str] = set()
+            for item in entries:
+                qualified_name = item.get("qualifiedName")
+                if not isinstance(qualified_name, str) or qualified_name.casefold() in seen_qualified_names:
+                    continue
+                seen_qualified_names.add(qualified_name.casefold())
+                owner = item.get("owner")
+                nodes.append({
+                    "id": f"purview:{item.get('id') or qualified_name}",
+                    "asset_id": item.get("id"),
+                    "name": str(item.get("name") or qualified_name.rsplit("/", 1)[-1]),
+                    "qualified_name": qualified_name,
+                    "kind": "view" if "/views/" in qualified_name.casefold() or "view" in str(item.get("entityType", "")).casefold() else "table",
+                    "source": "purview",
+                    "environment": "governance",
+                    "identity": identity,
+                    "description": item.get("description"),
+                    "owner": owner,
+                    "classifications": item.get("classification", []),
+                    "labels": item.get("label", []),
+                    "entity_type": item.get("entityType"),
+                    "access": "unknown",
+                    "children": [],
+                })
+            page = self.cache.put(cache_context, cache_key, nodes, TTL["schema"])
+            self.settings_repo.put_check("purview", "connected", None, f"Purview Data Map metadata loaded for {catalog}.{schema}.")
+            return page
+        except urllib.error.HTTPError as exc:
+            from dexter.adapters.purview import _http_diagnostic
+            diagnostic = _http_diagnostic(exc.code)
+            self.settings_repo.put_check("purview", diagnostic["status"], diagnostic["category"], diagnostic["detail"])
+            if cached:
+                cached.update(stale=True, error=f"{diagnostic['detail']} Showing cached Purview metadata.")
+                return cached
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": diagnostic["detail"]}
+        except ImportError:
+            detail = "Azure Identity is not installed in this Dexter environment."
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}
+        except (TimeoutError, OSError, urllib.error.URLError, ValueError, TypeError, KeyError) as exc:
+            detail = "Purview Data Map could not complete the schema query."
+            self.settings_repo.put_check("purview", "unavailable", "connectivity", detail)
+            if cached:
+                cached.update(stale=True, error=f"{detail} Showing cached Purview metadata.")
+                return cached
+            logger.info("Purview schema query failed (%s)", type(exc).__name__)
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}
+        except Exception as exc:
+            message = str(exc).casefold()
+            status = "unavailable" if any(term in message for term in ("credentialunavailable", "azure cli", "login")) else "expired"
+            detail = "Azure CLI has no usable Purview session. Run az login and retry." if status == "unavailable" else "Azure CLI authentication failed or expired. Run az login and retry."
+            self.settings_repo.put_check("purview", status, "authentication", detail)
+            if cached:
+                cached.update(stale=True, error=f"{detail} Showing cached Purview metadata.")
+                return cached
+            logger.info("Purview schema authentication failed (%s)", type(exc).__name__)
             return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}
