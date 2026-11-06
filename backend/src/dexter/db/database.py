@@ -1,0 +1,93 @@
+"""SQLite WAL adapter and versioned migrations."""
+
+from __future__ import annotations
+
+import sqlite3
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+MIGRATIONS = (
+    """
+    CREATE TABLE operations (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('queued','running','succeeded','failed','cancelled','interrupted')),
+      progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+      message TEXT NOT NULL DEFAULT '',
+      error_code TEXT,
+      error_message TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT
+    );
+    CREATE INDEX operations_state_updated ON operations(state, updated_at DESC);
+    CREATE TABLE settings (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE connection_checks (
+      key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      category TEXT,
+      detail TEXT NOT NULL DEFAULT '',
+      checked_at TEXT
+    );
+    """,
+)
+
+
+def connect(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    conn = sqlite3.connect(path, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = FULL")
+    return conn
+
+
+def migrate(path: Path) -> None:
+    conn = connect(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        current = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
+        for version, sql in enumerate(MIGRATIONS, start=1):
+            if version <= current:
+                continue
+            try:
+                conn.executescript(
+                    "BEGIN IMMEDIATE;\n" + sql +
+                    f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, strftime('%Y-%m-%dT%H:%M:%fZ','now'));\nCOMMIT;"
+                )
+            except Exception:
+                conn.rollback()
+                raise
+    finally:
+        conn.close()
+
+
+@contextmanager
+def transaction(path: Path, retries: int = 5) -> Iterator[sqlite3.Connection]:
+    conn = connect(path)
+    try:
+        for attempt in range(retries):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == retries - 1:
+                    raise
+                time.sleep(0.025 * (2**attempt))
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

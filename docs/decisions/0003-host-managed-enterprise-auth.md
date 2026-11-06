@@ -1,0 +1,8 @@
+# ADR 0003: Reuse host-managed enterprise authentication
+
+- **Status:** Accepted
+- **Context:** Databricks and Purview checks must preserve the user's identity and effective permissions, avoid duplicate credentials, isolate DEV/PROD, and work as optional integrations.
+- **Decision:** Use the official Databricks Python SDK with exactly one selected profile per environment. Use `AzureCliCredential` and the existing Azure CLI session for Purview. Persist only profile names, endpoint/tenant settings, and safe validation summaries; never store credentials or tokens. Connection checks are explicit, read-only actions.
+- **Alternatives:** Dexter-managed secrets (creates a second credential store); service principals created automatically (changes the acting identity and privilege model); automatic DEV/PROD retry (violates environment boundaries).
+- **Trade-offs:** API/CLI token compatibility and effective permissions remain controlled by each corporate service. Current Microsoft Purview Data Map authentication guidance documents service-principal credentials and data-plane role assignment; a delegated `az login` token may be incompatible with Atlas Data Map. Dexter reports that incompatibility and stops rather than creating an app identity. Sources: [Purview data-plane API authentication](https://learn.microsoft.com/en-us/purview/data-gov-api-rest-data-plane?tabs=datamap), [Databricks configuration profiles](https://docs.databricks.com/aws/en/dev-tools/auth/config-profiles).
+- **Traceability:** Requirements 3/7; adapter tests mock the SDK, Azure CLI credential, token audience, API read method, and selected DEV profile.
