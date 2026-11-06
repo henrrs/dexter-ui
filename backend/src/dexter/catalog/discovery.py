@@ -49,7 +49,7 @@ class DiscoverService:
             result.append({"id": f"databricks:{env}", "name": f"Databricks {env.upper()}", "source": "databricks", "environment": env, "kind": "source", "status": check["status"] if check else ("configured" if config else "unavailable"), "detail": check["detail"] if check else "Select a local CLI profile in Settings.", "children": None})
         config = self.settings_repo.get("purview")
         check = self.settings_repo.get_check("purview")
-        result.append({"id": "purview", "name": "Microsoft Purview", "source": "purview", "environment": "governance", "kind": "source", "status": check["status"] if check else ("configured" if config else "unavailable"), "detail": check["detail"] if check else "Configure a local Purview endpoint in Settings.", "children": None})
+        result.append({"id": "purview", "name": "Microsoft Purview", "source": "purview", "environment": "governance", "kind": "source", "status": check["status"] if check else ("configured" if config else "unavailable"), "detail": check["detail"] if check else "Discover a Purview account through the current Azure CLI session in Settings.", "children": None})
         return result
 
     def children(self, node_id: str, force: bool = False):
@@ -216,54 +216,82 @@ class DiscoverService:
             cached = self.cache.get(cache_context, "assets")
             if cached and not cached["stale"] and not force:
                 return cached
-            # Unified Catalog is a distinct public-preview API. Query it directly; never fall back to Atlas.
-            api_path = "/datagovernance/catalog/dataAssets"
-            base_url = resolve_api_endpoint(config["endpoint"], api_path) + api_path
-            entries, payload, skip = [], {}, 0
-            for _page in range(50):
-                query = urlencode({"api-version": "2026-03-20-preview", "includeExtendedProperties": "true", "top": "100", "skip": str(skip)})
-                url = base_url + "?" + query
-                request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
-                with urllib.request.urlopen(request, timeout=12) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                page_entries = payload.get("value", payload.get("items", payload.get("dataAssets", []))) if isinstance(payload, dict) else []
-                if not isinstance(page_entries, list): break
-                entries.extend(page_entries)
-                if len(page_entries) < 100: break
-                skip += len(page_entries)
+            api_surface = config.get("api_surface", "unified_catalog")
+            if api_surface == "data_map":
+                api_path = "/datamap/api/search/query"
+                base_url = resolve_api_endpoint(config["endpoint"], api_path) + api_path
+                entries, continuation = [], None
+                for _page in range(50):
+                    body = {"keywords": None, "limit": 1000}
+                    if continuation: body["continuationToken"] = continuation
+                    request = urllib.request.Request(base_url + "?api-version=2023-09-01", data=json.dumps(body).encode(), headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json", "Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    page_entries = payload.get("value", []) if isinstance(payload, dict) else []
+                    if not isinstance(page_entries, list): break
+                    entries.extend(page_entries)
+                    continuation = payload.get("continuationToken") if isinstance(payload, dict) else None
+                    if not continuation: break
+                has_more = bool(continuation)
+            else:
+                # Unified Catalog has its own global service endpoint and read-only list route.
+                api_path = "/datagovernance/catalog/dataAssets"
+                base_url = resolve_api_endpoint(config["endpoint"], api_path) + api_path
+                entries, payload, skip = [], {}, 0
+                for _page in range(50):
+                    query = urlencode({"api-version": "2026-03-20-preview", "includeExtendedProperties": "true", "top": "100", "skip": str(skip)})
+                    request = urllib.request.Request(base_url + "?" + query, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    page_entries = payload.get("value", payload.get("items", payload.get("dataAssets", []))) if isinstance(payload, dict) else []
+                    if not isinstance(page_entries, list): break
+                    entries.extend(page_entries)
+                    if len(page_entries) < 100: break
+                    skip += len(page_entries)
+                has_more = len(entries) >= 5000 and len(entries) % 100 == 0
             nodes = []
             for item in entries if isinstance(entries, list) else []:
                 if not isinstance(item, dict):
                     continue
-                name = item.get("name") or item.get("displayName") or item.get("id") or "Purview asset"
+                name = item.get("name") or item.get("displayName") or item.get("qualifiedName") or item.get("id") or "Purview asset"
                 source = item.get("source") if isinstance(item.get("source"), dict) else {}
                 qname = item.get("qualifiedName") or source.get("fqn") or item.get("id") or name
                 contacts = item.get("contacts") if isinstance(item.get("contacts"), dict) else {}
                 owner = contacts.get("owner") or item.get("owner")
                 if isinstance(owner, list):
                     owner = ", ".join(str(entry.get("description") or entry.get("id")) for entry in owner if isinstance(entry, dict)) or None
-                nodes.append({"id": f"purview:{qname}", "name": str(name).split("/")[-1], "qualified_name": qname, "kind": "table", "source": "purview", "environment": "governance", "identity": identity, "description": item.get("description"), "owner": owner, "classifications": item.get("classifications", []), "access": "unknown", "children": []})
+                entity_type = str(item.get("entityType") or "").casefold()
+                kind = "view" if "view" in entity_type else "table"
+                nodes.append({"id": f"purview:{qname}", "name": str(name).split("/")[-1], "qualified_name": qname, "kind": kind, "source": "purview", "environment": "governance", "identity": identity, "description": item.get("description"), "owner": owner, "classifications": item.get("classifications", []), "access": "unknown", "children": []})
             page = self.cache.put(cache_context, "assets", nodes, 6 * 3600)
-            page["has_more"] = len(entries) >= 5000 and len(entries) % 100 == 0
+            page["has_more"] = has_more
+            self.settings_repo.put_check("purview", "connected", None, f"Purview read-only metadata sync succeeded through {api_surface.replace('_', ' ').title()}.")
             return page
         except ImportError:
             return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Azure Identity is not installed in this Dexter environment."}
         except urllib.error.HTTPError as exc:
+            from dexter.adapters.purview import _http_diagnostic
+            diagnostic = _http_diagnostic(exc.code)
+            self.settings_repo.put_check("purview", diagnostic["status"], diagnostic["category"], diagnostic["detail"])
             if cached:
-                cached.update(stale=True, error=f"Purview refresh failed (HTTP {exc.code}); showing cached metadata.")
+                cached.update(stale=True, error=f"{diagnostic['detail']} Showing cached metadata.")
                 return cached
-            if exc.code == 401:
-                message = "Purview rejected the delegated Azure CLI token. Verify authentication and tenant."
-            elif exc.code == 403:
-                message = "Azure CLI identity is authenticated but lacks Unified Catalog read permission."
-            elif exc.code == 404:
-                message = "The configured Purview API endpoint or Unified Catalog route was not found."
-            else:
-                message = f"Purview returned HTTP {exc.code} while reading catalog metadata."
-            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": message}
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": diagnostic["detail"]}
         except (TimeoutError, OSError, urllib.error.URLError, ValueError, TypeError, KeyError) as exc:
+            self.settings_repo.put_check("purview", "unavailable", "connectivity", "Purview could not be reached while reading metadata.")
             if cached:
-                cached.update(stale=True, error="Purview could not refresh; showing cached metadata.")
+                cached.update(stale=True, error="Purview could not be reached; showing cached metadata.")
                 return cached
             logger.info("Purview discovery failed (%s)", type(exc).__name__)
             return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Purview catalogue discovery is unavailable. Check the endpoint, API support, and permissions."}
+        except Exception as exc:
+            message = str(exc).lower()
+            status = "unavailable" if any(term in message for term in ("azure cli", "az cli", "credentialunavailable", "login")) else "expired"
+            category = "authentication"
+            detail = "Azure CLI has no usable Purview session. Run az login and retry." if status == "unavailable" else "Azure CLI authentication failed or expired. Run az login and retry."
+            self.settings_repo.put_check("purview", status, category, detail)
+            if cached:
+                cached.update(stale=True, error=f"{detail} Showing cached metadata.")
+                return cached
+            logger.info("Purview authentication failed (%s)", type(exc).__name__)
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": detail}

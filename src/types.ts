@@ -9,6 +9,8 @@ export type Connection = {
   profile?: string | null
   workspace?: string | null
   endpoint?: string | null
+  account_name?: string | null
+  api_surface?: string | null
   tenant_id?: string | null
   scope?: string
   api_path?: string

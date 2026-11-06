@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 from types import ModuleType
 from pathlib import Path
 from types import SimpleNamespace
@@ -303,6 +304,65 @@ class PurviewDiscoveryTests(unittest.TestCase):
             result = validate_endpoint("https://pv.purview.azure.com/catalog", "tenant-1", "https://purview.azure.net/.default", "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview")
         self.assertEqual(result["status"], "connected")
         self.assertTrue(requests[0].startswith("https://api.purview-service.microsoft.com/"))
+
+    def test_discovery_keeps_arm_account_and_falls_back_to_read_only_data_map_search(self):
+        management = self.token("https://management.azure.com/")
+        purview = self.token("https://purview.azure.net")
+        credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=management if scope.startswith("https://management") else purview))
+        calls = []
+
+        class Response:
+            status = 200
+            def __init__(self, payload=None): self.payload = payload or {}
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return json.dumps(self.payload).encode()
+
+        def urlopen(request, timeout=0):
+            calls.append(request)
+            url = request.full_url
+            if "/subscriptions?" in url: return Response({"value": [{"subscriptionId": "sub-1"}]})
+            if "/providers/Microsoft.Purview/accounts?" in url:
+                return Response({"value": [{"id": "account-id", "name": "pv", "properties": {"endpoints": {"catalog": "https://pv.purview.azure.com/catalog"}}}]})
+            if "api.purview-service.microsoft.com" in url:
+                raise urllib.error.HTTPError(url, 403, "forbidden", {}, None)
+            return Response({"value": []})
+
+        azure_module = ModuleType("azure")
+        identity_module = ModuleType("azure.identity")
+        identity_module.AzureCliCredential = lambda: credential
+        azure_module.identity = identity_module
+        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
+            result = discover_accounts()
+        self.assertEqual(result["status"], "connected")
+        self.assertEqual(result["accounts"][0]["api_surface"], "data_map")
+        self.assertEqual(result["items"][0]["endpoint"], "https://pv.purview.azure.com")
+        query = calls[-1]
+        self.assertEqual(query.get_method(), "POST")
+        self.assertIn("/datamap/api/search/query?api-version=2023-09-01", query.full_url)
+        self.assertNotIn("/catalog/datamap", query.full_url)
+        self.assertEqual(json.loads(query.data), {"keywords": None, "limit": 1})
+
+    def test_data_map_validation_is_a_delegated_read_only_search_request(self):
+        token = self.token("https://purview.azure.net")
+        credential = SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
+        requests = []
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+        def urlopen(request, timeout=0):
+            requests.append(request)
+            return Response()
+        azure_module = ModuleType("azure")
+        identity_module = ModuleType("azure.identity")
+        identity_module.AzureCliCredential = lambda tenant_id=None: credential
+        azure_module.identity = identity_module
+        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
+            result = validate_endpoint("https://pv.purview.azure.com/catalog", "tenant-1", "https://purview.azure.net/.default", "/datamap/api/search/query?api-version=2023-09-01")
+        self.assertEqual(result["status"], "connected")
+        self.assertEqual(requests[0].get_method(), "POST")
+        self.assertEqual(requests[0].full_url, "https://pv.purview.azure.com/datamap/api/search/query?api-version=2023-09-01")
 
 
 class AnalyticsConfigTests(unittest.TestCase):

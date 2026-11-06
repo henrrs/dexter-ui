@@ -142,10 +142,12 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
     from dexter.adapters.purview import resolve_api_endpoint
     result["purview"] = {
         "configured": bool(purview),
-        "endpoint": resolve_api_endpoint(purview.get("endpoint", ""), settings.purview_api_path) if purview else None,
+        "endpoint": (resolve_api_endpoint(purview.get("endpoint", ""), "/datamap/api/search/query" if purview.get("api_surface") == "data_map" else settings.purview_api_path) if purview.get("api_surface") else purview.get("endpoint")) if purview else None,
         "tenant_id": purview.get("tenant_id") if purview else None,
+        "account_name": purview.get("account_name") if purview else None,
+        "api_surface": purview.get("api_surface", "unified_catalog") if purview else None,
         "scope": settings.purview_scope,
-        "api_path": settings.purview_api_path,
+        "api_path": "/datamap/api/search/query?api-version=2023-09-01" if purview and purview.get("api_surface") == "data_map" else settings.purview_api_path,
         "status": check["status"] if check else ("configured" if purview else "unavailable"),
         "category": check["category"] if check else None,
         "detail": check["detail"] if check else ("Configure a Purview endpoint to enable read-only validation." if not purview else "Endpoint configured. Validate to check Azure CLI authentication and access."),
@@ -466,7 +468,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         config = settings_repo.get("purview")
         if not config:
             raise HTTPException(409, detail="Configure a Purview endpoint before validating")
-        result = _run_validation(operations, "purview-connection", lambda: validate_endpoint(config["endpoint"], config.get("tenant_id"), settings.purview_scope, settings.purview_api_path))
+        api_path = "/datamap/api/search/query?api-version=2023-09-01" if config.get("api_surface") == "data_map" else settings.purview_api_path
+        result = _run_validation(operations, "purview-connection", lambda: validate_endpoint(config["endpoint"], config.get("tenant_id"), settings.purview_scope, api_path))
         settings_repo.put_check("purview", result["status"], result["category"], result["detail"])
         return result
 
@@ -474,14 +477,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def discover_purview_accounts():
         from dexter.adapters.purview import discover_accounts
         result = discover_accounts()
-        items = result.get("items", [])
-        if len(items) == 1:
-            account = items[0]
-            settings_repo.put("purview", {"endpoint": account["endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id")})
-            settings_repo.put_check("purview", "connected", None, "Automatically selected and validated the only accessible Purview Unified Catalog account.")
-            result["selected"] = account["id"]
-        elif len(items) > 1:
-            settings_repo.put_check("purview", "configured", None, "Multiple Purview accounts support Unified Catalog. Select the account to use.")
+        accounts = result.get("accounts", result.get("items", []))
+        if len(accounts) == 1:
+            account = accounts[0]
+            settings_repo.put("purview", {"endpoint": account.get("endpoint") or account["account_endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id"), "api_surface": account.get("api_surface")})
+            result["selected"] = account.get("id")
+            settings_repo.put_check("purview", account.get("status", result.get("status", "configured")), account.get("category", result.get("category")), result.get("detail", "Purview account discovered."))
+        elif len(accounts) > 1:
+            settings_repo.put_check("purview", "configured", None, "Multiple Purview accounts were discovered. Select the account to use.")
         elif result.get("status"):
             settings_repo.put_check("purview", result["status"], result.get("category"), result.get("detail", "Purview account discovery did not find a usable API."))
         return result
@@ -490,11 +493,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def select_purview_account(body: PurviewAccountSelection):
         from dexter.adapters.purview import discover_accounts
         result = discover_accounts()
-        account = next((item for item in result.get("items", []) if item.get("id") == body.account_id), None)
+        account = next((item for item in result.get("accounts", result.get("items", [])) if item.get("id") == body.account_id), None)
         if not account:
-            raise HTTPException(404, detail="That account is not currently accessible with Azure CLI authentication")
-        settings_repo.put("purview", {"endpoint": account["endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id")})
-        settings_repo.put_check("purview", "connected", None, "Selected an account with delegated Purview Unified Catalog access.")
+            raise HTTPException(404, detail="That Purview account was not found in the current Azure CLI discovery results")
+        settings_repo.put("purview", {"endpoint": account.get("endpoint") or account["account_endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id"), "api_surface": account.get("api_surface")})
+        settings_repo.put_check("purview", account.get("status", result.get("status", "configured")), account.get("category", result.get("category")), account.get("detail") or result.get("detail", "Purview account selected."))
         return get_connections()
 
     @app.get("/api/operations")

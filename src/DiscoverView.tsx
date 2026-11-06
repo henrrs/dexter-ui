@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { ChevronDown, ChevronRight, Database, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, PanelLeftClose, Play, RefreshCw, Search, Sparkles, Star, Trash2, X, XCircle } from 'lucide-react'
+import { ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, PanelLeftClose, PanelLeftOpen, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Star, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
 import type { DiscoverNode, DiscoverPage } from './api'
 import type { Operation } from './types'
@@ -8,7 +8,7 @@ import type { Operation } from './types'
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
 type WorkbenchTab = { key: string; node: DiscoverNode; environment: 'dev' | 'prod' | 'local' }
 
-export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, onResizeExplorer }: { explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void }) {
+export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer, rightOpen, onExpandContext }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void; rightOpen: boolean; onExpandContext: () => void }) {
   const [sources, setSources] = useState<DiscoverNode[]>([])
   const [pages, setPages] = useState<Record<string, PageState>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -45,7 +45,7 @@ export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, 
     catch { /* Keep the last local view and let the user retry. */ }
     finally { setRefreshing(false) }
   }
-  useEffect(() => { void loadSources() }, [])
+  useEffect(() => { if (active) void loadSources() }, [active])
 
   const loadChildren = async (node: DiscoverNode, force = false) => {
     if (loading.has(node.id)) return
@@ -159,7 +159,7 @@ export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, 
   const matches = (node: DiscoverNode) => {
     const text = `${node.name} ${node.qualified_name ?? ''} ${node.source} ${node.environment}`.toLowerCase()
     const queryMatch = text.includes(query.trim().toLowerCase())
-    const sourceMatch = filter === 'all' || (filter === 'restricted' && node.access === 'restricted') || (filter === 'favorites' && favorites.some((item) => item.id === node.id))
+    const sourceMatch = filter === 'all' || (filter === 'restricted' && (node.access === 'restricted' || node.source === 'purview')) || (filter === 'favorites' && favorites.some((item) => item.id === node.id))
     return queryMatch && sourceMatch
   }
 
@@ -182,14 +182,16 @@ export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, 
     const expandable = !['table', 'view'].includes(node.kind)
     const pending = loading.has(node.id)
     const access = node.access ?? 'unknown'
-    const metadataOnly = access !== 'read' && node.variants?.some((variant) => variant.environment === 'purview')
+    const hasReadableVariant = access === 'read' || node.variants?.some((variant) => ['dev', 'prod', 'local'].includes(variant.environment) && variant.access === 'read')
+    const metadataOnly = (node.source === 'purview' && !hasReadableVariant) || (!hasReadableVariant && node.variants?.some((variant) => variant.environment === 'purview'))
+    const restricted = access === 'restricted' || node.variants?.some((variant) => ['dev', 'prod', 'local'].includes(variant.environment) && variant.access === 'restricted')
     return <div key={node.id}>
       <div className={`discover-tree-row ${selected?.id === node.id ? 'selected' : ''}`} style={{ paddingLeft: 9 + depth * 14 }}>
         <button className="discover-expander" aria-label={`${open ? 'Collapse' : 'Expand'} ${node.name}`} onClick={() => void toggle(node)} disabled={!expandable}>{pending ? <LoaderCircle size={13} className="spin" /> : expandable ? open ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : <span className="tree-spacer" />}</button>
         <button className="discover-node" onClick={() => expandable ? void toggle(node) : void selectNode(node)}>
-          {node.kind === 'catalog' ? <Database size={14} className="tree-object-icon" /> : node.kind === 'schema' ? <Layers3 size={14} className="tree-object-icon" /> : <span className={`access-dot ${access}`} title={accessLabel(access)} />}
-          {(node.kind === 'table' || node.kind === 'view') && (access === 'restricted' || metadataOnly) && <LockKeyhole size={12} className="tree-lock" aria-label="Metadata visible; data access restricted" />}
-          <span className={`discover-node-name ${metadataOnly ? 'metadata-only' : ''}`}>{node.name}</span><span className="discover-node-kind" title={node.ambiguous ? 'Name collision; physical variants are kept separate' : undefined}>{node.ambiguous ? 'COLLISION' : node.kind === 'source' ? node.status : node.kind}</span>
+          {node.kind === 'catalog' ? <Database size={14} className="tree-object-icon" /> : node.kind === 'schema' ? <Layers3 size={14} className="tree-object-icon" /> : node.kind === 'view' ? <Eye size={14} className="tree-object-icon tree-view-icon" aria-label="View" /> : <Table2 size={14} className="tree-object-icon tree-table-icon" aria-label="Table" />}
+          {(node.kind === 'table' || node.kind === 'view') && (restricted || metadataOnly) && <LockKeyhole size={12} className="tree-lock" aria-label="Metadata visible; data access restricted" />}
+          <span className={`discover-node-name ${metadataOnly ? 'metadata-only' : ''}`} title={node.name}>{node.name}</span>{node.kind === 'source' && <span className="discover-node-kind">{node.status}</span>}{node.ambiguous && <span className="discover-node-kind" title="Name collision; physical variants are kept separate">COLLISION</span>}
           {(node.kind === 'table' || node.kind === 'view') && <Availability node={node} onSelect={(environment) => void selectNode(node, environment)} />}
         </button>
       </div>
@@ -200,14 +202,16 @@ export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, 
   })
 
   const visible = useMemo(() => filter === 'favorites' ? [] : sources.filter(matches), [sources, query, filter, favorites])
-  return <div className="page-content discover-page">
-    <div className="page-intro"><div><div className="eyebrow intro-eyebrow"><span className="accent-line" /> UNIFIED CATALOG</div><h1>Explore your data<span className="greeting-dot">.</span></h1><p>Catalogs, schemas, and tables are grouped by logical identity across environments.</p></div><button className="button secondary" onClick={() => { void loadSources(); for (const source of sources) if (expanded.has(source.id)) void loadChildren(source, true) }} disabled={refreshing}>{refreshing ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />} Refresh metadata</button></div>
-    <div className={`discover-layout ${explorerOpen ? '' : 'explorer-collapsed'}`}>
-      {explorerOpen && <section className="card discover-browser" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><div className="discover-subnav"><button className={filter !== 'favorites' ? 'active' : ''} onClick={() => setFilter('all')}><Database size={12} /> Catalog</button><button className={filter === 'favorites' ? 'active' : ''} onClick={() => setFilter(filter === 'favorites' ? 'all' : 'favorites')}><Star size={12} /> Favorites</button></div><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+  if (!active) return null
+  return <>
+    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><div className="discover-subnav"><button className={filter !== 'favorites' ? 'active' : ''} onClick={() => setFilter('all')}><Database size={12} /> Catalog</button><button className={filter === 'favorites' ? 'active' : ''} onClick={() => setFilter(filter === 'favorites' ? 'all' : 'favorites')}><Star size={12} /> Favorites</button></div><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
         <div className="discover-tree">{filter === 'favorites' ? favorites.length ? <div className="discover-shortcuts favorites-only"><div><span className="eyebrow"><Star size={10} /> FAVORITES</span>{favorites.map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div></div> : <div className="discover-empty">No favorites yet.</div> : <>{(favorites.length > 0 || recent.length > 0) && <div className="discover-shortcuts">{favorites.length > 0 && <div><span className="eyebrow"><Star size={10} /> FAVORITES</span>{favorites.map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div>}{recent.length > 0 && <div><span className="eyebrow">RECENT</span>{recent.slice(0, 5).map((node) => <button key={node.id} onClick={() => void selectNode(node)}>{node.name}<small>{node.qualified_name}</small></button>)}</div>}</div>}{visible.length ? renderNodes(visible) : <div className="discover-empty">No catalog metadata matches this search.</div>}</>}</div>
         <div className="discover-legend"><span><i className="access-dot read" /> Read confirmed</span><span><LockKeyhole size={10} /> Metadata only</span><span><i className="access-dot unknown" /> Unknown</span></div><div className="resize-handle" onPointerDown={onResizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
-      </section>}
-      <section className="card discover-details">{workbenchTabs.length > 0 && <div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name} · {tab.environment.toUpperCase()}</button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div>}{selected ? <>
+      </aside>}
+    <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
+      <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!explorerOpen && <button className="icon-button subtle" onClick={onExpandExplorer} aria-label="Show explorer"><PanelLeftOpen size={16} /></button>}<button className="toolbar-refresh" onClick={() => void refreshCatalog()} disabled={refreshing}>{refreshing ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />} Refresh metadata</button>{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
+      <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon"><Search size={13} /></span>Discover</div>{workbenchTabs.length > 0 && <div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name} · {tab.environment.toUpperCase()}</button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div>}</div>
+      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>
         <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div>{(selected.kind === 'table' || selected.kind === 'view') && <button className={`icon-button subtle ${favorites.some((item) => item.id === selected.id) ? 'active' : ''}`} aria-label="Toggle favorite" onClick={() => setFavorites((items) => items.some((item) => item.id === selected.id) ? items.filter((item) => item.id !== selected.id) : [selected, ...items])}><Star size={14} /></button>}<button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
         <code className="qualified-path">{selected.qualified_name ?? selected.id}</code>
         <div className="discover-detail-status"><span className={`access-dot ${selected.access ?? 'unknown'}`} />{accessLabel(selected.access ?? 'unknown')}{selected.access !== 'read' && selected.variants?.some((variant) => variant.environment === 'purview') && <LockKeyhole size={12} aria-label="Purview metadata only; data access is restricted" />}<span className="detail-separator">·</span>{selected.kind}</div>
@@ -228,15 +232,16 @@ export function DiscoverView({ explorerOpen, explorerWidth, onCollapseExplorer, 
         {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
         <div className="discover-preview-note"><LockKeyhole size={14} /><span>Remote preview remains available only after the selected environment confirms read access.</span></div>
       </> : <div className="discover-placeholder"><span className="empty-glyph"><FileStack size={17} /></span><strong>Select an asset</strong><span>Metadata and access evidence will appear here.</span></div>}</section>
-    </div>
-    <div className="discover-sync"><span><span className="live-dot" /> Metadata sync is lazy</span><span>Catalogs 6h · Schemas 30m · Tables 15m · Details 1h</span></div>
-  </div>
+      <div className="discover-sync"><span><span className="live-dot" /> Metadata sync is lazy</span><span>Catalogs 6h · Schemas 30m · Tables 15m · Details 1h</span></div></div>
+      <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item">Unified Discover</span></div><div className="statusbar-right"><span>Metadata sync is lazy</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
+    </main>
+  </>
 }
 
 function Fact({ label, value }: { label: string; value: string }) { return <div className="discover-fact"><span>{label}</span><strong>{value}</strong></div> }
 function Availability({ node, onSelect }: { node: DiscoverNode; onSelect?: (environment: 'local' | 'dev' | 'prod') => void }) {
   const availability = node.availability
-  const states = availability ?? { local: 'absent', dev: 'unknown', prod: 'unknown' }
+  const states = availability ?? { local: 'unknown', dev: 'unknown', prod: 'unknown' }
   return <span className="availability-pills" aria-label="Local, DEV, and PROD availability">
     {(['local', 'dev', 'prod'] as const).map((environment) => <button key={environment} className={states[environment]} title={`${environment.toUpperCase()} · ${accessLabel(states[environment])}`} onClick={(event) => { event.stopPropagation(); if (states[environment] === 'present') onSelect?.(environment) }} disabled={states[environment] !== 'present'}>{environment === 'local' ? 'L' : environment === 'dev' ? 'D' : 'P'}</button>)}
   </span>

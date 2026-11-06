@@ -22,7 +22,7 @@ export const api = {
   validateDatabricks: (environment: 'dev' | 'prod') => request(`/connections/databricks/${environment}/validate`, { method: 'POST' }),
   savePurview: (endpoint: string, tenant_id: string) => request<Connections>('/connections/purview', { method: 'PUT', body: JSON.stringify({ endpoint, tenant_id: tenant_id || null }) }),
   validatePurview: () => request('/connections/purview/validate', { method: 'POST' }),
-  discoverPurview: () => request<{ items: Array<{ id: string; name: string; endpoint: string; tenant_id: string; subscription_id: string }>; status: string; detail: string; selected?: string }>('/connections/purview/discover', { method: 'POST' }),
+  discoverPurview: () => request<{ items: Array<{ id: string; name: string; endpoint: string; tenant_id: string; subscription_id: string }>; accounts?: Array<{ id: string; name: string; endpoint?: string; account_endpoint?: string; tenant_id: string; subscription_id: string; api_surface?: string; status?: string }>; status: string; category?: string; detail: string; selected?: string }>('/connections/purview/discover', { method: 'POST' }),
   selectPurview: (account_id: string) => request<Connections>('/connections/purview/select', { method: 'PUT', body: JSON.stringify({ account_id }) }),
   operations: () => request<Operation[]>('/operations?limit=12'),
   discoverSources: () => request<{ items: DiscoverNode[] }>('/discover/catalogs'),

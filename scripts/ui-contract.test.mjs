@@ -25,7 +25,14 @@ test('connection screens expose separate DEV/PROD profiles and explain token-loc
 })
 
 test('Unified Discover exposes lazy source browsing and conservative access states', () => {
-  assert.match(app, /view === 'discover' \? <DiscoverView explorerOpen=/)
+  assert.match(app, /<DiscoverView active=\{view === 'discover'\} explorerOpen=/)
+  assert.match(app, /Math\.min\(380, Math\.max\(210, width \+ moveEvent\.clientX - start\)\)/)
+  assert.match(discover, /className="explorer discover-shell-explorer"/)
+  assert.match(discover, /className=\{`workspace discover-workspace/)
+  assert.match(discover, /if \(!active\) return null/)
+  assert.match(discover, /aria-label="Collapse explorer"/)
+  assert.match(discover, /aria-label="Show explorer"/)
+  assert.doesNotMatch(discover, /className="card discover-browser"/)
   assert.doesNotMatch(app, /WORKSPACE<\/span><h2>Explorer/)
   assert.match(api, /discoverChildren/)
   assert.match(api, /discoverDetail/)
@@ -37,6 +44,11 @@ test('Unified Discover exposes lazy source browsing and conservative access stat
   assert.match(discover, /table-lineage/)
   assert.match(discover, /Generate Synthetic Data/)
   assert.match(discover, /states\[environment\] === 'present'/)
+  assert.match(discover, /<Table2/)
+  assert.match(discover, /<Eye/)
+  assert.doesNotMatch(discover, /<span className=\{`access-dot \$\{access\}`/)
+  assert.doesNotMatch(discover, /node\.kind === 'source' \? node\.status : node\.kind/)
+  assert.match(discover, /local: 'unknown', dev: 'unknown', prod: 'unknown'/)
 })
 
 test('layout has compact desktop and responsive breakpoints without remote assets', () => {

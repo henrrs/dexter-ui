@@ -5,13 +5,16 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import base64
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from types import ModuleType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
-from dexter.catalog.cache import DiscoveryCache
+from dexter.catalog.cache import DiscoveryCache, context_key
 from dexter.catalog.discovery import DiscoverService
 from dexter.catalog.reconcile import databricks_identity, reconcile
 from dexter.db.database import connect, migrate
@@ -73,6 +76,80 @@ class DiscoveryTests(unittest.TestCase):
         with connect(self.paths.database) as db:
             raw = " ".join(str(row[0]) for row in db.execute("SELECT payload_json FROM discovery_cache"))
         self.assertNotIn("token", raw.lower())
+
+    def test_data_map_read_only_results_feed_discover_and_mark_sync_connected(self):
+        repo = SettingsRepository(self.paths.database)
+        repo.put("purview", {"endpoint": "https://pv.purview.azure.com", "tenant_id": "tenant-1", "api_surface": "data_map"})
+        token_payload = base64.urlsafe_b64encode(json.dumps({"aud": "https://purview.azure.net", "tid": "tenant-1", "oid": "user-1"}).encode()).decode().rstrip("=")
+        token = f"header.{token_payload}.sig"
+        identity = ModuleType("azure.identity")
+        identity.AzureCliCredential = lambda tenant_id=None: SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
+        azure = ModuleType("azure")
+        azure.identity = identity
+
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return json.dumps({"value": [{"name": "orders", "qualifiedName": "databricks://meta/catalogs/analytics/schemas/sales/tables/orders", "entityType": "Table", "description": "Governed orders"}]}).encode()
+
+        requests = []
+        def urlopen(request, timeout=0):
+            requests.append(request)
+            return Response()
+        service = DiscoverService(self.paths, repo, Settings())
+        with patch.dict(sys.modules, {"azure": azure, "azure.identity": identity}), patch("dexter.catalog.discovery.urllib.request.urlopen", side_effect=urlopen):
+            page = service._purview(force=True)
+        self.assertEqual(requests[0].get_method(), "POST")
+        self.assertEqual(page["items"][0]["qualified_name"], "databricks://meta/catalogs/analytics/schemas/sales/tables/orders")
+        self.assertEqual(page["items"][0]["access"], "unknown")
+        self.assertEqual(repo.get_check("purview")["status"], "connected")
+
+    def test_purview_authentication_absence_and_http_errors_are_specific(self):
+        repo = SettingsRepository(self.paths.database)
+        repo.put("purview", {"endpoint": "https://pv.purview.azure.com", "tenant_id": "tenant-1"})
+        azure = ModuleType("azure")
+        identity = ModuleType("azure.identity")
+        azure.identity = identity
+        identity.AzureCliCredential = lambda tenant_id=None: SimpleNamespace(get_token=lambda _scope: (_ for _ in ()).throw(RuntimeError("Azure CLI is not logged in")))
+        service = DiscoverService(self.paths, repo, Settings())
+        with patch.dict(sys.modules, {"azure": azure, "azure.identity": identity}):
+            page = service._purview(force=True)
+        self.assertIn("az login", page["error"])
+        self.assertEqual(repo.get_check("purview")["category"], "authentication")
+
+        from dexter.adapters.purview import _http_diagnostic
+        self.assertEqual(_http_diagnostic(401)["category"], "authentication")
+        self.assertEqual(_http_diagnostic(403)["category"], "authorization")
+        self.assertEqual(_http_diagnostic(404)["category"], "endpoint")
+
+    def test_purview_http_failures_update_status_and_keep_expired_cached_metadata(self):
+        repo = SettingsRepository(self.paths.database)
+        endpoint = "https://api.purview-service.microsoft.com"
+        repo.put("purview", {"endpoint": endpoint, "tenant_id": "tenant-1"})
+        token_payload = base64.urlsafe_b64encode(json.dumps({"aud": "https://purview.azure.net", "tid": "tenant-1", "oid": "user-1"}).encode()).decode().rstrip("=")
+        token = f"header.{token_payload}.sig"
+        identity = ModuleType("azure.identity")
+        identity.AzureCliCredential = lambda tenant_id=None: SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
+        azure = ModuleType("azure")
+        azure.identity = identity
+        service = DiscoverService(self.paths, repo, Settings())
+        context = context_key("purview", endpoint, "tenant-1", "user-1", "https://purview.azure.net")
+        cache = DiscoveryCache(self.paths.database)
+        cache.put(context, "assets", [{"name": "cached-asset"}], 0)
+        with patch.dict(sys.modules, {"azure": azure, "azure.identity": identity}):
+            for status, expected, category in ((401, "expired", "authentication"), (403, "no_permission", "authorization"), (404, "error", "endpoint")):
+                error = urllib.error.HTTPError(endpoint, status, "failure", {}, None)
+                with self.subTest(status=status), patch("dexter.catalog.discovery.urllib.request.urlopen", side_effect=error):
+                    page = service._purview(force=True)
+                    self.assertTrue(page["stale"])
+                    self.assertEqual(page["items"][0]["name"], "cached-asset")
+                    self.assertEqual(repo.get_check("purview")["status"], expected)
+                    self.assertEqual(repo.get_check("purview")["category"], category)
+            with patch("dexter.catalog.discovery.urllib.request.urlopen", side_effect=TimeoutError()):
+                page = service._purview(force=True)
+            self.assertTrue(page["stale"])
+            self.assertEqual(repo.get_check("purview")["category"], "connectivity")
 
 
 if __name__ == "__main__":
