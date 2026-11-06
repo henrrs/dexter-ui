@@ -79,6 +79,7 @@ class LocalOriginGuard:
 
 class MakeLocalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100_000)
     warehouse_id: str = Field(min_length=1, max_length=160)
     environment: str = Field(pattern="^(dev|prod)$")
     columns: list[str] = Field(min_length=1, max_length=500)
@@ -93,6 +94,7 @@ class LocalQueryRequest(BaseModel):
 
 class RemotePreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100_000)
     environment: str = Field(pattern="^(dev|prod)$")
     warehouse_id: str = Field(min_length=1, max_length=160)
 
@@ -329,8 +331,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def local_datasets():
         return {"items": local_data.list()}
 
-    @app.post("/api/discover/nodes/{node_id:path}/make-local", status_code=202)
-    def start_make_local(node_id: str, body: MakeLocalRequest):
+    @app.post("/api/discover/make-local", status_code=202)
+    def start_make_local(body: MakeLocalRequest):
+        node_id = body.node_id
         environment = body.environment
         if node_id.startswith("unified:"):
             try:
@@ -378,15 +381,16 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(409, detail="The local materialization queue is full") from None
         return operations.get(operation["id"])
 
-    @app.post("/api/discover/nodes/{node_id:path}/preview")
-    def preview_remote_table(node_id: str, body: RemotePreviewRequest):
+    @app.post("/api/discover/preview")
+    def preview_remote_table(body: RemotePreviewRequest):
+        node_id = body.node_id
         if node_id.startswith("unified:"):
             try:
                 kind, variants = _variants(node_id)
                 variant = next((item for item in variants if item.get("environment") == body.environment), None)
-            except Exception:
-                variant = None
-                kind = None
+            except Exception as exc:
+                logger.info("Unified table identity could not be decoded (%s)", type(exc).__name__)
+                raise HTTPException(422, detail="Invalid unified table identity") from None
             if kind not in {"table", "view"} or not variant:
                 raise HTTPException(422, detail="Select a physical table variant")
             physical_id = variant["node_id"]

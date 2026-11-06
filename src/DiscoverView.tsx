@@ -30,9 +30,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [warehouseRefreshKey, setWarehouseRefreshKey] = useState(0)
   const [selectedColumns, setSelectedColumns] = useState<string[]>([])
   const [makeLocalOpen, setMakeLocalOpen] = useState(false)
-  const [filterColumn, setFilterColumn] = useState('')
-  const [filterOperator, setFilterOperator] = useState('=')
-  const [filterValue, setFilterValue] = useState('')
   const [activeOperation, setActiveOperation] = useState<Operation | null>(null)
   const [operationLogs, setOperationLogs] = useState<Array<{ created_at: string; level: string; message: string }>>([])
   const [localSql, setLocalSql] = useState('SELECT * FROM local_table LIMIT 100')
@@ -114,7 +111,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const tab = { key: node.id, node, environment: preferred }
     setWorkbenchTabs((items) => items.some((item) => item.key === tab.key) ? items.map((item) => item.key === tab.key ? tab : item) : [...items, tab])
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: preferred } }))
-    setRemotePreview(null); setLocalRows([]); setLocalColumns([]); setLocalQueryError(''); setFilterColumn('')
+    setRemotePreview(null); setLocalRows([]); setLocalColumns([]); setLocalQueryError('')
     try {
       const detail = await api.discoverCatalogDetail(node.id, preferred)
       setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
@@ -173,8 +170,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     if (!selected || !warehouseId || !selectedColumns.length) return
     setLocalQueryError('')
     try {
-      const filters = filterColumn ? [{ column: filterColumn, operator: filterOperator, value: filterValue }] : []
-      const operation = await api.makeLocal(selected.id, { environment: activeEnvironment as 'dev' | 'prod', warehouse_id: warehouseId, columns: selectedColumns, filters })
+      const operation = await api.makeLocal(selected.id, { environment: activeEnvironment as 'dev' | 'prod', warehouse_id: warehouseId, columns: selectedColumns, filters: [] })
       setActiveOperation(operation)
       setOperationLogs([])
       setMakeLocalOpen(false)
@@ -298,8 +294,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               {selected.columns?.length
                 ? <><label className="select-all-columns"><input type="checkbox" checked={selectedColumns.length === selected.columns.length} onChange={(event) => setSelectedColumns(event.target.checked ? selected.columns?.map((column) => column.name) ?? [] : [])} /><strong>All columns</strong><span>{selected.columns.length} available</span></label><div className="local-column-picker">{selected.columns.map((column) => <label key={column.name}><input type="checkbox" checked={selectedColumns.includes(column.name)} onChange={(event) => setSelectedColumns((prior) => event.target.checked ? [...prior, column.name] : prior.filter((item) => item !== column.name))} />{column.name}<code>{column.type_text ?? column.type}</code></label>)}</div></>
                 : <div className="discover-error modal-inline-error">Column metadata is not loaded for this asset.</div>}
-              <label className="field-label">FILTER</label>
-              <div className="local-filter-row"><select aria-label="Filter column" value={filterColumn} onChange={(event) => setFilterColumn(event.target.value)}><option value="">No filter</option>{selected.columns?.map((column) => <option key={column.name} value={column.name}>{column.name}</option>)}</select><select aria-label="Filter operator" value={filterOperator} onChange={(event) => setFilterOperator(event.target.value)}><option>=</option><option>!=</option><option>&gt;</option><option>&gt;=</option><option>&lt;</option><option>&lt;=</option><option value="contains">contains</option><option value="is_null">is null</option><option value="not_null">is not null</option></select>{filterColumn && !['is_null', 'not_null'].includes(filterOperator) && <input aria-label="Filter value" value={filterValue} onChange={(event) => setFilterValue(event.target.value)} placeholder="Filter value" />}</div>
               {localQueryError && <div className="discover-error modal-inline-error" role="alert">{localQueryError}</div>}
               <small className="make-local-dialog-note">A stopped warehouse starts automatically when the snapshot begins.</small>
             </div>
