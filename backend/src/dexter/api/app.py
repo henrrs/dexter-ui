@@ -299,17 +299,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def discover_children(node_id: str, force: bool = False):
         return discover.children(node_id, force)
 
-    @app.get("/api/discover/nodes/{node_id:path}")
-    def discover_detail(node_id: str):
-        result = discover.detail(node_id)
-        if result is None:
-            raise HTTPException(404, detail="Asset details are unavailable")
-        return result
-
-    @app.get("/api/discover/local-datasets")
-    def local_datasets():
-        return {"items": local_data.list()}
-
     @app.get("/api/discover/nodes/{node_id:path}/warehouses")
     def available_warehouses(node_id: str, environment: str = "dev"):
         detail = unified.detail(node_id, environment) if node_id.startswith("unified:") else discover.detail(node_id)
@@ -328,6 +317,17 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         except Exception as exc:
             logger.info("Warehouse listing failed (%s)", type(exc).__name__)
             raise HTTPException(503, detail="Could not list SQL warehouses accessible to the selected profile") from None
+
+    @app.get("/api/discover/nodes/{node_id:path}")
+    def discover_detail(node_id: str):
+        result = discover.detail(node_id)
+        if result is None:
+            raise HTTPException(404, detail="Asset details are unavailable")
+        return result
+
+    @app.get("/api/discover/local-datasets")
+    def local_datasets():
+        return {"items": local_data.list()}
 
     @app.post("/api/discover/nodes/{node_id:path}/make-local", status_code=202)
     def start_make_local(node_id: str, body: MakeLocalRequest):
