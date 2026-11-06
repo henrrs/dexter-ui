@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
 from dexter.catalog.unified import UnifiedDiscoverService, normalize_catalog
-from dexter.adapters.purview import discover_accounts, resolve_api_endpoint, validate_endpoint
+from dexter.adapters.purview import _is_supported_account_host, discover_accounts, resolve_api_endpoint, validate_endpoint
 from dexter.db.database import migrate
 from dexter.paths import DexterPaths
 from dexter.services.local_data import LocalDataService
@@ -283,8 +283,48 @@ class PurviewDiscoveryTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "Bearer " + management)
         self.assertEqual(calls[-1][1], "Bearer " + purview)
 
+    def test_account_specific_purview_service_host_is_kept_and_probed(self):
+        management = self.token("https://management.azure.com/")
+        purview = self.token("https://purview.azure.net")
+        credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=management if scope.startswith("https://management") else purview))
+        account_endpoint = "https://cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com/catalog"
+        calls = []
+
+        class Response:
+            status = 200
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self): return json.dumps(self.payload).encode()
+
+        def urlopen(request, timeout=0):
+            url = request.full_url
+            calls.append(url)
+            if "/subscriptions?" in url: return Response({"value": [{"subscriptionId": "sub-1"}]})
+            if "/providers/Microsoft.Purview/accounts?" in url:
+                return Response({"value": [{"id": "account-id", "name": "xpi-prd-datagovernance-pview", "properties": {"provisioningState": "Succeeded", "endpoints": {"catalog": account_endpoint}}}]})
+            if url.startswith("https://cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com/datagovernance/catalog/dataAssets?"):
+                return Response({"value": []})
+            raise AssertionError(f"Unexpected Purview probe: {url}")
+
+        azure_module = ModuleType("azure")
+        identity_module = ModuleType("azure.identity")
+        identity_module.AzureCliCredential = lambda: credential
+        azure_module.identity = identity_module
+        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
+            result = discover_accounts()
+        self.assertEqual(result["status"], "connected")
+        self.assertEqual(result["accounts"][0]["name"], "xpi-prd-datagovernance-pview")
+        self.assertEqual(result["items"][0]["endpoint"], account_endpoint.removesuffix("/catalog"))
+        self.assertTrue(any(url.startswith(result["items"][0]["endpoint"] + "/datagovernance/catalog/dataAssets?") for url in calls))
+
     def test_unified_catalog_api_uses_service_host_not_arm_catalog_endpoint(self):
+        tenant_api_host = "cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com"
+        self.assertTrue(_is_supported_account_host(tenant_api_host))
+        self.assertFalse(_is_supported_account_host("untrusted-api.purview-service.microsoft.com"))
+        self.assertFalse(_is_supported_account_host("purview-service.microsoft.com"))
         self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datagovernance/catalog/dataAssets"), "https://api.purview-service.microsoft.com")
+        self.assertEqual(resolve_api_endpoint(f"https://{tenant_api_host}/catalog", "/datagovernance/catalog/dataAssets"), f"https://{tenant_api_host}")
         self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datamap/api/atlas/v2/search/basic"), "https://pv.purview.azure.com")
         token = self.token("https://purview.azure.net")
         credential = SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))

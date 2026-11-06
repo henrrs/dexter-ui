@@ -6,6 +6,7 @@ import base64
 import json
 import urllib.error
 import urllib.request
+import uuid
 from urllib.parse import urlparse
 
 
@@ -23,13 +24,34 @@ def validate_configuration(endpoint: str, scope: str, api_path: str) -> dict | N
 def resolve_api_endpoint(endpoint: str, api_path: str) -> str:
     """Resolve the host from the selected Purview API surface, not a joined resource URL."""
     if api_path.startswith("/datagovernance/catalog/"):
-        # Unified Catalog has a separate service host; ARM account endpoints can
-        # end in /catalog and are not valid bases for this route.
+        # Unified Catalog supports the tenant-specific platform endpoint returned by
+        # ARM. Legacy account endpoints use the documented shared service root.
+        parsed = urlparse(endpoint)
+        if parsed.hostname and _is_tenant_service_host(parsed.hostname):
+            base = endpoint.rstrip("/")
+            return base[:-len("/catalog")] if base.casefold().endswith("/catalog") else base
         return "https://api.purview-service.microsoft.com"
     if api_path.startswith("/datamap/api/"):
         # Data Map uses the account data-plane host, never its /catalog suffix.
         return endpoint.rstrip("/")[:-len("/catalog")] if endpoint.rstrip("/").casefold().endswith("/catalog") else endpoint.rstrip("/")
     return endpoint.rstrip("/")
+
+
+def _is_tenant_service_host(hostname: str) -> bool:
+    suffix = "-api.purview-service.microsoft.com"
+    if not hostname.casefold().endswith(suffix):
+        return False
+    tenant = hostname[:-len(suffix)]
+    try:
+        uuid.UUID(tenant)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _is_supported_account_host(hostname: str) -> bool:
+    normalized = hostname.casefold()
+    return normalized == "api.purview-service.microsoft.com" or _is_tenant_service_host(normalized) or normalized.endswith(".purview.azure.com")
 
 
 def validate_endpoint(endpoint: str, tenant_id: str | None, scope: str, api_path: str) -> dict:
@@ -135,7 +157,7 @@ def discover_accounts() -> dict:
                 parsed = urlparse(endpoint or "")
                 if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
                     continue
-                if parsed.hostname != "api.purview-service.microsoft.com" and not parsed.hostname.endswith(".purview.azure.com"):
+                if not _is_supported_account_host(parsed.hostname):
                     continue
                 accounts.append({"id": account.get("id"), "name": account.get("name"), "tenant_id": claims.get("tid"), "account_endpoint": endpoint.rstrip("/"), "subscription_id": sub_id})
         if not accounts:
@@ -150,20 +172,28 @@ def discover_accounts() -> dict:
         data_headers = {"Authorization": f"Bearer {purview_token.token}", "Accept": "application/json"}
         supported = []
         diagnostics = []
-        # Unified Catalog is one global service route. Probe it once; the ARM endpoint
-        # is account metadata and can legitimately end in /catalog.
-        api_endpoint = "https://api.purview-service.microsoft.com"
-        probe_url = api_endpoint + "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1"
+        # Prefer a tenant-specific platform endpoint when ARM returns one. Otherwise
+        # use the shared service root documented for Unified Catalog.
+        routes = {}
+        for account in accounts:
+            base = resolve_api_endpoint(account["account_endpoint"], "/datagovernance/catalog/dataAssets")
+            routes.setdefault(base, []).append(account)
         unified_error = None
-        try:
-            request = urllib.request.Request(probe_url, headers=data_headers, method="GET")
-            with urllib.request.urlopen(request, timeout=8) as response:
-                if 200 <= response.status < 300:
-                    supported.extend({**account, "endpoint": api_endpoint, "api_surface": "unified_catalog", "status": "connected"} for account in accounts)
-        except urllib.error.HTTPError as exc:
-            unified_error = _http_diagnostic(exc.code)
-        except (TimeoutError, OSError, urllib.error.URLError):
-            unified_error = {"status": "unavailable", "category": "connectivity", "detail": "The Unified Catalog service could not be reached."}
+        for api_endpoint, route_accounts in routes.items():
+            probe_url = api_endpoint + "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1"
+            try:
+                request = urllib.request.Request(probe_url, headers=data_headers, method="GET")
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    if 200 <= response.status < 300:
+                        supported.extend({**account, "endpoint": api_endpoint, "api_surface": "unified_catalog", "status": "connected"} for account in route_accounts)
+            except urllib.error.HTTPError as exc:
+                diagnostic = _http_diagnostic(exc.code)
+                unified_error = unified_error or diagnostic
+                diagnostics.extend({"account": account.get("name"), **diagnostic, "http_status": exc.code, "api_surface": "unified_catalog"} for account in route_accounts)
+            except (TimeoutError, OSError, urllib.error.URLError):
+                diagnostic = {"status": "unavailable", "category": "connectivity", "detail": "The Unified Catalog service could not be reached."}
+                unified_error = unified_error or diagnostic
+                diagnostics.extend({"account": account.get("name"), **diagnostic, "api_surface": "unified_catalog"} for account in route_accounts)
 
         # Data Map uses the account endpoint with its /catalog suffix removed and
         # a read-only Discovery query. Probe each account because this API is scoped.
