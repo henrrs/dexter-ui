@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import threading
@@ -13,6 +14,14 @@ from dexter.db.database import connect, transaction
 from dexter.services.analytics_config import load_limits
 
 _dataset_lock = threading.RLock()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _synchronized(method):
@@ -64,13 +73,27 @@ class LocalDataService:
 
     def recover(self) -> int:
         with transaction(self.db_path) as db:
-            rows = db.execute("SELECT operation_id,staging_path FROM local_materialization_locks").fetchall()
-            db.execute("DELETE FROM local_materialization_locks")
-        for row in rows:
+            rows = db.execute("SELECT l.operation_id,l.staging_path,o.state,o.details_json FROM local_materialization_locks l JOIN operations o ON o.id=l.operation_id").fetchall()
+            preserved = set()
+            abandoned = []
+            for row in rows:
+                try:
+                    details = json.loads(row["details_json"] or "{}")
+                except ValueError:
+                    details = {}
+                if (row["state"] in {"interrupted", "failed"}
+                        and details.get("retry_available") is True
+                        and details.get("resume_available") is True):
+                    preserved.add(str(Path(row["staging_path"]).resolve()))
+                else:
+                    abandoned.append(row)
+                    db.execute("DELETE FROM local_materialization_locks WHERE operation_id=?", (row["operation_id"],))
+        for row in abandoned:
             shutil.rmtree(row["staging_path"], ignore_errors=True)
-        # Staging names include operation IDs and are never active after a process restart.
+        # Keep only staging folders attached to interrupted, explicitly resumable operations.
         for path in self.paths.temporary.glob("make-local-*"):
-            shutil.rmtree(path, ignore_errors=True)
+            if str(path.resolve()) not in preserved:
+                shutil.rmtree(path, ignore_errors=True)
         db = connect(self.db_path)
         try:
             active_paths = {Path(row[0]).resolve() for row in db.execute("SELECT snapshot_path FROM local_datasets").fetchall()}
@@ -82,7 +105,7 @@ class LocalDataService:
                     shutil.rmtree(snapshot, ignore_errors=True)
             except OSError:
                 continue
-        return len(rows)
+        return len(abandoned)
 
     def list(self) -> list[dict]:
         db = connect(self.db_path)
@@ -107,19 +130,58 @@ class LocalDataService:
             "schema": source["schema"], "table": source["table"],
         }, sort_keys=True, separators=(",", ":"))
         with transaction(self.db_path) as db:
-            db.execute("INSERT INTO local_materialization_locks(source_key,operation_id,staging_path) VALUES(?,?,?)", (source_key, operation_id, str(staging)))
+            existing = db.execute("SELECT source_key,staging_path FROM local_materialization_locks WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing:
+                if existing["source_key"] != source_key or existing["staging_path"] != str(staging):
+                    raise RuntimeError("The saved materialization reservation does not match this retry")
+            else:
+                db.execute("INSERT INTO local_materialization_locks(source_key,operation_id,staging_path) VALUES(?,?,?)", (source_key, operation_id, str(staging)))
         return source_key
 
     @_synchronized
     def publish(self, operation_id: str, source_key: str, source: dict, name: str, qualified_name: str,
-                staging: Path, parquet_file: Path, columns: list[dict], row_count: int, byte_count: int) -> dict:
-        if not parquet_file.is_file() or parquet_file.stat().st_size <= 0:
-            raise ValueError("The completed snapshot has no readable Parquet data")
+                staging: Path, parquet_file: Path, columns: list[dict], row_count: int, byte_count: int,
+                chunk_records: list[dict] | None = None) -> dict:
         try:
             import pyarrow.parquet as pq
-            parquet = pq.ParquetFile(parquet_file)
-            if parquet.metadata.num_rows != row_count or parquet.schema_arrow.names != [column["name"] for column in columns]:
-                raise ValueError("The staged Parquet schema or row count does not match the operation")
+            if parquet_file.is_dir():
+                data_files = sorted(parquet_file.glob("chunk-*.parquet"))
+                if not data_files or any(file.is_symlink() or not file.is_file() or file.stat().st_size <= 0 for file in data_files):
+                    raise ValueError("The completed snapshot has no valid Parquet chunks")
+                actual_rows = 0
+                schema_names = None
+                schema_signature = None
+                for file in data_files:
+                    parquet = pq.ParquetFile(file)
+                    actual_rows += parquet.metadata.num_rows
+                    names = parquet.schema_arrow.names
+                    signature = str(parquet.schema_arrow)
+                    if schema_names is not None and (names != schema_names or signature != schema_signature):
+                        raise ValueError("Parquet chunks have inconsistent schemas")
+                    schema_names = names
+                    schema_signature = signature
+                if actual_rows != row_count or schema_names != [column["name"] for column in columns]:
+                    raise ValueError("The staged Parquet schema or row count does not match the operation")
+                if sum(file.stat().st_size for file in data_files) != byte_count:
+                    raise ValueError("The staged Parquet byte count does not match the operation")
+                file_names = [file.name for file in data_files]
+                verified = {item.get("file"): item for item in (chunk_records or []) if isinstance(item, dict)}
+                if set(verified) != set(file_names):
+                    raise ValueError("The staged Parquet files do not match the verified chunk checkpoints")
+                for file in data_files:
+                    record = verified[file.name]
+                    if (file.stat().st_size != record.get("parquet_bytes")
+                            or _sha256_file(file) != record.get("parquet_sha256")):
+                        raise ValueError("A staged Parquet chunk does not match its verified checkpoint")
+            else:
+                if not parquet_file.is_file() or parquet_file.stat().st_size <= 0:
+                    raise ValueError("The completed snapshot has no readable Parquet data")
+                parquet = pq.ParquetFile(parquet_file)
+                if parquet.metadata.num_rows != row_count or parquet.schema_arrow.names != [column["name"] for column in columns]:
+                    raise ValueError("The staged Parquet schema or row count does not match the operation")
+                if parquet_file.stat().st_size != byte_count:
+                    raise ValueError("The staged Parquet byte count does not match the operation")
+                file_names = [parquet_file.name]
         except Exception as exc:
             raise ValueError("The staged snapshot failed Parquet validation") from exc
         dataset_id = uuid.uuid5(uuid.NAMESPACE_URL, source_key).hex
@@ -128,19 +190,29 @@ class LocalDataService:
         destination_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try: destination_dir.parent.chmod(0o700)
         except OSError: pass
-        final_data = destination_dir / "part-00000.parquet"
+        is_chunked = parquet_file.is_dir()
         manifest = {
             "dataset_id": dataset_id, "snapshot_id": snapshot_id, "source": source,
+            "operation_id": operation_id,
             "name": name, "qualified_name": qualified_name, "format": "parquet",
-            "data_file": "part-00000.parquet", "columns": columns,
+            "data_files": file_names if is_chunked else None,
+            "data_file": None if is_chunked else file_names[0], "columns": columns,
             "row_count": row_count, "byte_count": byte_count, "created_at": _now(),
         }
+        if is_chunked:
+            manifest["files"] = file_names
+            manifest["file_bytes"] = {name: int(verified[name]["parquet_bytes"]) for name in file_names}
+            manifest["file_sha256"] = {name: str(verified[name]["parquet_sha256"]) for name in file_names}
+        if not is_chunked:
+            manifest.pop("data_files")
+        else:
+            manifest.pop("data_file")
+        final_data = destination_dir if is_chunked else destination_dir / file_names[0]
         old_path = None
         try:
             staging.replace(destination_dir)
             # Move files into a stable snapshot directory before switching SQLite's active pointer.
-            final_data = destination_dir / parquet_file.name
-            manifest["data_file"] = parquet_file.name
+            final_data = destination_dir if is_chunked else destination_dir / parquet_file.name
             manifest_path = destination_dir / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
             manifest_path.chmod(0o600)
@@ -149,7 +221,8 @@ class LocalDataService:
                 if not lock or lock[0] != source_key:
                     raise RuntimeError("Materialization reservation was lost")
                 previous = db.execute("SELECT snapshot_path FROM local_datasets WHERE source_key=?", (source_key,)).fetchone()
-                old_path = Path(previous[0]).parent if previous else None
+                previous_path = Path(previous[0]) if previous else None
+                old_path = (previous_path if previous_path.is_dir() else previous_path.parent) if previous_path else None
                 db.execute("INSERT INTO local_datasets(dataset_id,source_key,source_json,name,qualified_name,snapshot_id,snapshot_path,manifest_json,row_count,byte_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET dataset_id=excluded.dataset_id,source_json=excluded.source_json,name=excluded.name,qualified_name=excluded.qualified_name,snapshot_id=excluded.snapshot_id,snapshot_path=excluded.snapshot_path,manifest_json=excluded.manifest_json,row_count=excluded.row_count,byte_count=excluded.byte_count,created_at=excluded.created_at", (dataset_id, source_key, json.dumps(source), name, qualified_name, snapshot_id, str(final_data), json.dumps(manifest), row_count, byte_count, manifest["created_at"]))
                 db.execute("DELETE FROM local_materialization_locks WHERE operation_id=?", (operation_id,))
             if old_path and old_path != destination_dir:
@@ -173,7 +246,7 @@ class LocalDataService:
                 db.execute("DELETE FROM local_datasets WHERE dataset_id=?", (dataset_id,))
             path = Path(row[0])
             if self._valid_path(path):
-                shutil.rmtree(path.parent, ignore_errors=True)
+                shutil.rmtree(path if path.is_dir() else path.parent, ignore_errors=True)
             return True
 
     def query(self, dataset_id: str, sql: str, limit: int = 500) -> dict:
@@ -198,7 +271,7 @@ class LocalDataService:
                 memory_limit = load_limits(self.paths.config).memory_limit
                 db.execute(f"SET memory_limit='{memory_limit}'")
                 db.execute("SET threads=2")
-                db.register("local_table", ds.dataset(dataset["snapshot_path"], format="parquet"))
+                db.register("local_table", ds.dataset(dataset["snapshot_path"], format="parquet", exclude_invalid_files=True))
                 statements = db.extract_statements(statement)
                 if len(statements) != 1 or not str(statements[0].type).upper().endswith("SELECT"):
                     raise ValueError("Only a single read-only query is allowed")
@@ -223,8 +296,30 @@ class LocalDataService:
         try:
             root = self.paths.datasets.resolve()
             resolved = path.resolve(strict=True)
-            return root in resolved.parents and resolved.is_file() and not path.is_symlink()
-        except OSError:
+            if root not in resolved.parents or path.is_symlink():
+                return False
+            if resolved.is_file():
+                return resolved.stat().st_size > 0
+            if not resolved.is_dir():
+                return False
+            manifest_path = resolved / "manifest.json"
+            if manifest_path.is_symlink() or not manifest_path.is_file():
+                return False
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            names = manifest.get("data_files")
+            if not isinstance(names, list):
+                names = [manifest.get("data_file")]
+            files = []
+            for name in names:
+                if not isinstance(name, str) or Path(name).name != name:
+                    return False
+                candidate = resolved / name
+                resolved_file = candidate.resolve(strict=True)
+                if candidate.is_symlink() or resolved not in resolved_file.parents or not resolved_file.is_file() or resolved_file.stat().st_size <= 0:
+                    return False
+                files.append(resolved_file)
+            return bool(files)
+        except (OSError, ValueError, TypeError):
             return False
 
     @staticmethod

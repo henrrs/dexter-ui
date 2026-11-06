@@ -361,7 +361,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if shutil.disk_usage(paths.datasets).free < minimum_free:
             raise HTTPException(409, detail=f"At least {analytics_limits.minimum_free_disk_mb} MiB of local free space is required")
         operation = operations.create("make-local", "Full snapshot queued")
-        operations.update_details(operation["id"], phase="queued", rows=0, bytes=0, files=0, environment=parts[1], qualified_name=detail.get("qualified_name"))
+        resume_request = {"node_id": physical_id, "environment": parts[1], "catalog": parts[2],
+                          "schema": parts[3], "table": parts[4], "columns": body.columns,
+                          "filters": body.filters, "warehouse_id": body.warehouse_id}
+        operations.update_details(operation["id"], phase="queued", rows=0, bytes=0, files=0,
+                                  environment=parts[1], qualified_name=detail.get("qualified_name"),
+                                  materialization_request=resume_request, retry_available=True,
+                                  resume_available=False)
         operations.log(operation["id"], f"Queued complete snapshot for {parts[1].upper()} {detail.get('qualified_name', '')}")
         slot_acquired = False
         try:
@@ -487,6 +493,58 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(404, detail="Operation not found") from None
         except ValueError as exc:
             raise HTTPException(409, detail=str(exc)) from None
+
+    @app.post("/api/operations/{operation_id}/retry", status_code=202)
+    def retry_operation(operation_id: str):
+        operation = operations.get(operation_id)
+        if operation is None:
+            raise HTTPException(404, detail="Operation not found")
+        details = operation.get("details") or {}
+        request = details.get("materialization_request")
+        if (operation.get("kind") != "make-local"
+                or operation.get("state") not in {"failed", "interrupted"}
+                or details.get("retry_available") is not True
+                or not isinstance(request, dict)):
+            raise HTTPException(409, detail="This Make Local operation cannot be resumed")
+        environment = request.get("environment")
+        physical_id = request.get("node_id")
+        if environment != "prod" or not isinstance(physical_id, str):
+            raise HTTPException(409, detail="The saved Make Local request is invalid")
+        detail = discover.detail(physical_id)
+        if not detail or detail.get("access") != "read":
+            raise HTTPException(403, detail="Read access to the saved table is no longer confirmed")
+        slot_acquired = False
+        try:
+            if not materialization_slots.acquire(blocking=False):
+                raise HTTPException(409, detail="The local materialization queue is full")
+            slot_acquired = True
+            queued = operations.requeue(operation_id)
+            operations.log(operation_id, "Retry queued; verified Parquet chunks will be checked before resuming")
+            future = materializers.submit(
+                make_local_worker, operation_id=operation_id, operations=operations,
+                local_data=local_data, paths=paths, settings_repo=settings_repo,
+                environment=environment, catalog=request["catalog"], schema=request["schema"],
+                table=request["table"], columns=request["columns"], filters=request.get("filters", []),
+                warehouse_id=request["warehouse_id"], detail=detail,
+            )
+            future.add_done_callback(lambda _future: materialization_slots.release())
+            slot_acquired = False
+            return queued
+        except HTTPException:
+            if slot_acquired: materialization_slots.release()
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation_id)
+            if current and current["state"] == "queued":
+                operations.transition(operation_id, "failed", message="The resume worker could not be started", error_code="WORKER_START_FAILED", error_message="The saved Make Local request could not be resumed.")
+            raise HTTPException(409, detail="The saved Make Local request could not be resumed") from exc
+        except RuntimeError:
+            if slot_acquired: materialization_slots.release()
+            current = operations.get(operation_id)
+            if current and current["state"] == "queued":
+                operations.transition(operation_id, "failed", message="The resume worker could not be started", error_code="WORKER_START_FAILED", error_message="The local materialization worker could not be started.")
+            raise HTTPException(503, detail="The local materialization worker could not be started") from None
 
     frontend_dist = Path.cwd() / "dist"
     if frontend_dist.is_dir():

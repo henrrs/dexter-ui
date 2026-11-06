@@ -230,7 +230,18 @@ class UnifiedDiscoverService:
         if kind not in {"table", "view"}: return None
         local_variant = next((v for v in variants if v.get("environment") == "local"), None)
         if environment == "local" and local_variant:
-            return self.provider.detail(local_variant["node_id"])
+            dataset = self.local_data.get(local_variant.get("dataset_id", ""))
+            if not dataset:
+                return None
+            return {"id": local_variant["node_id"], "name": dataset["name"],
+                    "qualified_name": dataset["qualified_name"], "kind": "table",
+                    "source": "local", "environment": "local", "exists": True,
+                    "metadata_visible": True, "read_access": True, "access": "read",
+                    "workspace": dataset["source"].get("workspace"),
+                    "metastore_id": dataset["source"].get("metastore_id"),
+                    "columns": dataset["manifest"].get("columns", []),
+                    "row_count": dataset["row_count"], "format": "parquet",
+                    "variants": variants, "availability": availability or self._availability(variants)}
         available = [variant for variant in variants if variant["environment"] in {"dev", "prod"}]
         selected = next((v for v in available if v["environment"] == environment), None) if environment else None
         if selected:

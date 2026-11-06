@@ -80,6 +80,14 @@ MIGRATIONS = (
       staging_path TEXT NOT NULL
     );
     """,
+    """
+    CREATE TABLE materialization_chunks (
+      operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+      chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+      checkpoint_json TEXT NOT NULL,
+      PRIMARY KEY(operation_id, chunk_index)
+    );
+    """,
 )
 
 

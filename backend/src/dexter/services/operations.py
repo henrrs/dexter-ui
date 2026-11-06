@@ -64,6 +64,38 @@ class OperationsService:
                 raise ValueError("Operation is already terminal")
             return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
 
+    def requeue(self, operation_id: str) -> dict:
+        stamp = now()
+        with transaction(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if row["kind"] != "make-local" or row["state"] not in {"failed", "interrupted"}:
+                raise ValueError("Only failed or interrupted Make Local operations can be resumed")
+            ensure_transition(row["state"], "queued")
+            conn.execute("UPDATE operations SET state='queued',message='Resuming verified local snapshot chunks',error_code=NULL,error_message=NULL,cancel_requested=0,updated_at=?,finished_at=NULL WHERE id=?", (stamp, operation_id))
+            return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
+
+    def chunk_records(self, operation_id: str) -> list[dict]:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT checkpoint_json FROM materialization_chunks WHERE operation_id=? ORDER BY chunk_index", (operation_id,)).fetchall()
+            return [json.loads(row[0]) for row in rows]
+
+    def record_chunk(self, operation_id: str, checkpoint: dict) -> None:
+        index = checkpoint.get("index")
+        if not isinstance(index, int) or index < 0:
+            raise ValueError("A materialization chunk requires a non-negative index")
+        with transaction(self.db_path) as conn:
+            conn.execute("INSERT INTO materialization_chunks(operation_id,chunk_index,checkpoint_json) VALUES(?,?,?) ON CONFLICT(operation_id,chunk_index) DO UPDATE SET checkpoint_json=excluded.checkpoint_json", (operation_id, index, json.dumps(checkpoint, separators=(",", ":"))))
+
+    def delete_chunk(self, operation_id: str, chunk_index: int) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute("DELETE FROM materialization_chunks WHERE operation_id=? AND chunk_index=?", (operation_id, chunk_index))
+
+    def clear_chunks(self, operation_id: str) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute("DELETE FROM materialization_chunks WHERE operation_id=?", (operation_id,))
+
     def recover(self) -> int:
         stamp = now()
         with transaction(self.db_path) as conn:

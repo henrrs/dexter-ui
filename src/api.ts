@@ -32,6 +32,7 @@ export const api = {
   operation: (id: string) => request<Operation>(`/operations/${id}`),
   operationLogs: (id: string) => request<{ items: Array<{ created_at: string; level: string; message: string }> }>(`/operations/${id}/logs`),
   cancelOperation: (id: string) => request<Operation>(`/operations/${id}/cancel`, { method: 'POST' }),
+  retryOperation: (id: string) => request<Operation>(`/operations/${id}/retry`, { method: 'POST' }),
   localDatasets: () => request<{ items: LocalDataset[] }>('/local-datasets'),
   queryLocal: (datasetId: string, sql: string, limit = 500) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>(`/local-datasets/${datasetId}/query`, { method: 'POST', body: JSON.stringify({ sql, limit }) }),
   deleteLocal: (datasetId: string) => request<{ deleted: boolean }>(`/local-datasets/${datasetId}`, { method: 'DELETE' }),

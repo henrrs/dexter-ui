@@ -13,9 +13,9 @@ TRANSITIONS = {
     "queued": {"running", "cancelled", "failed"},
     "running": {"running", "succeeded", "failed", "cancelled", "interrupted"},
     "succeeded": set(),
-    "failed": set(),
+    "failed": {"queued"},
     "cancelled": set(),
-    "interrupted": set(),
+    "interrupted": {"queued"},
 }
 
 

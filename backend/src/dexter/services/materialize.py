@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ipaddress
+import json
 import os
 import random
 import shutil
@@ -20,6 +22,7 @@ from dexter.services.analytics_config import load_limits
 MAX_ARROW_CHUNK_BYTES = 2 * 1024 ** 3
 CHUNK_RETRY_ATTEMPTS = 4
 CHUNK_DOWNLOAD_TIMEOUT_SECONDS = 120
+MAX_RESULT_CHUNKS = 100_000
 
 
 def _get(value, key, default=None):
@@ -79,9 +82,60 @@ def _transfer_failure_reason(exc: Exception) -> str:
     return type(exc).__name__.lower()
 
 
+def _file_sha256(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            block = source.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _manifest_fingerprint(statement_id: str, manifest) -> str:
+    stable = {"statement_id": statement_id}
+    for key in ("format", "total_chunk_count", "total_row_count", "total_byte_count", "schema", "truncated"):
+        stable[key] = _get(manifest, key)
+    payload = json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _verified_chunks(operations, operation_id: str, staging, pq):
+    valid = []
+    expected_schema = None
+    for record in operations.chunk_records(operation_id):
+        index = record.get("index")
+        filename = f"chunk-{index:06d}.parquet" if isinstance(index, int) and index >= 0 else ""
+        path = staging / filename if filename else staging / "invalid-checkpoint"
+        try:
+            if (record.get("file") != filename or path.is_symlink() or not path.is_file()
+                    or path.stat().st_size != record.get("parquet_bytes")
+                    or _file_sha256(path) != record.get("parquet_sha256")):
+                raise ValueError("checkpoint file does not match its digest")
+            parquet = pq.ParquetFile(path)
+            schema = parquet.schema_arrow
+            fingerprint = hashlib.sha256(str(schema).encode()).hexdigest()
+            if (parquet.metadata.num_rows != record.get("rows")
+                    or fingerprint != record.get("schema_fingerprint")
+                    or (expected_schema is not None and fingerprint != expected_schema)):
+                raise ValueError("checkpoint schema or row count does not match")
+            expected_schema = fingerprint
+            valid.append(record)
+        except Exception:
+            try:
+                if path.exists() and not path.is_symlink():
+                    path.unlink()
+            except OSError:
+                pass
+            if isinstance(index, int) and index >= 0:
+                operations.delete_chunk(operation_id, index)
+    return valid
+
+
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
-                           minimum_free: int) -> str:
+                           minimum_free: int) -> tuple[str, int, str]:
     """Download a complete Arrow result link before parsing it, so retries cannot duplicate rows."""
     result_path = None
     current_link = initial_link
@@ -102,12 +156,17 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
                 or parsed.fragment or port not in (None, 443)):
             raise RuntimeError("Databricks returned an invalid temporary result link")
-
         expected_bytes = _get(current_link, "byte_count")
         if isinstance(expected_bytes, int) and expected_bytes > MAX_ARROW_CHUNK_BYTES:
             raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
         result_path = None
         try:
+            hostname = parsed.hostname.rstrip(".").lower()
+            if hostname in {"localhost", "localhost.localdomain"}:
+                raise RuntimeError("Databricks returned an unsafe result destination")
+            addresses = {item[4][0] for item in socket.getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM)}
+            if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+                raise RuntimeError("Databricks returned an unsafe result destination")
             request = urllib.request.Request(url, headers={"Accept": "application/vnd.apache.arrow.stream"}, method="GET")
             opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
             with opener.open(request, timeout=CHUNK_DOWNLOAD_TIMEOUT_SECONDS) as response_body:
@@ -148,7 +207,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
             operations.update_details(operation_id, downloaded_chunk_bytes=downloaded_bytes,
                                       downloaded_chunk_sha256=digest.hexdigest())
             succeeded = True
-            return result_path
+            return result_path, downloaded_bytes, digest.hexdigest()
         except InterruptedError:
             if result_path:
                 try:
@@ -163,6 +222,8 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 raise RuntimeError(f"Databricks rejected result chunk download (HTTP {exc.code})") from None
         except http.client.IncompleteRead as exc:
             downloaded_bytes += len(exc.partial or b"")
+            last_error = exc
+        except socket.gaierror as exc:
             last_error = exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError, ConnectionError) as exc:
             last_error = exc
@@ -239,10 +300,8 @@ def build_select(catalog: str, schema: str, table: str, columns: list[str], filt
 def make_local_worker(*, operation_id: str, operations, local_data, paths, settings_repo,
                       environment: str, catalog: str, schema: str, table: str, columns: list[str],
                       filters: list[dict], warehouse_id: str, detail: dict) -> None:
-    """Materialize a complete selected-column/filter result; no incremental state is read."""
+    """Materialize a full result with durable, independently verified Parquet chunk checkpoints."""
     staging = paths.temporary / f"make-local-{operation_id}"
-    parquet_path = staging / "part-00000.parquet"
-    writer = None
     statement_id = None
     reservation = None
     try:
@@ -259,32 +318,85 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             raise ValueError("The selected table is missing its workspace identity")
         source_record = {"environment": environment, "workspace": workspace_host, "metastore_id": detail.get("metastore_id"), "catalog": catalog, "schema": schema, "table": table, "profile": config["profile"], "selected_columns": columns, "filters": [{"column": item.get("column"), "operator": item.get("operator")} for item in filters]}
         paths.temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
-        staging.mkdir(mode=0o700)
+        if staging.is_symlink():
+            raise RuntimeError("Materialization staging path is unsafe")
+        staging.mkdir(mode=0o700, exist_ok=True)
         reservation = local_data.reserve(operation_id, source_record, table, f"{catalog}.{schema}.{table}", staging)
+        for partial in (*staging.glob("chunk-*.arrow"), *staging.glob(".chunk-*.parquet.tmp")):
+            if not partial.is_symlink():
+                partial.unlink(missing_ok=True)
         from databricks.sdk import WorkspaceClient
         from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
         workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-        operations.update_details(operation_id, phase="warehouse", rows=0, bytes=0, files=0)
-        operations.transition(operation_id, "running", progress=2, message="Starting selected SQL warehouse if needed")
-        operations.log(operation_id, "Validating access to the selected SQL warehouse and waiting for it to be ready")
-        ensure_sql_warehouse_running(workspace, warehouse_id)
         schema_columns = {str(c.get("name")) for c in detail.get("columns", []) if c.get("name")}
         sql, parameters = build_select(catalog, schema, table, columns, filters, schema_columns)
         # Databricks Statement Execution parameters use typed literal values, never string interpolation.
         statement_parameters = [{"name": f"p{i}", "value": _sql_literal(value), "type": _parameter_type(value)} for i, value in enumerate(parameters)]
-        parquet_path.touch(mode=0o600)
-        operations.log(operation_id, "Validated selected profile, table access, schema, and SQL warehouse")
-        operations.transition(operation_id, "running", progress=5, message="Submitting full snapshot query")
-        response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
-            "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
-            "format": "ARROW_STREAM", "disposition": "EXTERNAL_LINKS", "parameters": statement_parameters,
-        })
-        statement_id = _get(response, "statement_id")
+        operations.transition(operation_id, "running", progress=2, message="Checking selected warehouse and materialization checkpoint")
+        published_id = uuid.uuid5(uuid.NAMESPACE_URL, reservation).hex
+        already_published = local_data.get(published_id)
+        if already_published and already_published["manifest"].get("operation_id") == operation_id:
+            details = already_published["manifest"]
+            operations.update_details(operation_id, phase="published", rows=already_published["row_count"],
+                                      bytes=already_published["byte_count"], files=len(details.get("data_files", [details.get("data_file")])),
+                                      resume_available=True, retry_available=True)
+            operations.log(operation_id, "The verified snapshot was already published before the previous worker stopped")
+            operations.transition(operation_id, "succeeded", progress=100,
+                                  message=f"Snapshot ready · {already_published['row_count']:,} rows")
+            operations.update_details(operation_id, resume_available=False, retry_available=False)
+            return
+        operations.log(operation_id, "Validating selected PROD profile, table access, schema, and SQL warehouse")
+        current_details = (operations.get(operation_id) or {}).get("details", {})
+        statement_id = current_details.get("statement_id")
+        status_response = None
+        resuming_statement = bool(statement_id)
+        if statement_id:
+            try:
+                status_response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
+            except Exception as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    status_response = None
+                    statement_id = None
+                    operations.clear_chunks(operation_id)
+                    for path in staging.glob("chunk-*.parquet"):
+                        if not path.is_symlink():
+                            path.unlink(missing_ok=True)
+                    operations.update_details(operation_id, result_fingerprint=None, resume_available=False)
+                else:
+                    raise
+            if status_response is not None:
+                remote_state = _get(_get(status_response, "status", {}), "state", "").upper().split(".")[-1]
+                if remote_state in {"FAILED", "CANCELED", "CLOSED"}:
+                    if not resuming_statement:
+                        raise RuntimeError("Databricks did not complete the authorized read query")
+                    operations.log(operation_id, "The saved Databricks result is no longer active; starting a fresh read query", "warning")
+                    status_response = None
+                    statement_id = None
+                    operations.clear_chunks(operation_id)
+                    for path in staging.glob("chunk-*.parquet"):
+                        if not path.is_symlink():
+                            path.unlink(missing_ok=True)
+                    operations.update_details(operation_id, result_fingerprint=None, resume_available=False)
+
         if not statement_id:
-            raise RuntimeError("Databricks did not return a statement identifier")
-        operations.update_details(operation_id, phase="query", statement_id=statement_id, rows=0, bytes=0, files=0)
-        # Statement Execution permits long-running statements (up to 48 hours).
-        # Do not impose the previous six-hour Dexter cutoff on large snapshots.
+            operations.update_details(operation_id, phase="warehouse", rows=0, bytes=0, files=0)
+            operations.transition(operation_id, "running", progress=3, message="Starting selected SQL warehouse if needed")
+            ensure_sql_warehouse_running(workspace, warehouse_id)
+            operations.log(operation_id, "Submitting a read-only full snapshot query")
+            operations.transition(operation_id, "running", progress=5, message="Submitting full snapshot query")
+            response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
+                "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
+                "format": "ARROW_STREAM", "disposition": "EXTERNAL_LINKS", "parameters": statement_parameters,
+            })
+            statement_id = _get(response, "statement_id")
+            if not statement_id:
+                raise RuntimeError("Databricks did not return a statement identifier")
+            status_response = response
+            operations.update_details(operation_id, phase="query", statement_id=statement_id,
+                                      result_fingerprint=None, resume_available=False, retry_available=True)
+            resuming_statement = False
+
+        # Continue polling an existing statement after a process restart; the query is never reissued just because the worker died.
         query_deadline = time.monotonic() + 48 * 60 * 60
         while True:
             current = operations.get(operation_id)
@@ -303,92 +415,239 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             if status == "SUCCEEDED":
                 break
             if status in {"FAILED", "CANCELED", "CLOSED"}:
+                if resuming_statement:
+                    operations.log(operation_id, "The saved Databricks statement failed; retrying with a new read-only query", "warning")
+                    statement_id = None
+                    operations.clear_chunks(operation_id)
+                    for path in staging.glob("chunk-*.parquet"):
+                        if not path.is_symlink():
+                            path.unlink(missing_ok=True)
+                    operations.update_details(operation_id, statement_id=None, result_fingerprint=None, resume_available=False)
+                    ensure_sql_warehouse_running(workspace, warehouse_id)
+                    response = workspace.api_client.do("POST", "/api/2.0/sql/statements/", body={
+                        "statement": sql, "warehouse_id": warehouse_id, "wait_timeout": "0s", "on_wait_timeout": "CONTINUE",
+                        "format": "ARROW_STREAM", "disposition": "EXTERNAL_LINKS", "parameters": statement_parameters,
+                    })
+                    statement_id = _get(response, "statement_id")
+                    if not statement_id:
+                        raise RuntimeError("Databricks did not return a statement identifier")
+                    resuming_statement = False
+                    status_response = response
+                    operations.update_details(operation_id, phase="query", statement_id=statement_id)
+                    continue
                 raise RuntimeError("Databricks did not complete the authorized read query")
             operations.transition(operation_id, "running", progress=12, message="Waiting for Databricks query")
             time.sleep(1)
-        operations.transition(operation_id, "running", progress=25, message="Streaming Arrow batches to Parquet")
+
         manifest = _get(status_response, "manifest", {})
-        chunk_count = int(_get(manifest, "total_chunk_count", _get(manifest, "chunks_count", 1)) or 1)
+        manifest_format = _get(manifest, "format")
+        if manifest_format not in {None, "ARROW_STREAM"}:
+            raise RuntimeError("Databricks returned a non-Arrow materialization result")
+        if _get(manifest, "truncated") is True:
+            raise RuntimeError("Databricks marked the result as truncated; no partial local snapshot was published")
+        chunk_count = _get(manifest, "total_chunk_count", _get(manifest, "chunks_count"))
+        if not isinstance(chunk_count, int) or isinstance(chunk_count, bool) or chunk_count < 0 or chunk_count > MAX_RESULT_CHUNKS:
+            raise RuntimeError("Databricks returned an invalid result chunk count")
+        expected_rows = _get(manifest, "total_row_count")
+        expected_bytes = _get(manifest, "total_byte_count")
+        if expected_rows is not None and (not isinstance(expected_rows, int) or expected_rows < 0):
+            raise RuntimeError("Databricks returned an invalid result row count")
+        if expected_bytes is not None and (not isinstance(expected_bytes, int) or expected_bytes < 0):
+            raise RuntimeError("Databricks returned an invalid result byte count")
+        fingerprint = _manifest_fingerprint(statement_id, manifest)
+        current_details = (operations.get(operation_id) or {}).get("details", {})
+        saved_fingerprint = current_details.get("result_fingerprint")
+        if saved_fingerprint and saved_fingerprint != fingerprint:
+            operations.clear_chunks(operation_id)
+            for path in staging.glob("chunk-*.parquet"):
+                if not path.is_symlink():
+                    path.unlink(missing_ok=True)
+            operations.update_details(operation_id, result_fingerprint=None, resume_available=False)
+            raise RuntimeError("The saved Databricks result changed; start a new Make Local operation")
+        minimum_free = load_limits(paths.config).minimum_free_disk_mb * 1024 * 1024
+        free_bytes = shutil.disk_usage(staging).free
+        if isinstance(expected_bytes, int) and expected_bytes and free_bytes < expected_bytes + minimum_free:
+            raise OSError(28, "Insufficient free disk space for the complete snapshot")
+        operations.update_details(operation_id, phase="download", statement_id=statement_id,
+                                  result_fingerprint=fingerprint, total_chunks=chunk_count,
+                                  expected_rows=expected_rows, expected_source_bytes=expected_bytes,
+                                  resume_available=True, retry_available=True)
+        operations.transition(operation_id, "running", progress=20, message="Verifying saved result chunks")
         import pyarrow.ipc as ipc
+        import pyarrow as pa
         import pyarrow.parquet as pq
-        rows, bytes_written = 0, 0
-        output_columns = []
+        records = _verified_chunks(operations, operation_id, staging, pq)
+        completed = {record["index"] for record in records}
+        rows = sum(record["rows"] for record in records)
+        source_bytes = sum(record["arrow_bytes"] for record in records)
+        parquet_bytes = sum(record["parquet_bytes"] for record in records)
+        schema_fingerprint = records[0]["schema_fingerprint"] if records else None
+        output_columns = records[0]["columns"] if records else []
+        operations.update_details(operation_id, rows=rows, bytes=parquet_bytes,
+                                  source_bytes=source_bytes, files=len(records))
+
         for chunk_index in range(chunk_count):
+            if chunk_index in completed:
+                continue
+            current = operations.get(operation_id)
+            if current and current["cancel_requested"]:
+                workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                raise InterruptedError("Materialization cancelled")
             chunk = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}")
             links = _get(_get(chunk, "result", chunk), "external_links", []) or []
             if not links:
-                continue
-            for link_index, link in enumerate(links):
-                current_progress = (operations.get(operation_id) or {}).get("progress", 25)
-                download_progress = max(current_progress, min(94, 25 + chunk_index * 70 // max(1, chunk_count)))
-                operations.update_details(operation_id, phase="download", rows=rows, bytes=bytes_written, files=0)
-                operations.transition(operation_id, "running", progress=download_progress, message=f"Downloading result chunk {chunk_index + 1}/{chunk_count}")
-                minimum_free = load_limits(paths.config).minimum_free_disk_mb * 1024 * 1024
-                arrow_path = _download_result_chunk(
-                    workspace=workspace, statement_id=statement_id, chunk_index=chunk_index,
-                    link_index=link_index, initial_link=link, staging=staging,
-                    operations=operations, operation_id=operation_id, minimum_free=minimum_free,
-                )
-                try:
-                    with open(arrow_path, "rb") as response_body:
-                        reader = ipc.open_stream(response_body)
-                        if writer is None:
-                            writer = pq.ParquetWriter(parquet_path, reader.schema, compression="zstd")
-                            output_columns = [{"name": field.name, "type": str(field.type), "nullable": field.nullable} for field in reader.schema]
-                        for batch in reader:
-                            current = operations.get(operation_id)
-                            if current and current["cancel_requested"]:
-                                workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
-                                raise InterruptedError("Materialization cancelled")
-                            writer.write_batch(batch)
-                            rows += batch.num_rows
-                            bytes_written += batch.nbytes
-                            if shutil.disk_usage(staging).free < minimum_free:
-                                raise OSError(28, "Insufficient free disk space for snapshot")
-                            progress = min(95, 25 + (chunk_index + 1) * 70 // max(1, chunk_count))
-                            operations.transition(operation_id, "running", progress=progress, message=f"Writing Parquet · {rows:,} rows")
-                            operations.update_details(operation_id, phase="parquet", rows=rows, bytes=bytes_written, files=1)
-                finally:
+                raise RuntimeError(f"Databricks returned no signed URL for result chunk {chunk_index}")
+            link_index = 0
+            link = _link_for_chunk(links, chunk_index, link_index)
+            if link is None:
+                raise RuntimeError(f"Databricks returned no signed URL for result chunk {chunk_index}")
+            expected_chunk_bytes = _get(link, "byte_count")
+            if isinstance(expected_chunk_bytes, int):
+                free_bytes = shutil.disk_usage(staging).free
+                if free_bytes < expected_chunk_bytes * 2 + minimum_free:
+                    raise OSError(28, "Insufficient free disk space for the next result chunk")
+            current_progress = (operations.get(operation_id) or {}).get("progress", 20)
+            progress = max(current_progress, min(94, 20 + (chunk_index * 74 // max(1, chunk_count))))
+            operations.transition(operation_id, "running", progress=progress,
+                                  message=f"Downloading result chunk {chunk_index + 1}/{chunk_count}")
+            arrow_path, arrow_bytes, arrow_digest = _download_result_chunk(
+                workspace=workspace, statement_id=statement_id, chunk_index=chunk_index,
+                link_index=link_index, initial_link=link, staging=staging,
+                operations=operations, operation_id=operation_id, minimum_free=minimum_free,
+            )
+            chunk_path = staging / f"chunk-{chunk_index:06d}.parquet"
+            temporary_parquet = staging / f".chunk-{chunk_index:06d}.parquet.tmp"
+            writer = None
+            chunk_rows = 0
+            try:
+                with open(arrow_path, "rb") as response_body:
+                    reader = ipc.open_stream(response_body)
+                    reader_schema = reader.schema
+                    actual_schema_fingerprint = hashlib.sha256(str(reader_schema).encode()).hexdigest()
+                    if schema_fingerprint and schema_fingerprint != actual_schema_fingerprint:
+                        raise RuntimeError("Databricks result chunks have inconsistent schemas")
+                    if not output_columns:
+                        output_columns = [{"name": field.name, "type": str(field.type), "nullable": field.nullable} for field in reader_schema]
+                    writer = pq.ParquetWriter(temporary_parquet, reader_schema, compression="zstd")
+                    for batch in reader:
+                        current = operations.get(operation_id)
+                        if current and current["cancel_requested"]:
+                            workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                            raise InterruptedError("Materialization cancelled")
+                        writer.write_batch(batch)
+                        chunk_rows += batch.num_rows
+                writer.close()
+                writer = None
+                with open(temporary_parquet, "rb") as completed_file:
+                    os.fsync(completed_file.fileno())
+                parquet_file = pq.ParquetFile(temporary_parquet)
+                if parquet_file.metadata.num_rows != chunk_rows:
+                    raise RuntimeError("The Parquet chunk row count did not match its Arrow stream")
+                if shutil.disk_usage(staging).free < minimum_free:
+                    raise OSError(28, "Insufficient free disk space for snapshot")
+                if parquet_file.schema_arrow.names != [column["name"] for column in output_columns]:
+                    raise RuntimeError("The Parquet chunk schema did not match the selected columns")
+                schema_fingerprint = hashlib.sha256(str(parquet_file.schema_arrow).encode()).hexdigest()
+                if records and schema_fingerprint != records[0]["schema_fingerprint"]:
+                    raise RuntimeError("Databricks result chunks have inconsistent schemas")
+                parquet_file_bytes = temporary_parquet.stat().st_size
+                parquet_digest = _file_sha256(temporary_parquet)
+                os.chmod(temporary_parquet, stat.S_IRUSR | stat.S_IWUSR)
+                os.replace(temporary_parquet, chunk_path)
+                record = {"index": chunk_index, "rows": chunk_rows, "arrow_bytes": arrow_bytes,
+                          "parquet_bytes": parquet_file_bytes, "arrow_sha256": arrow_digest,
+                          "parquet_sha256": parquet_digest, "schema_fingerprint": schema_fingerprint,
+                          "columns": output_columns, "file": chunk_path.name}
+                operations.record_chunk(operation_id, record)
+                records.append(record)
+                records.sort(key=lambda item: item["index"])
+                rows += chunk_rows
+                source_bytes += arrow_bytes
+                parquet_bytes += parquet_file_bytes
+                completed.add(chunk_index)
+                operations.update_details(operation_id, phase="download", rows=rows, bytes=parquet_bytes,
+                                          source_bytes=source_bytes, files=len(records),
+                                          last_completed_chunk=chunk_index)
+                progress = min(95, 20 + (chunk_index + 1) * 75 // max(1, chunk_count))
+                operations.transition(operation_id, "running", progress=progress,
+                                      message=f"Saved chunk {chunk_index + 1}/{chunk_count} · {rows:,} rows")
+                operations.log(operation_id, f"Verified result chunk {chunk_index + 1}/{chunk_count}: {chunk_rows:,} rows, {parquet_file_bytes:,} Parquet bytes")
+            finally:
+                if writer is not None:
                     try:
-                        os.unlink(arrow_path)
+                        writer.close()
+                    except Exception:
+                        pass
+                for temporary in (arrow_path, temporary_parquet):
+                    try:
+                        temporary.unlink()
                     except OSError:
                         pass
-        if writer is None:
-            raise RuntimeError("The query returned no Arrow schema; an empty snapshot cannot be validated")
-        writer.close()
-        writer = None
-        parquet_bytes = parquet_path.stat().st_size
-        parquet_file = pq.ParquetFile(parquet_path)
-        if parquet_file.metadata.num_rows != rows or parquet_file.schema_arrow.names != [c["name"] for c in output_columns]:
-            raise RuntimeError("Parquet validation did not match the streamed Arrow batches")
+
+        if chunk_count == 0:
+            schema = pa.schema([pa.field(name, pa.null()) for name in columns])
+            empty_path = staging / "chunk-000000.parquet"
+            temporary_empty = staging / ".chunk-000000.parquet.tmp"
+            pq.write_table(pa.Table.from_batches([], schema=schema), temporary_empty, compression="zstd")
+            with open(temporary_empty, "rb") as completed_file:
+                os.fsync(completed_file.fileno())
+            os.chmod(temporary_empty, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(temporary_empty, empty_path)
+            schema_fingerprint = hashlib.sha256(str(schema).encode()).hexdigest()
+            output_columns = [{"name": field.name, "type": str(field.type), "nullable": field.nullable} for field in schema]
+            parquet_file_bytes = empty_path.stat().st_size
+            record = {"index": 0, "rows": 0, "arrow_bytes": 0, "parquet_bytes": parquet_file_bytes,
+                      "arrow_sha256": hashlib.sha256(b"").hexdigest(),
+                      "parquet_sha256": _file_sha256(empty_path), "schema_fingerprint": schema_fingerprint,
+                      "columns": output_columns, "file": empty_path.name}
+            operations.record_chunk(operation_id, record)
+            records, rows, source_bytes, parquet_bytes = [record], 0, 0, parquet_file_bytes
+
+        expected_indexes = list(range(chunk_count)) if chunk_count else [0]
+        if [record["index"] for record in sorted(records, key=lambda item: item["index"])] != expected_indexes:
+            raise RuntimeError("One or more Databricks result chunks are missing")
+        if isinstance(expected_rows, int) and rows != expected_rows:
+            raise RuntimeError("Downloaded row count does not match the Databricks result manifest")
+        if isinstance(expected_bytes, int) and source_bytes != expected_bytes:
+            raise RuntimeError("Downloaded byte count does not match the Databricks result manifest")
+        if not output_columns or [column["name"] for column in output_columns] != columns:
+            raise RuntimeError("The final Parquet schema did not match the selected columns")
         current = operations.get(operation_id)
         if current and current["cancel_requested"]:
             raise InterruptedError("Materialization cancelled")
-        # reserve immediately before publication; the source key makes DEV/PROD and workspaces distinct.
-        local_data.publish(operation_id, reservation, source_record, table, f"{catalog}.{schema}.{table}", staging, parquet_path, output_columns, rows, parquet_bytes)
-        operations.update_details(operation_id, phase="published", rows=rows, bytes=parquet_bytes, files=1)
+        operations.update_details(operation_id, phase="validating", rows=rows, bytes=parquet_bytes,
+                                  source_bytes=source_bytes, files=len(records))
+        local_data.publish(operation_id, reservation, source_record, table,
+                           f"{catalog}.{schema}.{table}", staging, staging, output_columns,
+                           rows, parquet_bytes, chunk_records=records)
+        operations.update_details(operation_id, phase="published", rows=rows, bytes=parquet_bytes,
+                                  source_bytes=source_bytes, files=len(records))
         operations.log(operation_id, f"Published a complete Parquet snapshot with {rows} rows")
         operations.transition(operation_id, "succeeded", progress=100, message=f"Snapshot ready · {rows:,} rows")
+        operations.update_details(operation_id, resume_available=False, retry_available=False)
     except InterruptedError as exc:
         operations.log(operation_id, str(exc), "warning")
+        operations.update_details(operation_id, resume_available=False, retry_available=False)
         operations.transition(operation_id, "cancelled", message=str(exc))
     except Exception as exc:
-        operations.log(operation_id, f"Materialization failed ({type(exc).__name__})", "error")
+        operations.log(operation_id, f"Materialization failed ({type(exc).__name__}): {_safe_error(exc)}", "error")
         current = operations.get(operation_id)
         if current and current["state"] in {"queued", "running"}:
+            can_resume = bool((current.get("details") or {}).get("resume_available"))
+            operations.update_details(operation_id, retry_available=True, resume_available=can_resume)
             operations.transition(operation_id, "failed", progress=current["progress"], message="Materialization failed; the previous local snapshot remains active", error_code=_error_code(exc), error_message=_safe_error(exc))
     finally:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:
-                pass
-        # A reservation is created only at publication. Remove any unregistered staging data.
-        if staging.exists():
+        current = operations.get(operation_id) or {}
+        details = current.get("details") or {}
+        if current.get("state") in {"failed", "interrupted"} and details.get("resume_available") is True:
+            operations.log(operation_id, "Verified result chunks and the remote statement were preserved for retry")
+        elif reservation is not None:
             try:
                 local_data.release(operation_id, staging)
             except Exception:
                 shutil.rmtree(staging, ignore_errors=True)
+        elif staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _sql_literal(value):

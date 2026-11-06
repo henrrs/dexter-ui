@@ -57,6 +57,19 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
   useEffect(() => { if (active) void loadSources() }, [active])
 
+  useEffect(() => {
+    if (!active || activeOperation) return
+    let alive = true
+    void api.operations().then(async (items) => {
+      const operation = items.find((item) => item.kind === 'make-local' && ['queued', 'running', 'failed', 'interrupted'].includes(item.state))
+      if (!operation || !alive) return
+      setActiveOperation(operation)
+      const logs = await api.operationLogs(operation.id).catch(() => ({ items: [] }))
+      if (alive) setOperationLogs(logs.items)
+    }).catch(() => undefined)
+    return () => { alive = false }
+  }, [active, activeOperation?.id])
+
   const loadChildren = async (node: DiscoverNode, force = false) => {
     if (loading.has(node.id)) return
     if (!force && pages[node.id]) return
@@ -283,7 +296,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             <button className="operation-card" disabled title="Planned; comparison is not implemented"><Layers3 size={16} /><strong>Compare Tables</strong><span>Cross environment · planned</span><b>→</b></button>
             <button className="operation-card" disabled={!selected.variants?.some((variant) => variant.environment === 'local')} onClick={() => { setActiveSection('preview'); void selectNode(selected, 'local') }}><Database size={16} /><strong>Open Local / Query Local</strong><span>{selected.variants?.some((variant) => variant.environment === 'local') ? 'Open the valid local snapshot.' : 'No local materialization available.'}</span><b>→</b></button>
           </div></div>}
-          {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
+          {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}{['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then((operation) => { setActiveOperation(operation); return api.operationLogs(operation.id) }).then((logs) => setOperationLogs(logs.items)).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.error_message ?? activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
           {makeLocalOpen && <div className="make-local-modal-backdrop"><section className="make-local-dialog" role="dialog" aria-modal="true" aria-labelledby="make-local-dialog-title">
             <header className="make-local-dialog-header"><div><span className="eyebrow">LOCAL SNAPSHOT</span><h3 id="make-local-dialog-title">Make {selected.name} local</h3><code>{selected.qualified_name ?? selected.name}</code></div><button className="icon-button subtle" aria-label="Close Make Local" onClick={() => setMakeLocalOpen(false)}><X size={16} /></button></header>
             <div className="make-local-dialog-body">
