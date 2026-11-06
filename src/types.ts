@@ -16,7 +16,7 @@ export type Connection = {
 
 export type Connections = {
   databricks: { dev: Connection; prod: Connection }
-  databricks_profiles: { items: string[]; config_file: string }
+  databricks_profiles: { items: string[]; config_file: string; dexter_config_file?: string }
   purview: Connection
 }
 

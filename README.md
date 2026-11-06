@@ -35,6 +35,7 @@ The Vite server proxies `/api` to FastAPI. After a build, the API can also serve
 | `make lock` | Resolve and hash the Python requirements and update the npm lockfile through configured registries, bootstrapping a local `uv` tool if needed. |
 | `make setup` | Create `.venv` and install exact, locked Python and npm dependencies through the selected registries. |
 | `make dev` | Start the backend and frontend on loopback. |
+| `make databricks-setup` | Configure and validate Dexter's DEV and PRD workspace profiles using the active Azure CLI login. |
 | `make build` | Type-check and bundle the frontend, then compile-check the backend. |
 | `make test` | Run standard-library backend tests and UI contract smoke tests. |
 | `make doctor` | Run offline tool, registry, SQLite, and integration CLI checks. `make doctor NETWORK=1` explicitly probes configured package registries. |
@@ -44,11 +45,13 @@ Set `DEXTER_HOME` and `DEXTER_CONFIG_HOME` to override XDG storage locations. De
 
 ## Connections
 
-In **Settings → Connections**, choose a named Databricks profile independently for DEV and PROD. Dexter reads profile names from `~/.databrickscfg` or `DATABRICKS_CONFIG_FILE`; it does not copy profile tokens. Validation calls the official SDK's current-user read endpoint. It never retries with another profile or environment.
+In **Settings → Connections**, Dexter reads named profiles from the regular Databricks config and from its own profile file at `${XDG_CONFIG_HOME:-$HOME/.config}/dexter/databricks/databrickscfg`; it does not copy profile tokens. Run `make databricks-setup` to configure both `DEXTER-DEV` and `DEXTER-PRD` for Azure Databricks. The setup reuses the current global Azure CLI login (and offers `az login` if none is active), validates both workspaces, and only then writes the Dexter-owned profile file. Existing Databricks profiles are left untouched. Dexter never retries with the other environment. The Azure CLI owns the shared credential cache; Dexter stores only workspace hosts and tenant metadata.
+
+See [Databricks setup](docs/databricks-setup.md) for reset behavior and details.
 
 For Purview, enter the HTTPS account endpoint and optional tenant ID. Saving the endpoint is local. Validation requests the `https://purview.azure.net/.default` token through `AzureCliCredential`, verifies the token audience, then makes one read-only GET to the configured API path. Azure CLI credentials and tokens are never written to Dexter storage. Microsoft documents service-principal authentication for the Data Map APIs; if the selected Atlas endpoint receives a delegated `az login` token, Dexter reports that incompatibility and does not create or use a second identity. Other API paths are subject to that API's own authentication model and effective permissions.
 
-The UI and local persistence remain usable when either corporate service is offline. No catalogue discovery is implemented in F1.
+The UI and local persistence remain usable when either corporate service is offline. Unified Discover reads local manifests and lazily browses configured Databricks catalogs, schemas, and tables. It can probe the Purview Unified Catalog public-preview data-assets endpoint with the existing Azure CLI identity; it does not fall back to Atlas or another identity.
 
 ## Local runtime and security
 
@@ -58,8 +61,8 @@ SQLite runs in WAL mode with `synchronous=FULL`, foreign keys, busy timeout, ver
 
 Docker is intentionally not required. For a later isolated worker, keep authentication on the host: use a narrowly scoped local credential broker or host-side connector, give workers only the exact endpoint/scope operation they need, and never bake CLI profiles, token caches, or credentials into an image. If host credential files must be mounted for a development experiment, mount only the selected profile read-only, keep DEV/PROD mounts distinct, and do not publish those volumes or images.
 
-## F1 boundaries
+## Discover scope and current limits
 
-F1 establishes contracts for a reconciled Purview/Databricks/LOCAL catalog, full-snapshot local Parquet materialization, persistent Ask Dexter sessions, and composable future engineering modules. It does not implement catalogue discovery, DuckDB, materialization workers, chat, or the later product features. The full-copy invariant for future Make Local runs excludes CDC/CDF, incremental merge, and record reconciliation; new snapshots stage and validate before atomic publication.
+Discover stores provider pages in the local SQLite WAL cache and keeps DEV, PROD, Purview identity, and LOCAL views separate. Databricks table access is marked read only when Unity Catalog returns `browse_only=false`; BROWSE-only metadata is labeled separately, and unconfirmed access remains unknown. Local snapshots are listed only when a manifest points to a file inside the datasets directory. This phase does not materialize remote data, start SQL warehouses, or execute previews. Purview discovery currently reads at most the first 100 Unified Catalog assets from the configured endpoint; Atlas search, pagination, and a single cross-source canonical tree are not yet wired into the explorer. An exact governance match can appear in a selected table's details. See [ADR 0006](docs/decisions/0006-unified-discover.md) for the decisions and limits.
 
 See [architecture](docs/architecture.md), [decisions](docs/decisions/), and [testing](docs/testing.md).

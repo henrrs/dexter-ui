@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 const app = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8')
 const api = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8')
+const discover = await readFile(new URL('../src/DiscoverView.tsx', import.meta.url), 'utf8')
 const vite = await readFile(new URL('../vite.config.ts', import.meta.url), 'utf8')
 
 test('platform shell exposes F1 navigation and links connection controls to the local API', () => {
@@ -21,6 +22,16 @@ test('connection screens expose separate DEV/PROD profiles and explain token-loc
   assert.match(app, /databricks\.prod/)
   assert.match(app, /Credentials remain in your host session/)
   assert.match(app, /READ-ONLY VALIDATION/)
+})
+
+test('Unified Discover exposes lazy source browsing and conservative access states', () => {
+  assert.match(app, /view === 'discover' \? <DiscoverView \/>/)
+  assert.match(api, /discoverChildren/)
+  assert.match(api, /discoverDetail/)
+  assert.match(discover, /Read access confirmed/)
+  assert.match(discover, /Access unknown/)
+  assert.match(discover, /Metadata visible · no read access/)
+  assert.match(discover, /Metadata sync is lazy/)
 })
 
 test('layout has compact desktop and responsive breakpoints without remote assets', () => {

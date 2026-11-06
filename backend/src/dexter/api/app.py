@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from dexter.adapters.databricks import discover_profiles, validate_profile
 from dexter.adapters.purview import validate_configuration, validate_endpoint
 from dexter.config import Settings
+from dexter.catalog.discovery import DiscoverService
 from dexter.db.database import migrate
 from dexter.logging_config import configure_logging
 from dexter.paths import DexterPaths
@@ -82,6 +84,7 @@ class PurviewConfig(BaseModel):
 
 def _connections(repo: SettingsRepository, settings: Settings) -> dict:
     profiles, config_file = discover_profiles()
+    _autoconfigure_profiles(repo, profiles)
     result: dict = {"databricks": {}}
     for env_name in ("dev", "prod"):
         key = f"databricks.{env_name}"
@@ -101,7 +104,7 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
         if item["profile"]:
             from dexter.adapters.databricks import safe_workspace_host
             item["workspace"] = safe_workspace_host(item["profile"])
-    result["databricks_profiles"] = {"items": profiles, "config_file": config_file}
+    result["databricks_profiles"] = {"items": profiles, "config_file": config_file, "dexter_config_file": str(DexterPaths.from_env().databricks_config)}
     purview = repo.get("purview")
     check = repo.get_check("purview")
     result["purview"] = {
@@ -118,6 +121,42 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
     return result
 
 
+def _autoconfigure_profiles(repo: SettingsRepository, profiles: list[str]) -> None:
+    """Use local profile name plus workspace host only when the environment signal is unique."""
+    from dexter.adapters.databricks import safe_workspace_host
+
+    matches: dict[str, list[str]] = {"dev": [], "prod": []}
+    paths = DexterPaths.from_env()
+    try:
+        managed = json.loads(paths.databricks_state.read_text(encoding="utf-8")).get("profiles", {})
+    except (OSError, ValueError, AttributeError):
+        managed = {}
+    for profile in profiles:
+        host = safe_workspace_host(profile)
+        if not host:
+            continue
+        record = managed.get(profile) if isinstance(managed, dict) else None
+        if isinstance(record, dict) and record.get("environment") in matches and record.get("host") == host:
+            matches[record["environment"]].append(profile)
+            continue
+        name = profile.lower()
+        hostname = urlsplit(host).hostname or ""
+        for env, markers in (("dev", ("dev", "development")), ("prod", ("prod", "production"))):
+            in_name = any(marker in name for marker in markers)
+            in_host = any(marker in hostname.lower() for marker in markers)
+            if in_name and in_host:
+                matches[env].append(profile)
+    selected = {env: items[0] for env, items in matches.items() if len(items) == 1}
+    if len(set(selected.values())) != len(selected):
+        return
+    for env, profile in selected.items():
+        key = f"databricks.{env}"
+        existing = repo.get(key)
+        if existing is None:
+            repo.put(key, {"profile": profile})
+            repo.put_check(key, "configured", None, "Automatically selected from matching local profile and workspace host labels. Validate to confirm access.")
+
+
 def create_app(paths: DexterPaths | None = None, settings: Settings | None = None) -> FastAPI:
     paths = paths or DexterPaths.from_env()
     settings = settings or Settings.from_env()
@@ -126,6 +165,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     migrate(paths.database)
     operations = OperationsService(paths.database)
     settings_repo = SettingsRepository(paths.database)
+    discover = DiscoverService(paths, settings_repo, settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -164,6 +204,21 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     @app.get("/api/connections")
     def get_connections():
         return _connections(settings_repo, settings)
+
+    @app.get("/api/discover/sources")
+    def discover_sources():
+        return {"items": discover.sources()}
+
+    @app.get("/api/discover/nodes/{node_id:path}/children")
+    def discover_children(node_id: str, force: bool = False):
+        return discover.children(node_id, force)
+
+    @app.get("/api/discover/nodes/{node_id:path}")
+    def discover_detail(node_id: str):
+        result = discover.detail(node_id)
+        if result is None:
+            raise HTTPException(404, detail="Asset details are unavailable")
+        return result
 
     @app.put("/api/connections/databricks/{environment}")
     def save_databricks(environment: str, body: DatabricksConfig):

@@ -1,4 +1,4 @@
-.PHONY: setup lock dev build test doctor stop
+.PHONY: setup lock dev build test doctor stop databricks-setup
 
 PYTHON ?= python3
 VENV_PYTHON := .venv/bin/python
@@ -37,3 +37,6 @@ doctor:
 
 stop:
 	./scripts/stop.sh
+
+databricks-setup:
+	PYTHONPATH=backend/src $(PYTHON_BIN) scripts/databricks_setup.py --format $(if $(OUTPUT),$(OUTPUT),text) $(if $(filter 1 true yes,$(RESET)),--reset,)

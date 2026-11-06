@@ -38,8 +38,16 @@ class DexterPaths:
     def database(self) -> Path:
         return self.metadata / "dexter.sqlite3"
 
+    @property
+    def databricks_config(self) -> Path:
+        return self.config / "databricks" / "databrickscfg"
+
+    @property
+    def databricks_state(self) -> Path:
+        return self.config / "databricks" / "profiles.json"
+
     def ensure(self) -> None:
-        for path in (self.home, self.config, self.metadata, self.datasets, self.artifacts, self.logs, self.temporary):
+        for path in (self.home, self.config, self.config / "databricks", self.metadata, self.datasets, self.artifacts, self.logs, self.temporary):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 path.chmod(0o700)

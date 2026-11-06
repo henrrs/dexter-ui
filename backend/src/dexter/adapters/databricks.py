@@ -7,22 +7,47 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+from dexter.paths import DexterPaths
+
+
+def profile_config_file(profile: str | None = None) -> Path:
+    """Resolve Dexter-owned profiles separately while preserving standard local profile support."""
+    managed = DexterPaths.from_env().databricks_config
+    if profile and profile.casefold() in {"dexter-dev", "dexter-prd"} and managed.is_file():
+        return managed
+    if profile and managed.is_file():
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(managed)
+            if parser.has_section(profile):
+                return managed
+        except (OSError, configparser.Error):
+            pass
+    override = os.environ.get("DATABRICKS_CONFIG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".databrickscfg"
+
 
 def discover_profiles(env: dict[str, str] | None = None) -> tuple[list[str], str]:
     values = env if env is not None else os.environ
-    file_path = Path(values.get("DATABRICKS_CONFIG_FILE", Path.home() / ".databrickscfg")).expanduser()
-    if not file_path.exists():
-        return [], str(file_path)
-    parser = configparser.ConfigParser()
-    try:
-        parser.read(file_path)
-    except (OSError, configparser.Error):
-        return [], str(file_path)
-    return sorted(section for section in parser.sections() if section.lower() != "default"), str(file_path)
+    external_path = Path(values.get("DATABRICKS_CONFIG_FILE", Path.home() / ".databrickscfg")).expanduser()
+    managed_path = DexterPaths.from_env(values).databricks_config
+    profiles: set[str] = set()
+    for file_path in (external_path, managed_path):
+        if not file_path.exists():
+            continue
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(file_path)
+        except (OSError, configparser.Error):
+            continue
+        profiles.update(section for section in parser.sections() if section.lower() != "default")
+    return sorted(profiles), str(external_path)
 
 
 def safe_workspace_host(profile: str) -> str | None:
-    path = Path(os.environ.get("DATABRICKS_CONFIG_FILE", Path.home() / ".databrickscfg")).expanduser()
+    path = profile_config_file(profile)
     if not path.exists():
         return None
     parser = configparser.ConfigParser()
@@ -43,7 +68,11 @@ def validate_profile(profile: str) -> dict:
     try:
         from databricks.sdk import WorkspaceClient
 
-        identity = WorkspaceClient(profile=profile).current_user.me()
+        managed_path = DexterPaths.from_env().databricks_config
+        if managed_path.is_file() and profile_config_file(profile) == managed_path:
+            identity = WorkspaceClient(profile=profile, config_file=str(managed_path)).current_user.me()
+        else:
+            identity = WorkspaceClient(profile=profile).current_user.me()
         user = getattr(identity, "user_name", None) or getattr(identity, "display_name", None) or "Authenticated identity"
         return {"status": "connected", "category": None, "detail": f"Read-only identity check succeeded for {user}."}
     except Exception as exc:

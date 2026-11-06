@@ -38,6 +38,18 @@ MIGRATIONS = (
       checked_at TEXT
     );
     """,
+    """
+    CREATE TABLE discovery_cache (
+      cache_key TEXT PRIMARY KEY,
+      context_key TEXT NOT NULL,
+      node_key TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      fetched_at REAL NOT NULL,
+      expires_at REAL NOT NULL,
+      last_error TEXT
+    );
+    CREATE INDEX discovery_cache_context_node ON discovery_cache(context_key, node_key);
+    """,
 )
 
 

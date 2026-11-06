@@ -9,8 +9,9 @@ import {
 } from 'lucide-react'
 import { api } from './api'
 import type { Connection, Connections, Operation } from './types'
+import { DiscoverView } from './DiscoverView'
 
-type View = 'home' | 'connections'
+type View = 'home' | 'discover' | 'connections'
 type Notice = { kind: 'success' | 'error'; message: string } | null
 
 function App() {
@@ -103,11 +104,11 @@ function App() {
       <div className="main-frame">
         <nav className="rail" aria-label="Primary navigation">
           <button className={`rail-item ${view === 'home' ? 'selected' : ''}`} onClick={() => setView('home')} title="Home"><Home size={18} /><span>Home</span></button>
-          <button className="rail-item disabled" title="Unified Discover is planned for F2" disabled><Search size={18} /><span>Discover</span><span className="nav-phase">F2</span></button>
+          <button className={`rail-item ${view === 'discover' ? 'selected' : ''}`} onClick={() => setView('discover')} title="Unified Discover"><Search size={18} /><span>Discover</span></button>
           <div className="rail-spacer" />
           <div className="rail-divider" />
           <button className="rail-item" onClick={() => setView('connections')} title="Settings and connections"><Settings size={18} /><span>Settings</span></button>
-          <div className="rail-bottom"><span className="rail-version">F1.0</span></div>
+          <div className="rail-bottom"><span className="rail-version">F2.0</span></div>
         </nav>
 
         {leftOpen && <aside className="explorer" style={{ width: leftWidth }}>
@@ -125,7 +126,7 @@ function App() {
 
         <main className="workspace">
           <div className="workspace-toolbar">
-            <div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>{view === 'home' ? 'Home' : 'Settings'}</strong>{view === 'connections' && <><ChevronRight size={13} /><strong>Connections</strong></>}</div>
+            <div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>{view === 'home' ? 'Home' : view === 'discover' ? 'Discover' : 'Settings'}</strong>{view === 'connections' && <><ChevronRight size={13} /><strong>Connections</strong></>}</div>
             <div className="toolbar-actions">
               {!leftOpen && <button className="icon-button subtle" onClick={() => setLeftOpen(true)} aria-label="Show explorer"><PanelLeftClose size={16} /></button>}
               <span className="toolbar-updated"><span className="live-dot" /> Auto refresh · 15s</span>
@@ -133,13 +134,14 @@ function App() {
               {!rightOpen && <button className="icon-button subtle" onClick={() => setRightOpen(true)} aria-label="Show context panel"><PanelRightClose size={16} /></button>}
             </div>
           </div>
-          <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon">{view === 'home' ? <Home size={13} /> : <Settings size={13} />}</span>{view === 'home' ? 'Home' : 'Connections'}</div><button className="new-tab" aria-label="Additional workspace tabs are planned" title="Additional workspace tabs are planned" disabled><Plus size={14} /></button></div>
+          <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon">{view === 'home' ? <Home size={13} /> : view === 'discover' ? <Search size={13} /> : <Settings size={13} />}</span>{view === 'home' ? 'Home' : view === 'discover' ? 'Discover' : 'Connections'}</div><button className="new-tab" aria-label="Additional workspace tabs are planned" title="Additional workspace tabs are planned" disabled><Plus size={14} /></button></div>
           <div className="workspace-scroll">
             {view === 'home'
               ? <HomeView apiOnline={apiOnline} storageReady={storageReady} connectedCount={connectedCount} connections={connections} operations={operations} loading={loading} onConnections={() => setView('connections')} onValidate={(key, action) => void runAction(key, action, 'Connection validation finished.')} onRefresh={() => void refresh()} />
+              : view === 'discover' ? <DiscoverView />
               : <ConnectionsView connections={connections} loading={loading} busy={busy} onSaveDatabricks={(env, profile) => runAction(`save-${env}`, () => api.saveDatabricks(env, profile), `${env.toUpperCase()} profile saved.`)} onValidateDatabricks={(env) => runAction(`validate-${env}`, () => api.validateDatabricks(env), `${env.toUpperCase()} validation finished.`)} onSavePurview={(endpoint, tenant) => runAction('save-purview', () => api.savePurview(endpoint, tenant), 'Purview endpoint saved.')} onValidatePurview={() => runAction('validate-purview', api.validatePurview, 'Purview validation finished.')} />}
           </div>
-          <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item"><span className={`status-dot ${apiOnline ? 'good' : 'bad'}`} /> API {apiOnline ? 'Online' : 'Offline'}</span><span className="status-item"><span className={`status-dot ${storageReady ? 'good' : 'bad'}`} /> Storage {storageReady ? 'Ready' : 'Unavailable'}</span></div><div className="statusbar-right"><span>Local-first · F1 Core</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
+          <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item"><span className={`status-dot ${apiOnline ? 'good' : 'bad'}`} /> API {apiOnline ? 'Online' : 'Offline'}</span><span className="status-item"><span className={`status-dot ${storageReady ? 'good' : 'bad'}`} /> Storage {storageReady ? 'Ready' : 'Unavailable'}</span></div><div className="statusbar-right"><span>Local-first · F2 Discover</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
         </main>
 
         {rightOpen && <aside className="context-panel"><div className="panel-heading context-heading"><div><span className="eyebrow">CONTEXT</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Collapse context panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div><div className="context-content"><div className="context-orbit"><div className="orbit-ring ring-one" /><div className="orbit-ring ring-two" /><div className="orbit-core"><Sparkles size={20} /></div><span className="orbit-node node-a" /><span className="orbit-node node-b" /><span className="orbit-node node-c" /></div><div className="context-title">Your workspace,<br /><em>in conversation.</em></div><p>Ask Dexter will help you explore and understand your data assets.</p><div className="phase-lock"><LockKeyhole size={13} /><span>Planned for F4</span></div></div><div className="context-bottom"><div className="context-bottom-title"><span>ACTIVE CONTEXT</span><span className="context-none">NONE</span></div><div className="context-empty"><FileStack size={15} /><span>Select an asset to add context</span></div></div></aside>}
@@ -201,14 +203,14 @@ function ConnectionsView({ connections, loading, busy, onSaveDatabricks, onValid
     <div className="page-intro settings-intro"><div><div className="eyebrow intro-eyebrow"><span className="accent-line" /> PREFERENCES & ACCESS</div><h1>Connections<span className="greeting-dot">.</span></h1><p>Manage how Dexter connects to the services you already use.</p></div><div className="settings-lock"><LockKeyhole size={14} /><span>Credentials remain in your host session</span></div></div>
     <div className="settings-nav"><span className="settings-nav-active"><Cloud size={14} /> Connections <span>3</span></span></div>
     {loading && <div className="loading-inline"><LoaderCircle size={15} className="spin" /> Loading configuration</div>}
-    <section className="connection-section"><div className="connection-section-head"><div className="section-emblem amber"><Database size={17} /></div><div><h2>Databricks</h2><p>Choose an existing CLI profile for each workspace. Environments are validated independently.</p></div><div className="sdk-chip"><span className="sdk-mark">db</span> OFFICIAL SDK</div></div>
+    <section className="connection-section"><div className="connection-section-head"><div className="section-emblem amber"><Database size={17} /></div><div><h2>Databricks</h2><p>Run <code>make databricks-setup</code> to configure DEV and PRD profiles that share your Azure CLI login.</p></div><div className="sdk-chip"><span className="sdk-mark">db</span> OFFICIAL SDK</div></div>
       <div className="environment-grid">{(['dev', 'prod'] as const).map((env) => {
         const conn = connections?.databricks[env]
         const value = env === 'dev' ? devProfile : prodProfile
         const setter = env === 'dev' ? setDevProfile : setProdProfile
         return <div className="environment-card" key={env}><div className="environment-top"><div className="environment-title"><span className={`env-marker ${env}`} /> <strong>{env.toUpperCase()}</strong><span className="env-subtitle">{env === 'dev' ? 'DEVELOPMENT' : 'PRODUCTION'}</span></div><StatusBadge state={conn?.status ?? 'unavailable'} /></div><label className="field-label" htmlFor={`${env}-profile`}>LOCAL CONFIG PROFILE</label><div className="select-wrap"><select id={`${env}-profile`} value={value} onChange={(event) => setter(event.target.value)}><option value="">Select a profile</option>{profiles.map((profile) => <option key={profile} value={profile}>{profile}</option>)}</select><ChevronDown size={14} /></div>{profiles.length === 0 && <div className="field-help">No named profiles found in <code>{connections?.databricks_profiles.config_file ?? '~/.databrickscfg'}</code>.</div>}{conn?.workspace && <div className="workspace-url"><span className="status-dot good" />{conn.workspace}</div>}<div className="connection-detail">{conn?.detail ?? 'Waiting for local connection settings.'}</div><div className="environment-actions"><button className="button primary small" disabled={!value || busy === `save-${env}`} onClick={() => void onSaveDatabricks(env, value)}>{busy === `save-${env}` ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />} Save profile</button><button className="button secondary small" disabled={!conn?.configured || busy === `validate-${env}`} onClick={() => void onValidateDatabricks(env)}>{busy === `validate-${env}` ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={13} />} Validate</button></div></div>
       })}</div>
-      <div className="source-path"><FileStack size={13} /><span>Profile file</span><code>{connections?.databricks_profiles.config_file ?? '~/.databrickscfg'}</code><span className="path-hint">Read-only access check · no token storage</span></div>
+      <div className="source-path"><FileStack size={13} /><span>Local profiles</span><code>{connections?.databricks_profiles.config_file ?? '~/.databrickscfg'}</code><span className="path-hint">Dexter setup: {connections?.databricks_profiles.dexter_config_file ?? '~/.config/dexter/databricks/databrickscfg'} · Azure CLI owns shared login · no token storage</span></div>
     </section>
     <section className="connection-section purview-section"><div className="connection-section-head"><div className="section-emblem blue"><ShieldCheck size={17} /></div><div><h2>Microsoft Purview</h2><p>Reuse Azure CLI authentication, then check token and API compatibility with a read-only request.</p></div><div className="sdk-chip"><span className="azure-mark">A</span> AZURE CLI</div></div>
       <div className="purview-form"><div className="field-block full"><label className="field-label" htmlFor="purview-endpoint">PURVIEW ACCOUNT ENDPOINT</label><div className="input-wrap"><span className="input-prefix"><ExternalLink size={13} /></span><input id="purview-endpoint" type="url" placeholder="https://your-account.purview.azure.com" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} /></div><span className="field-help">HTTPS endpoint for the Purview account data plane.</span></div><div className="field-block"><label className="field-label" htmlFor="purview-tenant">TENANT ID <span>OPTIONAL</span></label><div className="input-wrap"><input id="purview-tenant" placeholder="Use the current Azure CLI tenant" value={tenant} onChange={(event) => setTenant(event.target.value)} /></div></div><div className="field-block"><label className="field-label">AUTHENTICATION SCOPE</label><div className="scope-value"><LockKeyhole size={13} /><code>{connections?.purview.scope ?? 'https://purview.azure.net/.default'}</code></div></div><div className="field-block full api-check"><span className="field-label">READ-ONLY VALIDATION</span><div className="api-path-row"><code>{connections?.purview.api_path ?? '/datamap/api/atlas/v2/types/typedefs/headers'}</code><span>GET</span></div></div></div>

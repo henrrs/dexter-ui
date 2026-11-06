@@ -60,7 +60,7 @@ class RuntimeFoundationTests(unittest.TestCase):
             migrate(db)
             with connect(db) as connection:
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operations'").fetchone()[0], 1)
 
     def test_operations_persist_validate_transitions_and_recover_after_restart(self):
@@ -169,7 +169,7 @@ class EnterpriseAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "databrickscfg"
             config.write_text("[DEV]\nhost=https://dev.example\ntoken=do-not-return\n[PROD]\nhost=https://prod.example\n")
-            profiles, _ = discover_profiles({"DATABRICKS_CONFIG_FILE": str(config)})
+            profiles, _ = discover_profiles({"DATABRICKS_CONFIG_FILE": str(config), "DEXTER_CONFIG_HOME": temporary + "/dexter-config"})
             self.assertEqual(profiles, ["DEV", "PROD"])
             self.assertNotIn("do-not-return", repr(profiles))
 
@@ -181,7 +181,7 @@ class EnterpriseAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / "databrickscfg"
             config.write_text("[DEV]\nhost=https://dev.example\ntoken=dev-secret\n[PROD]\nhost=https://prod.example\ntoken=prod-secret\n")
-            with patch.dict(os.environ, {"DATABRICKS_CONFIG_FILE": str(config)}), patch.dict(sys.modules, {"databricks": fake_databricks, "databricks.sdk": fake_sdk}):
+            with patch.dict(os.environ, {"DATABRICKS_CONFIG_FILE": str(config), "DEXTER_CONFIG_HOME": temporary + "/dexter-config"}), patch.dict(sys.modules, {"databricks": fake_databricks, "databricks.sdk": fake_sdk}):
                 result = validate_profile("DEV")
             self.assertEqual(result["status"], "connected")
             fake_sdk.WorkspaceClient.assert_called_once_with(profile="DEV")
