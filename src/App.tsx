@@ -104,7 +104,7 @@ function App() {
       <div className="main-frame">
         <nav className="rail" aria-label="Primary navigation">
           <button className={`rail-item ${view === 'home' ? 'selected' : ''}`} onClick={() => setView('home')} title="Home"><Home size={18} /><span>Home</span></button>
-          <button className={`rail-item ${view === 'discover' ? 'selected' : ''}`} onClick={() => setView('discover')} title="Unified Discover"><Search size={18} /><span>Discover</span></button>
+          <button className={`rail-item ${view === 'discover' ? 'selected' : ''}`} onClick={() => { setView('discover'); setLeftOpen(true) }} title="Unified Discover"><Search size={18} /><span>Discover</span></button>
           <div className="rail-spacer" />
           <div className="rail-divider" />
           <div className="rail-bottom"><span className="rail-version">F3.0</span></div>

@@ -194,8 +194,8 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .discover-tree { max-height:calc(100vh - 280px); min-height:0; }
 .discover-legend { position:absolute; bottom:0; left:0; right:0; gap:9px; font-size:8px; }
 .tree-object-icon { flex:0 0 14px; color:#e4b42e; }
-.tree-lock { flex:0 0 auto; color:#9a9f9c; }
-.tree-lock-placeholder { width:12px; flex:0 0 12px; }
+.tree-asset-icon { position:relative; width:14px; height:14px; flex:0 0 14px; display:grid; place-items:center; }
+.tree-lock-badge { position:absolute; right:-4px; bottom:-3px; color:#c0c5c2; background:#151719; border-radius:2px; }
 .discover-node-name.metadata-only { color:#868c89; }
 .availability-pills button.absent { color:#545a59; border-color:#343a39; background:#171a1a; }
 .availability-pills button.unknown { color:#929896; border-color:#454b4a; background:#202424; border-style:dashed; }
