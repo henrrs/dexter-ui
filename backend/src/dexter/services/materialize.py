@@ -16,6 +16,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from urllib.parse import urlsplit
 from dexter.services.analytics_config import load_limits
 
