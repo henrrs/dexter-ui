@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 from dexter.services.analytics_config import load_limits
@@ -26,6 +27,7 @@ MAX_ARROW_CHUNK_BYTES = 2 * 1024 ** 3
 CHUNK_RETRY_ATTEMPTS = 4
 CHUNK_DOWNLOAD_TIMEOUT_SECONDS = 120
 MAX_RESULT_CHUNKS = 100_000
+MAX_PARALLEL_CHUNK_DOWNLOADS = 3
 WORKER_HEARTBEAT_SECONDS = 10
 
 
@@ -39,6 +41,10 @@ class RemoteResultExpired(RuntimeError):
 
 class WorkerLeaseLost(RuntimeError):
     """This worker no longer owns the durable operation lease."""
+
+
+class _TransferAborted(RuntimeError):
+    """A sibling chunk failed, so unfinished speculative downloads should stop."""
 
 
 def _get(value, key, default=None):
@@ -127,10 +133,21 @@ def _submit_read_statement(*, workspace, operations, operation_id: str, statemen
 def _get_result_chunk(*, workspace, operations, operation_id: str, statement_id: str,
                       chunk_index: int):
     for attempt in range(CHUNK_RETRY_ATTEMPTS):
+        started_at = time.monotonic()
         try:
-            return workspace.api_client.do(
+            response = workspace.api_client.do(
                 "GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}"
             )
+            elapsed = time.monotonic() - started_at
+            links = _get(_get(response, "result", response), "external_links", []) or []
+            byte_count = sum(
+                item_bytes for item in links
+                if isinstance((item_bytes := _get(item, "byte_count")), int)
+            )
+            operations.log(operation_id,
+                           f"Chunk {chunk_index + 1} link metadata resolved in {elapsed:.2f}s; "
+                           f"links={len(links)}, declared_bytes={byte_count}")
+            return response
         except Exception as exc:
             status = _http_status(exc)
             if status in {404, 410}:
@@ -213,6 +230,10 @@ def _file_sha256(path) -> str:
     return digest.hexdigest()
 
 
+def _throughput_mib_s(byte_count: int, elapsed_seconds: float) -> float:
+    return byte_count / (1024 * 1024) / max(elapsed_seconds, 0.001)
+
+
 def _manifest_fingerprint(statement_id: str, manifest) -> str:
     stable = {"statement_id": statement_id}
     for key in ("format", "total_chunk_count", "total_row_count", "total_byte_count", "schema", "truncated"):
@@ -255,7 +276,8 @@ def _verified_chunks(operations, operation_id: str, staging, pq):
 
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
-                           minimum_free: int, lease_lost=None) -> tuple[Path, int, str]:
+                           minimum_free: int, lease_lost=None,
+                           stop_event: threading.Event | None = None) -> tuple[Path, int, str, float]:
     """Download a complete Arrow result link before parsing it, so retries cannot duplicate rows."""
     result_path = None
     current_link = initial_link
@@ -304,6 +326,8 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     digest = hashlib.sha256()
                     downloaded_bytes = 0
                     while True:
+                        if stop_event is not None and stop_event.is_set():
+                            raise _TransferAborted("A sibling result chunk failed")
                         if lease_lost is not None and lease_lost.is_set():
                             raise WorkerLeaseLost("The Make Local worker lease expired or was taken over")
                         current = operations.get(operation_id)
@@ -326,10 +350,9 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
             if isinstance(expected_bytes, int) and downloaded_bytes != expected_bytes:
                 raise TimeoutError("Databricks returned an incomplete result chunk")
             os.chmod(result_path, stat.S_IRUSR | stat.S_IWUSR)
-            operations.update_details(operation_id, downloaded_chunk_bytes=downloaded_bytes,
-                                      downloaded_chunk_sha256=digest.hexdigest())
             succeeded = True
-            return result_path, downloaded_bytes, digest.hexdigest()
+            elapsed = time.monotonic() - started_at
+            return result_path, downloaded_bytes, digest.hexdigest(), elapsed
         except InterruptedError:
             if result_path:
                 try:
@@ -410,6 +433,83 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
     raise TimeoutError(f"Databricks result chunk failed after {CHUNK_RETRY_ATTEMPTS} attempts: {_transfer_failure_reason(last_error)}") from last_error
 
 
+def _iter_result_chunks(*, workspace, operations, operation_id: str, statement_id: str,
+                        chunk_count: int, completed: set[int], staging, minimum_free: int,
+                        heartbeat_lost, assert_lease):
+    """Prefetch a bounded window of links and overlap Arrow downloads with local conversion."""
+    workers = min(MAX_PARALLEL_CHUNK_DOWNLOADS, max(1, chunk_count - len(completed)))
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dexter-chunk")
+    pending = {}
+    next_index = 0
+    stop_event = threading.Event()
+
+    def submit_available():
+        nonlocal next_index
+        while len(pending) < workers and next_index < chunk_count:
+            chunk_index = next_index
+            next_index += 1
+            if chunk_index in completed:
+                continue
+            assert_lease()
+            current = operations.get(operation_id)
+            if current and current["cancel_requested"]:
+                workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                raise InterruptedError("Materialization cancelled")
+            chunk = _get_result_chunk(workspace=workspace, operations=operations,
+                                      operation_id=operation_id, statement_id=statement_id,
+                                      chunk_index=chunk_index)
+            assert_lease()
+            links = _get(_get(chunk, "result", chunk), "external_links", []) or []
+            if not links:
+                raise RemoteResultExpired(
+                    "Databricks no longer exposes the completed result. Start a new Make Local operation."
+                )
+            link_index = 0
+            link = _link_for_chunk(links, chunk_index, link_index)
+            if link is None:
+                raise RemoteResultExpired(
+                    "Databricks no longer exposes the completed result. Start a new Make Local operation."
+                )
+            expected_bytes = _get(link, "byte_count")
+            if isinstance(expected_bytes, int):
+                free_bytes = shutil.disk_usage(staging).free
+                in_flight_bytes = sum(
+                    size for _future, size in pending.values() if isinstance(size, int) and size > 0
+                )
+                if free_bytes < expected_bytes * 2 + in_flight_bytes + minimum_free:
+                    if pending:
+                        next_index = chunk_index
+                        return
+                    raise OSError(28, "Insufficient free disk space for the next result chunk")
+            current_progress = (operations.get(operation_id) or {}).get("progress", 20)
+            progress = max(current_progress, min(94, 20 + (chunk_index * 74 // max(1, chunk_count))))
+            operations.transition(operation_id, "running", progress=progress,
+                                  message=f"Downloading result chunks · up to {workers} in parallel")
+            reserved_bytes = expected_bytes if isinstance(expected_bytes, int) else 0
+            pending[chunk_index] = (
+                executor.submit(
+                    _download_result_chunk, workspace=workspace, statement_id=statement_id,
+                    chunk_index=chunk_index, link_index=link_index, initial_link=link,
+                    staging=staging, operations=operations, operation_id=operation_id,
+                    minimum_free=minimum_free, lease_lost=heartbeat_lost,
+                    stop_event=stop_event,
+                ),
+                reserved_bytes,
+            )
+
+    try:
+        submit_available()
+        while pending:
+            chunk_index = min(pending)
+            future, _expected_bytes = pending.pop(chunk_index)
+            arrow_path, arrow_bytes, arrow_digest, download_seconds = future.result()
+            yield chunk_index, arrow_path, arrow_bytes, arrow_digest, download_seconds
+            submit_available()
+    finally:
+        stop_event.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def build_select(catalog: str, schema: str, table: str, columns: list[str], filters: list[dict], known_columns: set[str]) -> tuple[str, list]:
     if not columns or len(set(columns)) != len(columns) or any(c not in known_columns for c in columns):
         raise ValueError("Select unique columns that are present in the authorized table schema")
@@ -449,6 +549,7 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
     heartbeat_stop = threading.Event()
     heartbeat_lost = threading.Event()
     heartbeat_thread = None
+    operation_started_at = time.monotonic()
 
     def heartbeat() -> None:
         while not heartbeat_stop.wait(WORKER_HEARTBEAT_SECONDS):
@@ -558,19 +659,29 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             operations.update_details(operation_id, phase="warehouse", rows=0, bytes=0, files=0)
             operations.transition(operation_id, "running", progress=3, message="Starting selected SQL warehouse if needed")
             assert_lease()
+            warehouse_started_at = time.monotonic()
             ensure_sql_warehouse_running(workspace, warehouse_id)
+            operations.log(operation_id,
+                           f"Selected SQL warehouse is ready in {time.monotonic() - warehouse_started_at:.2f}s")
             operations.log(operation_id, "Submitting a read-only full snapshot query")
             operations.transition(operation_id, "running", progress=5, message="Submitting full snapshot query")
+            submission_started_at = time.monotonic()
             statement_id, response = _submit_read_statement(
                 workspace=workspace, operations=operations, operation_id=operation_id,
                 statement=sql, warehouse_id=warehouse_id, parameters=statement_parameters,
                 worker_id=worker_id, assert_lease=assert_lease,
             )
+            operations.log(operation_id,
+                           f"Databricks accepted the statement in "
+                           f"{time.monotonic() - submission_started_at:.2f}s")
             status_response = response
             resuming_statement = False
 
         # Continue polling an existing statement after a process restart; the query is never reissued just because the worker died.
         query_deadline = time.monotonic() + 48 * 60 * 60
+        query_started_at = time.monotonic()
+        query_poll_count = 0
+        last_query_progress_log = query_started_at
         while True:
             assert_lease()
             current = operations.get(operation_id)
@@ -586,10 +697,30 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                     raise TimeoutError("Databricks statement exceeded Dexter's 48-hour maximum duration")
             status_response = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
             assert_lease()
+            query_poll_count += 1
             status = _get(_get(status_response, "status", {}), "state", "").upper().split(".")[-1]
             if status == "SUCCEEDED":
+                manifest = _get(status_response, "manifest", {})
+                operations.log(
+                    operation_id,
+                    f"Databricks statement succeeded in {time.monotonic() - query_started_at:.2f}s; "
+                    f"polls={query_poll_count}, rows={_get(manifest, 'total_row_count', 'unknown')}, "
+                    f"source_bytes={_get(manifest, 'total_byte_count', 'unknown')}, "
+                    f"chunks={_get(manifest, 'total_chunk_count', 'unknown')}",
+                )
                 break
             if status in {"FAILED", "CANCELED", "CLOSED"}:
+                remote_error = _get(_get(status_response, "status", {}), "error", {})
+                remote_message = str(_get(remote_error, "message", "") or "")
+                remote_message = " ".join(remote_message.split())[:300]
+                operations.log(
+                    operation_id,
+                    f"Databricks statement ended state={status}; "
+                    f"error_code={_get(remote_error, 'error_code', 'none')}, "
+                    f"sql_state={_get(remote_error, 'sql_state', 'none')}, "
+                    f"message={remote_message or 'none'}",
+                    "warning" if status in {"CANCELED", "CLOSED"} else "error",
+                )
                 if resuming_statement:
                     operations.log(operation_id, "The saved Databricks statement failed; retrying with a new read-only query", "warning")
                     statement_id = None
@@ -610,6 +741,11 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                     continue
                 raise RuntimeError("Databricks did not complete the authorized read query")
             operations.transition(operation_id, "running", progress=12, message="Waiting for Databricks query")
+            if time.monotonic() - last_query_progress_log >= 30:
+                operations.log(operation_id,
+                               f"Databricks statement still {status or 'pending'} after "
+                               f"{time.monotonic() - query_started_at:.0f}s; polls={query_poll_count}")
+                last_query_progress_log = time.monotonic()
             time.sleep(1)
 
         manifest = _get(status_response, "manifest", {})
@@ -645,11 +781,23 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                                   result_fingerprint=fingerprint, total_chunks=chunk_count,
                                   expected_rows=expected_rows, expected_source_bytes=expected_bytes,
                                   resume_available=True, retry_available=True)
+        operations.log(
+            operation_id,
+            f"Result transfer starting: chunks={chunk_count}, expected_rows={expected_rows}, "
+            f"expected_source_bytes={expected_bytes}, parallel_downloads={MAX_PARALLEL_CHUNK_DOWNLOADS}, "
+            f"format={manifest_format or 'ARROW_STREAM'}",
+        )
         operations.transition(operation_id, "running", progress=20, message="Verifying saved result chunks")
         import pyarrow.ipc as ipc
         import pyarrow as pa
         import pyarrow.parquet as pq
+        checkpoint_started_at = time.monotonic()
         records = _verified_chunks(operations, operation_id, staging, pq)
+        operations.log(
+            operation_id,
+            f"Verified {len(records)} saved chunk checkpoints in "
+            f"{time.monotonic() - checkpoint_started_at:.2f}s",
+        )
         completed = {record["index"] for record in records}
         rows = sum(record["rows"] for record in records)
         source_bytes = sum(record["arrow_bytes"] for record in records)
@@ -659,45 +807,27 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         operations.update_details(operation_id, rows=rows, bytes=parquet_bytes,
                                   source_bytes=source_bytes, files=len(records))
 
-        for chunk_index in range(chunk_count):
+        transfer_started_at = time.monotonic()
+        for (chunk_index, arrow_path, arrow_bytes, arrow_digest,
+             download_seconds) in _iter_result_chunks(
+                workspace=workspace, operations=operations, operation_id=operation_id,
+                statement_id=statement_id, chunk_count=chunk_count, completed=completed,
+                staging=staging, minimum_free=minimum_free, heartbeat_lost=heartbeat_lost,
+                assert_lease=assert_lease,
+        ):
             assert_lease()
-            if chunk_index in completed:
-                continue
-            current = operations.get(operation_id)
-            if current and current["cancel_requested"]:
-                workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
-                raise InterruptedError("Materialization cancelled")
-            chunk = _get_result_chunk(workspace=workspace, operations=operations,
-                                      operation_id=operation_id, statement_id=statement_id,
-                                      chunk_index=chunk_index)
-            assert_lease()
-            links = _get(_get(chunk, "result", chunk), "external_links", []) or []
-            if not links:
-                raise RemoteResultExpired("Databricks no longer exposes the completed result. Start a new Make Local operation.")
-            link_index = 0
-            link = _link_for_chunk(links, chunk_index, link_index)
-            if link is None:
-                raise RemoteResultExpired("Databricks no longer exposes the completed result. Start a new Make Local operation.")
-            expected_chunk_bytes = _get(link, "byte_count")
-            if isinstance(expected_chunk_bytes, int):
-                free_bytes = shutil.disk_usage(staging).free
-                if free_bytes < expected_chunk_bytes * 2 + minimum_free:
-                    raise OSError(28, "Insufficient free disk space for the next result chunk")
-            current_progress = (operations.get(operation_id) or {}).get("progress", 20)
-            progress = max(current_progress, min(94, 20 + (chunk_index * 74 // max(1, chunk_count))))
-            operations.transition(operation_id, "running", progress=progress,
-                                  message=f"Downloading result chunk {chunk_index + 1}/{chunk_count}")
-            arrow_path, arrow_bytes, arrow_digest = _download_result_chunk(
-                workspace=workspace, statement_id=statement_id, chunk_index=chunk_index,
-                link_index=link_index, initial_link=link, staging=staging,
-                operations=operations, operation_id=operation_id, minimum_free=minimum_free,
-                lease_lost=heartbeat_lost,
+            operations.log(
+                operation_id,
+                f"Chunk {chunk_index + 1}/{chunk_count} downloaded: bytes={arrow_bytes}, "
+                f"duration={download_seconds:.2f}s, throughput={_throughput_mib_s(arrow_bytes, download_seconds):.2f}MiB/s, "
+                f"sha256={arrow_digest}",
             )
             assert_lease()
             chunk_path = staging / f"chunk-{chunk_index:06d}.parquet"
             temporary_parquet = staging / f".chunk-{chunk_index:06d}-{worker_id}.parquet.tmp"
             writer = None
             chunk_rows = 0
+            conversion_started_at = time.monotonic()
             try:
                 with open(arrow_path, "rb") as response_body:
                     reader = ipc.open_stream(response_body)
@@ -754,7 +884,15 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 progress = min(95, 20 + (chunk_index + 1) * 75 // max(1, chunk_count))
                 operations.transition(operation_id, "running", progress=progress,
                                       message=f"Saved chunk {chunk_index + 1}/{chunk_count} · {rows:,} rows")
-                operations.log(operation_id, f"Verified result chunk {chunk_index + 1}/{chunk_count}: {chunk_rows:,} rows, {parquet_file_bytes:,} Parquet bytes")
+                conversion_seconds = time.monotonic() - conversion_started_at
+                operations.log(
+                    operation_id,
+                    f"Chunk {chunk_index + 1}/{chunk_count} converted and checkpointed: "
+                    f"rows={chunk_rows}, parquet_bytes={parquet_file_bytes}, "
+                    f"conversion_duration={conversion_seconds:.2f}s, "
+                    f"conversion_throughput={_throughput_mib_s(arrow_bytes, conversion_seconds):.2f}MiB/s, "
+                    f"parquet_to_arrow_ratio={parquet_file_bytes / max(arrow_bytes, 1):.3f}",
+                )
             finally:
                 if writer is not None:
                     try:
@@ -766,6 +904,12 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                         temporary.unlink()
                     except OSError:
                         pass
+
+        operations.log(
+            operation_id,
+            f"All result chunks downloaded and converted in {time.monotonic() - transfer_started_at:.2f}s; "
+            f"chunks={chunk_count}, rows={rows}, arrow_bytes={source_bytes}, parquet_bytes={parquet_bytes}",
+        )
 
         if chunk_count == 0:
             schema = pa.schema([pa.field(name, pa.null()) for name in columns])
@@ -801,12 +945,18 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             raise InterruptedError("Materialization cancelled")
         operations.update_details(operation_id, phase="validating", rows=rows, bytes=parquet_bytes,
                                   source_bytes=source_bytes, files=len(records))
+        publish_started_at = time.monotonic()
         local_data.publish(operation_id, reservation, source_record, table,
                            f"{catalog}.{schema}.{table}", staging, staging, output_columns,
                            rows, parquet_bytes, chunk_records=records)
+        operations.log(operation_id,
+                       f"Validated local snapshot and published it atomically in "
+                       f"{time.monotonic() - publish_started_at:.2f}s")
         operations.update_details(operation_id, phase="published", rows=rows, bytes=parquet_bytes,
                                   source_bytes=source_bytes, files=len(records))
         operations.log(operation_id, f"Published a complete Parquet snapshot with {rows} rows")
+        operations.log(operation_id,
+                       f"Make Local completed in {time.monotonic() - operation_started_at:.2f}s total")
         operations.transition(operation_id, "succeeded", progress=100, message=f"Snapshot ready · {rows:,} rows")
         operations.update_details(operation_id, resume_available=False, retry_available=False)
     except InterruptedError as exc:
@@ -849,8 +999,15 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         if not operations.worker_lease_owned(operation_id, worker_id):
             worker_lease_lost = True
             return
-        operations.log(operation_id, f"Materialization failed ({type(exc).__name__}): {_safe_error(exc)}", "error")
         current = operations.get(operation_id)
+        phase = ((current or {}).get("details") or {}).get("phase", "unknown")
+        operations.log(
+            operation_id,
+            f"Materialization failed in phase={phase} after "
+            f"{time.monotonic() - operation_started_at:.2f}s "
+            f"({type(exc).__name__}): {_safe_error(exc)}",
+            "error",
+        )
         if current and current["state"] in {"queued", "running"}:
             can_resume = bool((current.get("details") or {}).get("resume_available"))
             retryable = _is_transient_failure(exc)
