@@ -12,7 +12,6 @@ import shutil
 import socket
 import ssl
 import stat
-import tempfile
 import threading
 import time
 import urllib.error
@@ -25,9 +24,11 @@ from dexter.services.analytics_config import load_limits
 
 MAX_ARROW_CHUNK_BYTES = 2 * 1024 ** 3
 CHUNK_RETRY_ATTEMPTS = 4
-CHUNK_DOWNLOAD_TIMEOUT_SECONDS = 120
+CHUNK_DOWNLOAD_TIMEOUT_SECONDS = 10
 MAX_RESULT_CHUNKS = 100_000
-MAX_PARALLEL_CHUNK_DOWNLOADS = 3
+MAX_PARALLEL_RESULT_CHUNKS = 3
+TRANSFER_PROGRESS_CHECK_BYTES = 16 * 1024 * 1024
+TRANSFER_PROGRESS_CHECK_SECONDS = 2.0
 WORKER_HEARTBEAT_SECONDS = 10
 
 
@@ -177,6 +178,68 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _ChunkStreamReader:
+    """Count/hash Arrow bytes and check cancellation/disk at bounded intervals."""
+
+    def __init__(self, source, *, operations, operation_id: str, staging, minimum_free: int,
+                 lease_lost=None, stop_event=None):
+        self.source = source
+        self.operations = operations
+        self.operation_id = operation_id
+        self.staging = staging
+        self.minimum_free = minimum_free
+        self.lease_lost = lease_lost
+        self.stop_event = stop_event
+        self.bytes_read = 0
+        self.read_seconds = 0.0
+        self.digest = hashlib.sha256()
+        self._last_check_bytes = 0
+        self._last_check_at = time.monotonic()
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def readinto(self, buffer):
+        block = self.read(len(buffer))
+        length = len(block)
+        buffer[:length] = block
+        return length
+
+    def read(self, size=-1):
+        started_at = time.monotonic()
+        try:
+            block = self.source.read(size)
+        finally:
+            self.read_seconds += time.monotonic() - started_at
+        if block:
+            self.bytes_read += len(block)
+            if self.bytes_read > MAX_ARROW_CHUNK_BYTES:
+                raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
+            self.digest.update(block)
+        self.check()
+        return block
+
+    def check(self, *, force: bool = False):
+        now = time.monotonic()
+        if not force and (self.bytes_read - self._last_check_bytes < TRANSFER_PROGRESS_CHECK_BYTES
+                          and now - self._last_check_at < TRANSFER_PROGRESS_CHECK_SECONDS):
+            return
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise _TransferAborted("A sibling result chunk failed")
+        if self.lease_lost is not None and self.lease_lost.is_set():
+            raise WorkerLeaseLost("The Make Local worker lease expired or was taken over")
+        current = self.operations.get(self.operation_id)
+        if current and current["cancel_requested"]:
+            raise InterruptedError("Materialization cancelled")
+        if shutil.disk_usage(self.staging).free < self.minimum_free:
+            raise OSError(28, "Insufficient free disk space for snapshot")
+        self._last_check_bytes = self.bytes_read
+        self._last_check_at = now
+
+
 def _link_for_chunk(links, chunk_index: int, fallback_index: int):
     for item in links:
         reported_index = _get(item, "chunk_index")
@@ -277,15 +340,16 @@ def _verified_chunks(operations, operation_id: str, staging, pq):
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
                            minimum_free: int, lease_lost=None,
-                           stop_event: threading.Event | None = None) -> tuple[Path, int, str, float]:
-    """Download a complete Arrow result link before parsing it, so retries cannot duplicate rows."""
-    result_path = None
+                           stop_event: threading.Event | None = None) -> tuple:
+    """Stream one Arrow result chunk directly into a temporary Parquet checkpoint."""
+    import pyarrow.ipc as ipc
+    import pyarrow.parquet as pq
+
     current_link = initial_link
     last_error = None
     for attempt in range(CHUNK_RETRY_ATTEMPTS):
         last_error = None
         succeeded = False
-        downloaded_bytes = 0
         started_at = time.monotonic()
         url = _get(current_link, "external_link") or _get(current_link, "url")
         if not isinstance(url, str):
@@ -301,7 +365,12 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         expected_bytes = _get(current_link, "byte_count")
         if isinstance(expected_bytes, int) and expected_bytes > MAX_ARROW_CHUNK_BYTES:
             raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
-        result_path = None
+        temporary_parquet = staging / f".chunk-{chunk_index:06d}-{uuid.uuid4().hex}.parquet.tmp"
+        stream = None
+        writer = None
+        read_seconds = 0.0
+        write_seconds = 0.0
+        chunk_rows = 0
         try:
             hostname = parsed.hostname.rstrip(".").lower()
             if hostname in {"localhost", "localhost.localdomain"}:
@@ -321,57 +390,69 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                         raise RuntimeError("Databricks returned an invalid result chunk length") from None
                     if declared_bytes > MAX_ARROW_CHUNK_BYTES:
                         raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
-                with tempfile.NamedTemporaryFile(prefix=f"chunk-{chunk_index:06d}-", suffix=".arrow", dir=staging, delete=False) as spool:
-                    result_path = Path(spool.name)
-                    digest = hashlib.sha256()
-                    downloaded_bytes = 0
-                    while True:
-                        if stop_event is not None and stop_event.is_set():
-                            raise _TransferAborted("A sibling result chunk failed")
-                        if lease_lost is not None and lease_lost.is_set():
-                            raise WorkerLeaseLost("The Make Local worker lease expired or was taken over")
-                        current = operations.get(operation_id)
-                        if current and current["cancel_requested"]:
-                            raise InterruptedError("Materialization cancelled")
-                        block = response_body.read(min(1024 * 1024, MAX_ARROW_CHUNK_BYTES - downloaded_bytes + 1))
-                        if not block:
-                            break
-                        downloaded_bytes += len(block)
-                        if downloaded_bytes > MAX_ARROW_CHUNK_BYTES:
-                            raise RuntimeError("Databricks result chunk exceeds the 2 GiB transfer limit")
-                        spool.write(block)
-                        digest.update(block)
-                        if shutil.disk_usage(staging).free < minimum_free:
-                            raise OSError(28, "Insufficient free disk space for snapshot")
-                    spool.flush()
-                    os.fsync(spool.fileno())
+                stream = _ChunkStreamReader(
+                    response_body, operations=operations, operation_id=operation_id,
+                    staging=staging, minimum_free=minimum_free,
+                    lease_lost=lease_lost, stop_event=stop_event,
+                )
+                reader = ipc.open_stream(stream)
+                schema = reader.schema
+                writer = pq.ParquetWriter(temporary_parquet, schema, compression="zstd")
+                while True:
+                    try:
+                        batch = reader.read_next_batch()
+                    except StopIteration:
+                        break
+                    write_started_at = time.monotonic()
+                    writer.write_batch(batch)
+                    write_seconds += time.monotonic() - write_started_at
+                    chunk_rows += batch.num_rows
+                    if shutil.disk_usage(staging).free < minimum_free:
+                        raise OSError(28, "Insufficient free disk space for snapshot")
+                # Consume any bytes buffered after Arrow's end marker so length and digest cover the HTTP body.
+                while stream.read(1024 * 1024):
+                    pass
+                stream.check(force=True)
+                write_started_at = time.monotonic()
+                writer.close()
+                writer = None
+                write_seconds += time.monotonic() - write_started_at
+                read_seconds = stream.read_seconds
+                downloaded_bytes = stream.bytes_read
+                arrow_digest = stream.digest.hexdigest()
             if declared_bytes is not None and downloaded_bytes != declared_bytes:
                 raise TimeoutError("Databricks returned an incomplete result chunk")
             if isinstance(expected_bytes, int) and downloaded_bytes != expected_bytes:
                 raise TimeoutError("Databricks returned an incomplete result chunk")
-            os.chmod(result_path, stat.S_IRUSR | stat.S_IWUSR)
+            with temporary_parquet.open("rb") as completed_file:
+                os.fsync(completed_file.fileno())
+            parquet_file = pq.ParquetFile(temporary_parquet)
+            if parquet_file.metadata.num_rows != chunk_rows:
+                raise RuntimeError("The Parquet chunk row count did not match its Arrow stream")
+            parquet_schema = parquet_file.schema_arrow
+            schema_fingerprint = hashlib.sha256(str(parquet_schema).encode()).hexdigest()
+            parquet_bytes = temporary_parquet.stat().st_size
+            parquet_digest = _file_sha256(temporary_parquet)
+            os.chmod(temporary_parquet, stat.S_IRUSR | stat.S_IWUSR)
+            chunk_elapsed = time.monotonic() - started_at
             succeeded = True
-            elapsed = time.monotonic() - started_at
-            return result_path, downloaded_bytes, digest.hexdigest(), elapsed
+            return (temporary_parquet, downloaded_bytes, arrow_digest, chunk_rows,
+                    parquet_schema, schema_fingerprint, read_seconds, write_seconds,
+                    parquet_bytes, parquet_digest, chunk_elapsed)
         except InterruptedError:
-            if result_path:
-                try:
-                    os.unlink(result_path)
-                except OSError:
-                    pass
+            raise
+        except (WorkerLeaseLost, _TransferAborted):
             raise
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code == 410:
-                raise RemoteResultExpired(
-                    "Databricks no longer exposes this statement result. Start a new Make Local operation."
-                ) from None
-            if exc.code not in {401, 403, 404, 408, 429, 500, 502, 503, 504}:
+            if exc.code not in {401, 403, 404, 408, 410, 429, 500, 502, 503, 504}:
                 operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer stopped: http_{exc.code}", "error")
                 raise RuntimeError(f"Databricks rejected result chunk download (HTTP {exc.code})") from None
         except http.client.IncompleteRead as exc:
-            downloaded_bytes += len(exc.partial or b"")
-            last_error = exc
+            if stream is not None and exc.partial:
+                stream.bytes_read += len(exc.partial)
+                stream.digest.update(exc.partial)
+            last_error = TimeoutError("Databricks returned an incomplete result chunk")
         except socket.gaierror as exc:
             last_error = exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError, ConnectionError) as exc:
@@ -380,21 +461,30 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
             if getattr(exc, "errno", None) == 28:
                 raise
             raise
+        except Exception as exc:
+            if type(exc).__name__.startswith("Arrow"):
+                last_error = TimeoutError("Databricks returned an incomplete result chunk")
+            else:
+                raise
         finally:
-            # Never keep a partial chunk: only a complete, verified download can reach PyArrow.
-            if not succeeded and result_path:
+            if writer is not None:
                 try:
-                    os.unlink(result_path)
-                except OSError:
+                    writer.close()
+                except Exception:
                     pass
-                result_path = None
+            if not succeeded:
+                temporary_parquet.unlink(missing_ok=True)
+
+        downloaded_bytes = stream.bytes_read if stream is not None else 0
 
         link_renewed = False
-        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404, 410}:
+        status = _http_status(last_error) if last_error is not None else None
+        refresh_link = status in {401, 403, 404, 410} or _transfer_failure_reason(last_error) == "incomplete_chunk"
+        if refresh_link and attempt + 1 < CHUNK_RETRY_ATTEMPTS:
             try:
-                refreshed = workspace.api_client.do(
-                    "GET", f"/api/2.0/sql/statements/{statement_id}/result/chunks/{chunk_index}"
-                )
+                refreshed = _get_result_chunk(workspace=workspace, operations=operations,
+                                               operation_id=operation_id, statement_id=statement_id,
+                                               chunk_index=chunk_index)
                 refreshed_links = _get(_get(refreshed, "result", refreshed), "external_links", []) or []
                 renewed_link = _link_for_chunk(refreshed_links, chunk_index, link_index)
                 if renewed_link is None:
@@ -414,16 +504,12 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         reason = _transfer_failure_reason(last_error)
         elapsed = time.monotonic() - started_at
         if attempt + 1 >= CHUNK_RETRY_ATTEMPTS:
-            operations.log(operation_id, f"Result chunk {chunk_index + 1} failed after {attempt + 1}/{CHUNK_RETRY_ATTEMPTS} attempts: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "error")
+            operations.log(operation_id, f"Result chunk {chunk_index + 1} failed after {attempt + 1}/{CHUNK_RETRY_ATTEMPTS} attempts: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, expected_bytes={expected_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "error")
             break
-        operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer retry {attempt + 2}/{CHUNK_RETRY_ATTEMPTS}: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "warning")
+        operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer retry {attempt + 2}/{CHUNK_RETRY_ATTEMPTS}: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, expected_bytes={expected_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "warning")
         delay = min(4.0, 0.25 * (2 ** attempt) + random.uniform(0.0, 0.25))
         time.sleep(delay)
 
-    if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404}:
-        raise RemoteResultExpired(
-            "Databricks no longer exposes this statement result. Start a new Make Local operation."
-        ) from None
     raise TimeoutError(f"Databricks result chunk failed after {CHUNK_RETRY_ATTEMPTS} attempts: {_transfer_failure_reason(last_error)}") from last_error
 
 
@@ -431,7 +517,7 @@ def _iter_result_chunks(*, workspace, operations, operation_id: str, statement_i
                         chunk_count: int, completed: set[int], staging, minimum_free: int,
                         heartbeat_lost, assert_lease):
     """Prefetch a bounded window of links and overlap Arrow downloads with local conversion."""
-    workers = min(MAX_PARALLEL_CHUNK_DOWNLOADS, max(1, chunk_count - len(completed)))
+    workers = min(MAX_PARALLEL_RESULT_CHUNKS, max(1, chunk_count - len(completed)))
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dexter-chunk")
     pending = {}
     next_index = 0
@@ -464,40 +550,30 @@ def _iter_result_chunks(*, workspace, operations, operation_id: str, statement_i
                 raise RemoteResultExpired(
                     "Databricks no longer exposes the completed result. Start a new Make Local operation."
                 )
-            expected_bytes = _get(link, "byte_count")
-            if isinstance(expected_bytes, int):
-                free_bytes = shutil.disk_usage(staging).free
-                in_flight_bytes = sum(
-                    size for _future, size in pending.values() if isinstance(size, int) and size > 0
-                )
-                if free_bytes < expected_bytes * 2 + in_flight_bytes + minimum_free:
-                    if pending:
-                        next_index = chunk_index
-                        return
-                    raise OSError(28, "Insufficient free disk space for the next result chunk")
+            if shutil.disk_usage(staging).free < minimum_free:
+                if pending:
+                    next_index = chunk_index
+                    return
+                raise OSError(28, "Insufficient free disk space for the next result chunk")
             current_progress = (operations.get(operation_id) or {}).get("progress", 20)
             progress = max(current_progress, min(94, 20 + (chunk_index * 74 // max(1, chunk_count))))
             operations.transition(operation_id, "running", progress=progress,
                                   message=f"Downloading result chunks · up to {workers} in parallel")
-            reserved_bytes = expected_bytes if isinstance(expected_bytes, int) else 0
-            pending[chunk_index] = (
-                executor.submit(
+            pending[chunk_index] = executor.submit(
                     _download_result_chunk, workspace=workspace, statement_id=statement_id,
                     chunk_index=chunk_index, link_index=link_index, initial_link=link,
                     staging=staging, operations=operations, operation_id=operation_id,
                     minimum_free=minimum_free, lease_lost=heartbeat_lost,
                     stop_event=stop_event,
-                ),
-                reserved_bytes,
             )
 
     try:
         submit_available()
         while pending:
             chunk_index = min(pending)
-            future, _expected_bytes = pending.pop(chunk_index)
-            arrow_path, arrow_bytes, arrow_digest, download_seconds = future.result()
-            yield chunk_index, arrow_path, arrow_bytes, arrow_digest, download_seconds
+            future = pending.pop(chunk_index)
+            result = future.result()
+            yield (chunk_index, *result)
             submit_available()
     finally:
         stop_event.set()
@@ -769,8 +845,8 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             raise RuntimeError("The saved Databricks result changed; start a new Make Local operation")
         minimum_free = load_limits(paths.config).minimum_free_disk_mb * 1024 * 1024
         free_bytes = shutil.disk_usage(staging).free
-        if isinstance(expected_bytes, int) and expected_bytes and free_bytes < expected_bytes + minimum_free:
-            raise OSError(28, "Insufficient free disk space for the complete snapshot")
+        if free_bytes < minimum_free:
+            raise OSError(28, "Insufficient free disk space to start the snapshot")
         operations.update_details(operation_id, phase="download", statement_id=statement_id,
                                   result_fingerprint=fingerprint, total_chunks=chunk_count,
                                   expected_rows=expected_rows, expected_source_bytes=expected_bytes,
@@ -778,11 +854,10 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         operations.log(
             operation_id,
             f"Result transfer starting: chunks={chunk_count}, expected_rows={expected_rows}, "
-            f"expected_source_bytes={expected_bytes}, parallel_downloads={MAX_PARALLEL_CHUNK_DOWNLOADS}, "
+            f"expected_source_bytes={expected_bytes}, parallel_chunks={MAX_PARALLEL_RESULT_CHUNKS}, "
             f"format={manifest_format or 'ARROW_STREAM'}",
         )
         operations.transition(operation_id, "running", progress=20, message="Verifying saved result chunks")
-        import pyarrow.ipc as ipc
         import pyarrow as pa
         import pyarrow.parquet as pq
         checkpoint_started_at = time.monotonic()
@@ -802,8 +877,9 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                                   source_bytes=source_bytes, files=len(records))
 
         transfer_started_at = time.monotonic()
-        for (chunk_index, arrow_path, arrow_bytes, arrow_digest,
-             download_seconds) in _iter_result_chunks(
+        for (chunk_index, temporary_parquet, arrow_bytes, arrow_digest, chunk_rows,
+             parquet_schema, chunk_schema_fingerprint, read_seconds, write_seconds,
+             parquet_file_bytes, parquet_digest, chunk_elapsed) in _iter_result_chunks(
                 workspace=workspace, operations=operations, operation_id=operation_id,
                 statement_id=statement_id, chunk_count=chunk_count, completed=completed,
                 staging=staging, minimum_free=minimum_free, heartbeat_lost=heartbeat_lost,
@@ -812,52 +888,36 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
             assert_lease()
             operations.log(
                 operation_id,
-                f"Chunk {chunk_index + 1}/{chunk_count} downloaded: bytes={arrow_bytes}, "
-                f"duration={download_seconds:.2f}s, throughput={_throughput_mib_s(arrow_bytes, download_seconds):.2f}MiB/s, "
-                f"sha256={arrow_digest}",
+                f"Chunk {chunk_index + 1}/{chunk_count} streamed: bytes={arrow_bytes}, "
+                f"read_duration={read_seconds:.2f}s, read_throughput={_throughput_mib_s(arrow_bytes, read_seconds):.2f}MiB/s, "
+                f"parquet_write_duration={write_seconds:.2f}s, parquet_bytes={parquet_file_bytes}, "
+                f"chunk_elapsed={chunk_elapsed:.2f}s, sha256={arrow_digest}",
             )
-            assert_lease()
             chunk_path = staging / f"chunk-{chunk_index:06d}.parquet"
-            temporary_parquet = staging / f".chunk-{chunk_index:06d}-{worker_id}.parquet.tmp"
-            writer = None
-            chunk_rows = 0
-            conversion_started_at = time.monotonic()
             try:
-                with open(arrow_path, "rb") as response_body:
-                    reader = ipc.open_stream(response_body)
-                    reader_schema = reader.schema
-                    actual_schema_fingerprint = hashlib.sha256(str(reader_schema).encode()).hexdigest()
-                    if schema_fingerprint and schema_fingerprint != actual_schema_fingerprint:
-                        raise RuntimeError("Databricks result chunks have inconsistent schemas")
-                    if not output_columns:
-                        output_columns = [{"name": field.name, "type": str(field.type), "nullable": field.nullable} for field in reader_schema]
-                    writer = pq.ParquetWriter(temporary_parquet, reader_schema, compression="zstd")
-                    for batch in reader:
-                        assert_lease()
-                        current = operations.get(operation_id)
-                        if current and current["cancel_requested"]:
-                            workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
-                            raise InterruptedError("Materialization cancelled")
-                        writer.write_batch(batch)
-                        chunk_rows += batch.num_rows
                 assert_lease()
-                writer.close()
-                writer = None
-                with open(temporary_parquet, "rb") as completed_file:
-                    os.fsync(completed_file.fileno())
+                if schema_fingerprint and schema_fingerprint != chunk_schema_fingerprint:
+                    raise RuntimeError("Databricks result chunks have inconsistent schemas")
+                if parquet_schema.names != columns:
+                    raise RuntimeError("The Parquet chunk schema did not match the selected columns")
+                if not output_columns:
+                    output_columns = [
+                        {"name": field.name, "type": str(field.type), "nullable": field.nullable}
+                        for field in parquet_schema
+                    ]
+                schema_fingerprint = chunk_schema_fingerprint
                 parquet_file = pq.ParquetFile(temporary_parquet)
                 if parquet_file.metadata.num_rows != chunk_rows:
                     raise RuntimeError("The Parquet chunk row count did not match its Arrow stream")
                 if shutil.disk_usage(staging).free < minimum_free:
                     raise OSError(28, "Insufficient free disk space for snapshot")
-                if parquet_file.schema_arrow.names != [column["name"] for column in output_columns]:
-                    raise RuntimeError("The Parquet chunk schema did not match the selected columns")
-                schema_fingerprint = hashlib.sha256(str(parquet_file.schema_arrow).encode()).hexdigest()
+                assert_lease()
+                current = operations.get(operation_id)
+                if current and current["cancel_requested"]:
+                    workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                    raise InterruptedError("Materialization cancelled")
                 if records and schema_fingerprint != records[0]["schema_fingerprint"]:
                     raise RuntimeError("Databricks result chunks have inconsistent schemas")
-                parquet_file_bytes = temporary_parquet.stat().st_size
-                parquet_digest = _file_sha256(temporary_parquet)
-                os.chmod(temporary_parquet, stat.S_IRUSR | stat.S_IWUSR)
                 assert_lease()
                 os.replace(temporary_parquet, chunk_path)
                 record = {"index": chunk_index, "rows": chunk_rows, "arrow_bytes": arrow_bytes,
@@ -878,26 +938,18 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
                 progress = min(95, 20 + (chunk_index + 1) * 75 // max(1, chunk_count))
                 operations.transition(operation_id, "running", progress=progress,
                                       message=f"Saved chunk {chunk_index + 1}/{chunk_count} · {rows:,} rows")
-                conversion_seconds = time.monotonic() - conversion_started_at
                 operations.log(
                     operation_id,
-                    f"Chunk {chunk_index + 1}/{chunk_count} converted and checkpointed: "
+                    f"Chunk {chunk_index + 1}/{chunk_count} checkpointed: "
                     f"rows={chunk_rows}, parquet_bytes={parquet_file_bytes}, "
-                    f"conversion_duration={conversion_seconds:.2f}s, "
-                    f"conversion_throughput={_throughput_mib_s(arrow_bytes, conversion_seconds):.2f}MiB/s, "
+                    f"read_duration={read_seconds:.2f}s, write_duration={write_seconds:.2f}s, "
                     f"parquet_to_arrow_ratio={parquet_file_bytes / max(arrow_bytes, 1):.3f}",
                 )
             finally:
-                if writer is not None:
-                    try:
-                        writer.close()
-                    except Exception:
-                        pass
-                for temporary in (arrow_path, temporary_parquet):
-                    try:
-                        temporary.unlink()
-                    except OSError:
-                        pass
+                try:
+                    temporary_parquet.unlink()
+                except OSError:
+                    pass
 
         operations.log(
             operation_id,
@@ -942,7 +994,8 @@ def make_local_worker(*, operation_id: str, operations, local_data, paths, setti
         publish_started_at = time.monotonic()
         local_data.publish(operation_id, reservation, source_record, table,
                            f"{catalog}.{schema}.{table}", staging, staging, output_columns,
-                           rows, parquet_bytes, chunk_records=records)
+                           rows, parquet_bytes, chunk_records=records,
+                           checkpoint_hashes_verified=True)
         operations.log(operation_id,
                        f"Validated local snapshot and published it atomically in "
                        f"{time.monotonic() - publish_started_at:.2f}s")
@@ -1065,12 +1118,12 @@ def _safe_error(exc: Exception) -> str:
         if "result chunk failed after" in message:
             reason = message.rsplit(":", 1)[-1].strip()
             if reason == "read_timeout":
-                return "The Databricks result transfer repeatedly stalled for over 120 seconds; see operation logs for bytes received per attempt."
+                return f"The Databricks result transfer repeatedly stalled for over {CHUNK_DOWNLOAD_TIMEOUT_SECONDS} seconds; see operation logs for bytes received per attempt."
             if reason == "incomplete_chunk":
                 return "The Databricks result chunk repeatedly arrived with fewer bytes than declared."
             if reason == "http_stream_error":
                 return "The Databricks result stream was interrupted or malformed on all four attempts."
-            if reason.startswith("http_401") or reason.startswith("http_403") or reason.startswith("http_404"):
+            if reason.startswith("http_401") or reason.startswith("http_403") or reason.startswith("http_404") or reason.startswith("http_410"):
                 status = reason.removeprefix("http_")
                 return f"The temporary Databricks result link was rejected after renewal attempts (HTTP {status})."
             if reason == "http_429":

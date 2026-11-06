@@ -149,7 +149,8 @@ class LocalDataService:
     @_synchronized
     def publish(self, operation_id: str, source_key: str, source: dict, name: str, qualified_name: str,
                 staging: Path, parquet_file: Path, columns: list[dict], row_count: int, byte_count: int,
-                chunk_records: list[dict] | None = None) -> dict:
+                chunk_records: list[dict] | None = None,
+                checkpoint_hashes_verified: bool = False) -> dict:
         try:
             import pyarrow.parquet as pq
             if parquet_file.is_dir():
@@ -178,8 +179,11 @@ class LocalDataService:
                     raise ValueError("The staged Parquet files do not match the verified chunk checkpoints")
                 for file in data_files:
                     record = verified[file.name]
-                    if (file.stat().st_size != record.get("parquet_bytes")
-                            or _sha256_file(file) != record.get("parquet_sha256")):
+                    if file.stat().st_size != record.get("parquet_bytes"):
+                        raise ValueError("A staged Parquet chunk does not match its verified checkpoint")
+                    # Make Local has just hashed this checkpoint, or rehashed it during resume validation.
+                    if (not checkpoint_hashes_verified
+                            and _sha256_file(file) != record.get("parquet_sha256")):
                         raise ValueError("A staged Parquet chunk does not match its verified checkpoint")
             else:
                 if not parquet_file.is_file() or parquet_file.stat().st_size <= 0:
