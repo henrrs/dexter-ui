@@ -73,8 +73,8 @@ def validate_profile(profile: str) -> dict:
             identity = WorkspaceClient(profile=profile, config_file=str(managed_path)).current_user.me()
         else:
             identity = WorkspaceClient(profile=profile).current_user.me()
-        user = getattr(identity, "user_name", None) or getattr(identity, "display_name", None) or "Authenticated identity"
-        return {"status": "connected", "category": None, "detail": f"Read-only identity check succeeded for {user}."}
+        user = next((value.strip() for value in (getattr(identity, "display_name", None), getattr(identity, "user_name", None)) if isinstance(value, str) and value.strip()), None)
+        return {"status": "connected", "category": None, "identity": user, "detail": f"Read-only identity check succeeded for {user or 'the authenticated user'}."}
     except Exception as exc:
         code = getattr(exc, "status_code", None)
         message = str(exc).lower()

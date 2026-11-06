@@ -87,6 +87,10 @@ function App() {
 
   const connectedCount = [connections?.databricks.dev, connections?.databricks.prod, connections?.purview]
     .filter((item) => item?.status === 'connected').length
+  const databricksIdentity = connections?.databricks.dev.identity || connections?.databricks.prod.identity || null
+  const identityInitials = databricksIdentity
+    ? databricksIdentity.split(/[\s.@_-]+/).filter(Boolean).slice(0, 2).map((part) => part[0].toUpperCase()).join('')
+    : 'D'
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -97,7 +101,7 @@ function App() {
           <div className="workspace-label"><span className="workspace-dot" /> Personal workspace</div>
         </div>
         <div className="topbar-actions">
-          <span className="runtime-pill"><span className="live-dot" /> LOCAL RUNTIME</span>
+          <div className="user-pill" title={databricksIdentity ?? 'Databricks identity is unavailable'}><span className="user-avatar">{identityInitials}</span><span className="user-pill-name">{databricksIdentity ?? (connections ? 'Databricks user unavailable' : 'Connecting to Databricks…')}</span></div>
         </div>
       </header>
 
@@ -106,8 +110,6 @@ function App() {
           <button className={`rail-item ${view === 'home' ? 'selected' : ''}`} onClick={() => setView('home')} title="Home"><Home size={18} /><span>Home</span></button>
           <button className={`rail-item ${view === 'discover' ? 'selected' : ''}`} onClick={() => { setView('discover'); setLeftOpen(true) }} title="Unified Discover"><Search size={18} /><span>Discover</span></button>
           <div className="rail-spacer" />
-          <div className="rail-divider" />
-          <div className="rail-bottom"><span className="rail-version">F3.0</span></div>
         </nav>
 
         <DiscoverView active={view === 'discover'} explorerOpen={leftOpen} explorerWidth={leftWidth} onCollapseExplorer={() => setLeftOpen(false)} onExpandExplorer={() => setLeftOpen(true)} onResizeExplorer={resizeExplorer} rightOpen={rightOpen} onExpandContext={() => setRightOpen(true)} />
@@ -124,7 +126,7 @@ function App() {
           <div className="workspace-scroll">
             <HomeView apiOnline={apiOnline} storageReady={storageReady} connectedCount={connectedCount} connections={connections} operations={operations} loading={loading} onRefreshConnections={() => void refreshConnections()} onRefresh={() => void refresh()} />
           </div>
-          <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item"><span className={`status-dot ${apiOnline ? 'good' : 'bad'}`} /> API {apiOnline ? 'Online' : 'Offline'}</span><span className="status-item"><span className={`status-dot ${storageReady ? 'good' : 'bad'}`} /> Storage {storageReady ? 'Ready' : 'Unavailable'}</span></div><div className="statusbar-right"><span>Local-first · F3 Unified Explorer</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
+          <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item"><span className={`status-dot ${apiOnline ? 'good' : 'bad'}`} /> API {apiOnline ? 'Online' : 'Offline'}</span><span className="status-item"><span className={`status-dot ${storageReady ? 'good' : 'bad'}`} /> Storage {storageReady ? 'Ready' : 'Unavailable'}</span></div><div className="statusbar-right"><span>Local-first · F3 Unified Explorer</span></div></footer>
         </main>}
 
         {rightOpen && <aside className="context-panel"><div className="panel-heading context-heading"><div><span className="eyebrow">CONTEXT</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Collapse context panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div>{view === 'discover' && discoverContext ? <div className="discover-ask-context"><div className="discover-context-card"><Database size={17} /><div><strong>{discoverContext.name}</strong><small>{discoverContext.qualifiedName}</small><span>{discoverContext.environment.toUpperCase()} context</span></div><button className="icon-button tiny" aria-label="Clear selected context" onClick={() => { setDiscoverContext(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) }}><X size={13} /></button></div><div className="context-quick-actions"><button disabled><Activity size={14} /> Summarize this table</button><button disabled><FileStack size={14} /> Explain the columns</button><button disabled><span>SQL</span> Generate a query</button><button disabled><Layers3 size={14} /> Compare with another table</button></div><div className="phase-lock"><LockKeyhole size={13} /><span>Context actions planned for F4</span></div></div> : <><div className="context-content"><div className="context-orbit"><div className="orbit-ring ring-one" /><div className="orbit-ring ring-two" /><div className="orbit-core"><Sparkles size={20} /></div><span className="orbit-node node-a" /><span className="orbit-node node-b" /><span className="orbit-node node-c" /></div><div className="context-title">Your workspace,<br /><em>in conversation.</em></div><p>Ask Dexter will help you explore and understand your data assets.</p><div className="phase-lock"><LockKeyhole size={13} /><span>Planned for F4</span></div></div><div className="context-bottom"><div className="context-bottom-title"><span>ACTIVE CONTEXT</span><span className="context-none">NONE</span></div><div className="context-empty"><FileStack size={15} /><span>Select an asset to add context</span></div></div></>}</aside>}

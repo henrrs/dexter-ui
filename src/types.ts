@@ -7,6 +7,7 @@ export type Connection = {
   detail: string
   checked_at: string | null
   profile?: string | null
+  identity?: string | null
   workspace?: string | null
   endpoint?: string | null
   account_name?: string | null

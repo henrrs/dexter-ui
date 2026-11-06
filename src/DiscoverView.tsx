@@ -163,6 +163,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const text = `${node.name} ${node.qualified_name ?? ''} ${node.source} ${node.environment}`.toLowerCase()
     return text.includes(query.trim().toLowerCase())
   }
+  const loadedChildren = (node: DiscoverNode) => node.children ?? pages[node.id]?.items ?? []
+  const matchesLoadedBranch = (node: DiscoverNode): boolean => matches(node) || loadedChildren(node).some(matchesLoadedBranch)
 
   const loadedNodes = [...Object.values(pages).flatMap((page) => page.items), ...sources]
   const matchingGovernance = (asset: DiscoverNode | null) => {
@@ -177,9 +179,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
   const governanceMatch = matchingGovernance(selected)
 
-  const renderNodes = (nodes: DiscoverNode[], depth = 0): ReactNode => nodes.filter(matches).map((node) => {
-    const open = expanded.has(node.id)
-    const children = node.children ?? pages[node.id]?.items
+  const renderNodes = (nodes: DiscoverNode[], depth = 0): ReactNode => nodes.filter((node) => !query.trim() || matchesLoadedBranch(node)).map((node) => {
+    const children = loadedChildren(node)
+    const open = expanded.has(node.id) || Boolean(query.trim() && children.some(matchesLoadedBranch))
     const expandable = !['table', 'view'].includes(node.kind)
     const pending = loading.has(node.id)
     const access = node.access ?? 'unknown'
@@ -196,15 +198,15 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         </button>
       </div>
       {open && pages[node.id]?.error && <div className="discover-error" style={{ paddingLeft: 35 + depth * 14 }}>{pages[node.id].error}{pages[node.id].stale && ' · cached data may be stale'}</div>}
-      {open && children && renderNodes(children, depth + 1)}
-      {open && !children?.length && !pending && !pages[node.id]?.error && <div className="discover-empty-child" style={{ paddingLeft: 40 + depth * 14 }}>No visible children</div>}
+      {open && children.length > 0 && renderNodes(children, depth + 1)}
+      {open && !children.length && !pending && !pages[node.id]?.error && <div className="discover-empty-child" style={{ paddingLeft: 40 + depth * 14 }}>No visible children</div>}
     </div>
   })
 
-  const visible = useMemo(() => sources.filter(matches), [sources, query])
+  const visible = useMemo(() => sources.filter((node) => !query.trim() || matchesLoadedBranch(node)), [sources, pages, query])
   if (!active) return null
   return <>
-    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search loaded catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
         <div className="discover-tree">
           {sources.length === 0 && (!sourcesLoaded || refreshing)
             ? <div className="loading-state"><LoaderCircle size={15} className="spin" /> Loading catalog metadata…</div>
@@ -213,7 +215,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               : visible.length
                 ? renderNodes(visible)
                 : query.trim()
-                  ? <div className="discover-empty">No catalog metadata matches this search.</div>
+                  ? <div className="discover-empty">No loaded metadata matches this search.</div>
                   : sourcesError
                     ? <div className="discover-empty">Could not refresh catalog metadata. Showing the last loaded catalog.</div>
                     : <div className="discover-empty">No catalogs were found. Check that a Databricks profile is configured.</div>}
@@ -222,7 +224,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       </aside>}
     {!explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
     <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
-      <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions"><button className="toolbar-refresh" onClick={() => void refreshCatalog()} disabled={refreshing}>{refreshing ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />} Refresh metadata</button>{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
+      <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
       <div className="tab-strip"><div className="workspace-tab"><span className="tab-icon"><Search size={13} /></span>Discover</div>{workbenchTabs.length > 0 && <div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${selected?.id === tab.node.id ? 'active' : ''}`} key={tab.key}><button onClick={() => void selectNode(tab.node, tab.environment)}><Database size={12} /> {tab.node.name} · {tab.environment.toUpperCase()}</button><button aria-label={`Minimize ${tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (selected?.id === tab.node.id) { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (selected?.id === tab.node.id) { const next = remaining.at(-1); if (next) void selectNode(next.node, next.environment); else { setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div>}</div>
       <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>
         <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div><button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
@@ -245,8 +247,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small>{activeOperation.message}</small>{operationLogs.map((log, index) => <small key={`${log.created_at}-${index}`}>{log.message}</small>)}</div>}
         <div className="discover-preview-note"><LockKeyhole size={14} /><span>Remote preview remains available only after the selected environment confirms read access.</span></div>
       </> : <div className="discover-placeholder"><span className="empty-glyph"><FileStack size={17} /></span><strong>Select an asset</strong><span>Metadata and access evidence will appear here.</span></div>}</section>
-      <div className="discover-sync"><span><span className="live-dot" /> Metadata sync is lazy</span><span>Catalogs 6h · Schemas 30m · Tables 15m · Details 1h</span></div></div>
-      <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item">Unified Discover</span></div><div className="statusbar-right"><span>Metadata sync is lazy</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
+      </div>
+      <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item">Unified Discover</span></div></footer>
     </main>
   </>
 }

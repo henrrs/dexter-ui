@@ -108,6 +108,7 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
         result["databricks"][env_name] = {
             "configured": bool(config),
             "profile": config.get("profile") if config else None,
+            "identity": config.get("identity") if config else None,
             "workspace": None,
             "status": check["status"] if check else ("configured" if config else "unavailable"),
             "category": check["category"] if check else None,
@@ -240,6 +241,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             config = settings_repo.get(key)
             if config:
                 result = validate_profile(config["profile"])
+                updated_config = dict(config)
+                identity = result.get("identity") if result.get("status") == "connected" else None
+                if isinstance(identity, str) and identity.strip():
+                    updated_config["identity"] = identity.strip()
+                else:
+                    updated_config.pop("identity", None)
+                settings_repo.put(key, updated_config)
             else:
                 result = {"status": "unavailable", "category": "configuration", "detail": f"No unambiguous local Databricks {environment.upper()} profile was detected."}
             settings_repo.put_check(key, result["status"], result.get("category"), result["detail"])
