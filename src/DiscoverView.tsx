@@ -167,7 +167,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }, [activeSection, selected?.id, selected?.kind])
 
   const runMakeLocal = async () => {
-    if (!selected || !warehouseId || !selectedColumns.length) return
+    if (!selected || activeEnvironment !== 'prod' || !warehouseId || !selectedColumns.length) return
     setLocalQueryError('')
     try {
       const operation = await api.makeLocal(selected.id, { environment: activeEnvironment as 'dev' | 'prod', warehouse_id: warehouseId, columns: selectedColumns, filters: [] })
@@ -278,7 +278,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
           <div className="workbench-overview"><div className="eyebrow">TABLE OVERVIEW</div><strong>{selected.qualified_name ?? selected.name}</strong></div>
           {selected.description && <p className="discover-description">{selected.description}</p>}
           {(selected.kind === 'table' || selected.kind === 'view') && <div className="discover-operation-cards"><div className="discover-section-title">Operations</div><div className="operation-card-grid">
-            <button className="operation-card make-local-action" onClick={() => { setLocalQueryError(''); setMakeLocalOpen(true) }} disabled={selected.access !== 'read' || activeEnvironment === 'local'}><HardDrive size={16} /><strong>Make Local</strong><span>Select columns and filters for a local snapshot.</span><b>→</b></button>
+            <button className="operation-card make-local-action" onClick={() => { setLocalQueryError(''); setMakeLocalOpen(true) }} disabled={selected.access !== 'read' || activeEnvironment !== 'prod'} title={activeEnvironment !== 'prod' ? 'Make Local is only available when viewing the PROD table.' : undefined}><HardDrive size={16} /><strong>Make Local</strong><span>{activeEnvironment === 'prod' ? 'Select columns for a local snapshot.' : 'Available only from PROD.'}</span><b>→</b></button>
             <button className="operation-card" disabled title="Planned; no generation backend is connected"><Sparkles size={16} /><strong>Generate Synthetic Data</strong><span>Mock data in DEV · planned</span><b>→</b></button>
             <button className="operation-card" disabled title="Planned; comparison is not implemented"><Layers3 size={16} /><strong>Compare Tables</strong><span>Cross environment · planned</span><b>→</b></button>
             <button className="operation-card" disabled={!selected.variants?.some((variant) => variant.environment === 'local')} onClick={() => { setActiveSection('preview'); void selectNode(selected, 'local') }}><Database size={16} /><strong>Open Local / Query Local</strong><span>{selected.variants?.some((variant) => variant.environment === 'local') ? 'Open the valid local snapshot.' : 'No local materialization available.'}</span><b>→</b></button>
@@ -297,7 +297,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               {localQueryError && <div className="discover-error modal-inline-error" role="alert">{localQueryError}</div>}
               <small className="make-local-dialog-note">A stopped warehouse starts automatically when the snapshot begins.</small>
             </div>
-            <footer className="make-local-dialog-footer"><button className="button secondary small" onClick={() => setMakeLocalOpen(false)}>Cancel</button><button className="button primary small" disabled={!warehouseId || !selectedColumns.length || !selected.columns?.length || warehousesLoading || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void runMakeLocal()}><HardDrive size={13} /> Make Local</button></footer>
+            <footer className="make-local-dialog-footer"><button className="button secondary small" onClick={() => setMakeLocalOpen(false)}>Cancel</button><button className="button primary small" disabled={activeEnvironment !== 'prod' || !warehouseId || !selectedColumns.length || !selected.columns?.length || warehousesLoading || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void runMakeLocal()}><HardDrive size={13} /> Make Local</button></footer>
           </section></div>}
         </div>}
         {activeSection === 'schema' && <div className="workbench-section-content">

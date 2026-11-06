@@ -81,7 +81,7 @@ class MakeLocalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     node_id: str = Field(min_length=1, max_length=100_000)
     warehouse_id: str = Field(min_length=1, max_length=160)
-    environment: str = Field(pattern="^(dev|prod)$")
+    environment: str = Field(pattern="^prod$")
     columns: list[str] = Field(min_length=1, max_length=500)
     filters: list[dict] = Field(default_factory=list, max_length=100)
 
@@ -350,8 +350,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             parts = node_id.split(":")
             environment = parts[1] if len(parts) > 1 else environment
             physical_id = node_id
-        if len(parts) != 5 or parts[0] != "databricks" or parts[1] not in {"dev", "prod"}:
-            raise HTTPException(422, detail="Select a Databricks DEV or PROD table variant")
+        if len(parts) != 5 or parts[0] != "databricks" or parts[1] != "prod":
+            raise HTTPException(422, detail="Make Local is only available for a Databricks PROD table")
         detail = discover.detail(physical_id)
         if not detail or detail.get("access") != "read":
             raise HTTPException(403, detail="Table read access is not confirmed for the selected environment")
