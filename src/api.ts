@@ -50,7 +50,7 @@ export type DiscoverNode = {
   metastore_id?: string | null; classifications?: string[]
   workspace?: string; profile?: string; logical_name?: string
   variants?: Array<{ environment: string; catalog: string; schema?: string; table?: string; node_id: string; access?: string; metastore_id?: string; dataset_id?: string; metadata?: Record<string, unknown> }>
-  availability?: { local: 'present' | 'restricted' | 'unknown' | 'absent'; dev: 'present' | 'restricted' | 'unknown' | 'absent'; prod: 'present' | 'restricted' | 'unknown' | 'absent' }
+  availability?: { local: 'present' | 'unknown' | 'absent'; dev: 'present' | 'unknown' | 'absent'; prod: 'present' | 'unknown' | 'absent' }
   ambiguous?: boolean
   purview_metadata?: Record<string, unknown>
   children?: DiscoverNode[] | null; row_count?: number | null; format?: string

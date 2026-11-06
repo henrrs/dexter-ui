@@ -11,7 +11,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8000
     purview_scope: str = "https://purview.azure.net/.default"
-    purview_api_path: str = "/datamap/api/atlas/v2/types/typedefs/headers"
+    purview_api_path: str = "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -28,7 +28,7 @@ class Settings:
         scope = values.get("DEXTER_PURVIEW_SCOPE", "https://purview.azure.net/.default").strip()
         if not scope.startswith("https://") or not scope.endswith("/.default"):
             raise ValueError("DEXTER_PURVIEW_SCOPE must be an HTTPS resource scope ending in /.default")
-        api_path = values.get("DEXTER_PURVIEW_API_PATH", "/datamap/api/atlas/v2/types/typedefs/headers")
+        api_path = values.get("DEXTER_PURVIEW_API_PATH", "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1")
         if not api_path.startswith("/") or api_path.startswith("//"):
             raise ValueError("DEXTER_PURVIEW_API_PATH must be an absolute path on the configured endpoint")
         return cls(host=host, port=port, purview_scope=scope, purview_api_path=api_path)

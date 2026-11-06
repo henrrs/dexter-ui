@@ -199,7 +199,7 @@ class DiscoverService:
         cached = None
         try:
             from azure.identity import AzureCliCredential
-            from dexter.adapters.purview import _token_claims
+            from dexter.adapters.purview import _token_claims, resolve_api_endpoint
 
             token = AzureCliCredential(tenant_id=config.get("tenant_id") or None).get_token(self.settings.purview_scope)
             claims = _token_claims(token.token) or {}
@@ -217,10 +217,11 @@ class DiscoverService:
             if cached and not cached["stale"] and not force:
                 return cached
             # Unified Catalog is a distinct public-preview API. Query it directly; never fall back to Atlas.
-            base_url = config["endpoint"].rstrip("/") + "/datagovernance/catalog/dataAssets"
+            api_path = "/datagovernance/catalog/dataAssets"
+            base_url = resolve_api_endpoint(config["endpoint"], api_path) + api_path
             entries, payload, skip = [], {}, 0
             for _page in range(50):
-                query = urlencode({"api-version": "2026-03-20-preview", "top": "100", "skip": str(skip)})
+                query = urlencode({"api-version": "2026-03-20-preview", "includeExtendedProperties": "true", "top": "100", "skip": str(skip)})
                 url = base_url + "?" + query
                 request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
                 with urllib.request.urlopen(request, timeout=12) as response:
@@ -235,9 +236,12 @@ class DiscoverService:
                 if not isinstance(item, dict):
                     continue
                 name = item.get("name") or item.get("displayName") or item.get("id") or "Purview asset"
-                qname = item.get("qualifiedName") or item.get("id") or name
+                source = item.get("source") if isinstance(item.get("source"), dict) else {}
+                qname = item.get("qualifiedName") or source.get("fqn") or item.get("id") or name
                 contacts = item.get("contacts") if isinstance(item.get("contacts"), dict) else {}
                 owner = contacts.get("owner") or item.get("owner")
+                if isinstance(owner, list):
+                    owner = ", ".join(str(entry.get("description") or entry.get("id")) for entry in owner if isinstance(entry, dict)) or None
                 nodes.append({"id": f"purview:{qname}", "name": str(name).split("/")[-1], "qualified_name": qname, "kind": "table", "source": "purview", "environment": "governance", "identity": identity, "description": item.get("description"), "owner": owner, "classifications": item.get("classifications", []), "access": "unknown", "children": []})
             page = self.cache.put(cache_context, "assets", nodes, 6 * 3600)
             page["has_more"] = len(entries) >= 5000 and len(entries) % 100 == 0
@@ -248,7 +252,15 @@ class DiscoverService:
             if cached:
                 cached.update(stale=True, error=f"Purview refresh failed (HTTP {exc.code}); showing cached metadata.")
                 return cached
-            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "Purview denied catalogue discovery or the configured endpoint does not expose Unified Catalog."}
+            if exc.code == 401:
+                message = "Purview rejected the delegated Azure CLI token. Verify authentication and tenant."
+            elif exc.code == 403:
+                message = "Azure CLI identity is authenticated but lacks Unified Catalog read permission."
+            elif exc.code == 404:
+                message = "The configured Purview API endpoint or Unified Catalog route was not found."
+            else:
+                message = f"Purview returned HTTP {exc.code} while reading catalog metadata."
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": message}
         except (TimeoutError, OSError, urllib.error.URLError, ValueError, TypeError, KeyError) as exc:
             if cached:
                 cached.update(stale=True, error="Purview could not refresh; showing cached metadata.")

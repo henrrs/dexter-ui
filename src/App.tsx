@@ -3,7 +3,7 @@ import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import {
   Activity, AlertCircle, ArrowDownRight, ArrowRight, ArrowUpRight,
   Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp,
-  Cloud, Database, ExternalLink, FileStack, Gauge, HardDrive, Home, Layers3,
+  Cloud, Database, ExternalLink, FileStack, Gauge, Home, Layers3,
   LoaderCircle, LockKeyhole, PanelLeftClose, PanelRightClose, Plus,
   RefreshCw, Search, Settings, ShieldCheck, Sparkles, X,
 } from 'lucide-react'
@@ -26,7 +26,7 @@ function App() {
   const [rightOpen, setRightOpen] = useState(true)
   const [leftWidth, setLeftWidth] = useState(252)
   const [busy, setBusy] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
+  const [discoverContext, setDiscoverContext] = useState<{ name: string; qualifiedName: string; environment: string } | null>(null)
 
   const refresh = useCallback(async (initial = false) => {
     if (initial) setLoading(true)
@@ -45,6 +45,13 @@ function App() {
     const timer = window.setInterval(() => void refresh(), 15000)
     return () => window.clearInterval(timer)
   }, [refresh])
+
+  useEffect(() => {
+    const update = (event: Event) => setDiscoverContext((event as CustomEvent<typeof discoverContext>).detail)
+    window.addEventListener('dexter:discover-context', update)
+    return () => window.removeEventListener('dexter:discover-context', update)
+  }, [])
+  useEffect(() => { if (view !== 'discover') setDiscoverContext(null) }, [view])
 
   useEffect(() => {
     if (!notice) return
@@ -80,12 +87,6 @@ function App() {
 
   const connectedCount = [connections?.databricks.dev, connections?.databricks.prod, connections?.purview]
     .filter((item) => item?.status === 'connected').length
-  const visibleSources = [
-    { title: 'Databricks', detail: 'DEV & PROD', tint: 'amber', icon: <Database size={15} />, onClick: () => setView('connections') },
-    { title: 'Microsoft Purview', detail: 'GOVERNANCE', tint: 'blue', icon: <ShieldCheck size={15} />, onClick: () => setView('connections') },
-    { title: 'Local datasets', detail: '0 DATASETS', tint: 'green', icon: <HardDrive size={15} /> },
-  ].filter((source) => `${source.title} ${source.detail}`.toLowerCase().includes(query.trim().toLowerCase()))
-
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -111,24 +112,11 @@ function App() {
           <div className="rail-bottom"><span className="rail-version">F3.0</span></div>
         </nav>
 
-        {leftOpen && view !== 'discover' && <aside className="explorer" style={{ width: leftWidth }}>
-          <div className="panel-heading"><div><span className="eyebrow">WORKSPACE</span><h2>Explorer</h2></div><button className="icon-button subtle" aria-label="Collapse explorer" onClick={() => setLeftOpen(false)}><PanelLeftClose size={16} /></button></div>
-          <div className="explorer-search"><Search size={14} /><input placeholder="Filter workspace" value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>/</kbd></div>
-          <div className="explorer-tree">
-            <div className="tree-group"><ChevronDown size={14} /><span className="tree-label">SOURCES</span><span className="tree-count">3</span></div>
-            {visibleSources.length ? visibleSources.map((source) => <TreeSource key={source.title} {...source} />) : <div className="explorer-empty compact-empty">No matching sources</div>}
-            <div className="tree-group tree-group-spaced"><ChevronRight size={14} /><span className="tree-label">RECENT</span></div>
-            <div className="explorer-empty"><span className="empty-glyph"><Layers3 size={17} /></span><span>No recent assets</span><small>Connect a source to get started.</small></div>
-          </div>
-          <div className="explorer-footer"><span className="sync-indicator"><span className="live-dot" /> Local metadata</span><button className="icon-button tiny" aria-label="Refresh" onClick={() => void refresh()}><RefreshCw size={13} /></button></div>
-          <div className="resize-handle" onPointerDown={resizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
-        </aside>}
-
         <main className="workspace">
           <div className="workspace-toolbar">
             <div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>{view === 'home' ? 'Home' : view === 'discover' ? 'Discover' : 'Settings'}</strong>{view === 'connections' && <><ChevronRight size={13} /><strong>Connections</strong></>}</div>
             <div className="toolbar-actions">
-              {!leftOpen && view !== 'discover' && <button className="icon-button subtle" onClick={() => setLeftOpen(true)} aria-label="Show explorer"><PanelLeftClose size={16} /></button>}
+              {!leftOpen && view === 'discover' && <button className="icon-button subtle" onClick={() => setLeftOpen(true)} aria-label="Show explorer"><PanelLeftClose size={16} /></button>}
               <span className="toolbar-updated"><span className="live-dot" /> Auto refresh · 15s</span>
               <button className="icon-button subtle" onClick={() => void refresh()} aria-label="Refresh workspace"><RefreshCw size={15} /></button>
               {!rightOpen && <button className="icon-button subtle" onClick={() => setRightOpen(true)} aria-label="Show context panel"><PanelRightClose size={16} /></button>}
@@ -138,21 +126,17 @@ function App() {
           <div className="workspace-scroll">
             {view === 'home'
               ? <HomeView apiOnline={apiOnline} storageReady={storageReady} connectedCount={connectedCount} connections={connections} operations={operations} loading={loading} onConnections={() => setView('connections')} onValidate={(key, action) => void runAction(key, action, 'Connection validation finished.')} onRefresh={() => void refresh()} />
-              : view === 'discover' ? <DiscoverView />
+              : view === 'discover' ? <DiscoverView explorerOpen={leftOpen} explorerWidth={leftWidth} onCollapseExplorer={() => setLeftOpen(false)} onResizeExplorer={resizeExplorer} />
               : <ConnectionsView connections={connections} loading={loading} busy={busy} onSaveDatabricks={(env, profile) => runAction(`save-${env}`, () => api.saveDatabricks(env, profile), `${env.toUpperCase()} profile saved.`)} onValidateDatabricks={(env) => runAction(`validate-${env}`, () => api.validateDatabricks(env), `${env.toUpperCase()} validation finished.`)} onSavePurview={(endpoint, tenant) => runAction('save-purview', () => api.savePurview(endpoint, tenant), 'Purview endpoint saved.')} onValidatePurview={() => runAction('validate-purview', api.validatePurview, 'Purview validation finished.')} onDiscoverPurview={async () => { const result = await api.discoverPurview(); await refresh(); return result }} onSelectPurview={async (id) => { await api.selectPurview(id); await refresh() }} />}
           </div>
           <footer className="statusbar"><div className="statusbar-left"><span className="statusbar-brand"><span className="brand-mini">D</span> Dexter</span><span className="status-sep" /><span className="status-item"><span className={`status-dot ${apiOnline ? 'good' : 'bad'}`} /> API {apiOnline ? 'Online' : 'Offline'}</span><span className="status-item"><span className={`status-dot ${storageReady ? 'good' : 'bad'}`} /> Storage {storageReady ? 'Ready' : 'Unavailable'}</span></div><div className="statusbar-right"><span>Local-first · F3 Unified Explorer</span><span className="status-sep" /><span>v0.1.0</span></div></footer>
         </main>
 
-        {rightOpen && <aside className="context-panel"><div className="panel-heading context-heading"><div><span className="eyebrow">CONTEXT</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Collapse context panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div><div className="context-content"><div className="context-orbit"><div className="orbit-ring ring-one" /><div className="orbit-ring ring-two" /><div className="orbit-core"><Sparkles size={20} /></div><span className="orbit-node node-a" /><span className="orbit-node node-b" /><span className="orbit-node node-c" /></div><div className="context-title">Your workspace,<br /><em>in conversation.</em></div><p>Ask Dexter will help you explore and understand your data assets.</p><div className="phase-lock"><LockKeyhole size={13} /><span>Planned for F4</span></div></div><div className="context-bottom"><div className="context-bottom-title"><span>ACTIVE CONTEXT</span><span className="context-none">NONE</span></div><div className="context-empty"><FileStack size={15} /><span>Select an asset to add context</span></div></div></aside>}
+        {rightOpen && <aside className="context-panel"><div className="panel-heading context-heading"><div><span className="eyebrow">CONTEXT</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Collapse context panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div>{view === 'discover' && discoverContext ? <div className="discover-ask-context"><div className="discover-context-card"><Database size={17} /><div><strong>{discoverContext.name}</strong><small>{discoverContext.qualifiedName}</small><span>{discoverContext.environment.toUpperCase()} context</span></div><button className="icon-button tiny" aria-label="Clear selected context" onClick={() => { setDiscoverContext(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) }}><X size={13} /></button></div><div className="context-quick-actions"><button disabled><Activity size={14} /> Summarize this table</button><button disabled><FileStack size={14} /> Explain the columns</button><button disabled><span>SQL</span> Generate a query</button><button disabled><Layers3 size={14} /> Compare with another table</button></div><div className="phase-lock"><LockKeyhole size={13} /><span>Context actions planned for F4</span></div></div> : <><div className="context-content"><div className="context-orbit"><div className="orbit-ring ring-one" /><div className="orbit-ring ring-two" /><div className="orbit-core"><Sparkles size={20} /></div><span className="orbit-node node-a" /><span className="orbit-node node-b" /><span className="orbit-node node-c" /></div><div className="context-title">Your workspace,<br /><em>in conversation.</em></div><p>Ask Dexter will help you explore and understand your data assets.</p><div className="phase-lock"><LockKeyhole size={13} /><span>Planned for F4</span></div></div><div className="context-bottom"><div className="context-bottom-title"><span>ACTIVE CONTEXT</span><span className="context-none">NONE</span></div><div className="context-empty"><FileStack size={15} /><span>Select an asset to add context</span></div></div></>}</aside>}
       </div>
       {notice && <div className={`toast ${notice.kind}`} role="status">{notice.kind === 'success' ? <CheckCircle2 size={17} /> : <AlertCircle size={17} />}<span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="Dismiss"><X size={14} /></button></div>}
     </div>
   )
-}
-
-function TreeSource({ icon, title, detail, tint, onClick }: { icon: ReactNode; title: string; detail: string; tint: string; onClick?: () => void }) {
-  return <button className="tree-source" onClick={onClick} disabled={!onClick}><span className={`source-icon ${tint}`}>{icon}</span><span className="source-text"><strong>{title}</strong><small>{detail}</small></span><ChevronRight className="tree-chevron" size={14} /></button>
 }
 
 function HomeView({ apiOnline, storageReady, connectedCount, connections, operations, loading, onConnections, onValidate, onRefresh }: { apiOnline: boolean; storageReady: boolean; connectedCount: number; connections: Connections | null; operations: Operation[]; loading: boolean; onConnections: () => void; onValidate: (key: string, action: () => Promise<unknown>) => void; onRefresh: () => void }) {
@@ -217,7 +201,7 @@ function ConnectionsView({ connections, loading, busy, onSaveDatabricks, onValid
     </section>
     <section className="connection-section purview-section"><div className="connection-section-head"><div className="section-emblem blue"><ShieldCheck size={17} /></div><div><h2>Microsoft Purview</h2><p>Reuse Azure CLI authentication, then check token and API compatibility with a read-only request.</p></div><div className="sdk-chip"><span className="azure-mark">A</span> AZURE CLI</div><button className="button secondary small" disabled={busy === 'discover-purview'} onClick={() => { void (async () => { setPurviewDiscoveryMessage('Discovering accessible accounts with Azure CLI…'); try { const result = await onDiscoverPurview(); setPurviewAccounts(result.items); setPurviewAccountId(result.items[0]?.id ?? ''); setPurviewDiscoveryMessage(result.detail) } catch (error) { setPurviewDiscoveryMessage(error instanceof Error ? error.message : 'Purview discovery failed.') } })() }}><Search size={13} /> Discover accounts</button></div>
       {purviewDiscoveryMessage && <div className="connection-detail">{purviewDiscoveryMessage}</div>}{purviewAccounts.length > 1 && <div className="local-filter-row"><select aria-label="Discovered Purview account" value={purviewAccountId} onChange={(event) => setPurviewAccountId(event.target.value)}>{purviewAccounts.map((account) => <option key={account.id} value={account.id}>{account.name} · {account.subscription_id}</option>)}</select><button className="button secondary small" disabled={!purviewAccountId} onClick={() => void onSelectPurview(purviewAccountId)}>Select account</button></div>}
-      <div className="purview-form"><div className="field-block full"><label className="field-label" htmlFor="purview-endpoint">PURVIEW ACCOUNT ENDPOINT</label><div className="input-wrap"><span className="input-prefix"><ExternalLink size={13} /></span><input id="purview-endpoint" type="url" placeholder="https://your-account.purview.azure.com" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} /></div><span className="field-help">HTTPS endpoint for the Purview account data plane.</span></div><div className="field-block"><label className="field-label" htmlFor="purview-tenant">TENANT ID <span>OPTIONAL</span></label><div className="input-wrap"><input id="purview-tenant" placeholder="Use the current Azure CLI tenant" value={tenant} onChange={(event) => setTenant(event.target.value)} /></div></div><div className="field-block"><label className="field-label">AUTHENTICATION SCOPE</label><div className="scope-value"><LockKeyhole size={13} /><code>{connections?.purview.scope ?? 'https://purview.azure.net/.default'}</code></div></div><div className="field-block full api-check"><span className="field-label">READ-ONLY VALIDATION</span><div className="api-path-row"><code>{connections?.purview.api_path ?? '/datamap/api/atlas/v2/types/typedefs/headers'}</code><span>GET</span></div></div></div>
+      <div className="purview-form"><div className="field-block full"><label className="field-label" htmlFor="purview-endpoint">PURVIEW UNIFIED CATALOG API ENDPOINT</label><div className="input-wrap"><span className="input-prefix"><ExternalLink size={13} /></span><input id="purview-endpoint" type="url" placeholder="https://api.purview-service.microsoft.com" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} /></div><span className="field-help">Unified Catalog uses its service endpoint; Azure CLI discovers account resources through ARM and probes this read-only API.</span></div><div className="field-block"><label className="field-label" htmlFor="purview-tenant">TENANT ID <span>OPTIONAL</span></label><div className="input-wrap"><input id="purview-tenant" placeholder="Use the current Azure CLI tenant" value={tenant} onChange={(event) => setTenant(event.target.value)} /></div></div><div className="field-block"><label className="field-label">AUTHENTICATION SCOPE</label><div className="scope-value"><LockKeyhole size={13} /><code>{connections?.purview.scope ?? 'https://purview.azure.net/.default'}</code></div></div><div className="field-block full api-check"><span className="field-label">READ-ONLY VALIDATION</span><div className="api-path-row"><code>{connections?.purview.api_path ?? '/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1'}</code><span>GET</span></div></div></div>
       <div className="purview-status-row"><div className="purview-current"><StatusBadge state={connections?.purview.status ?? 'unavailable'} /><span>{connections?.purview.detail ?? 'Configure an endpoint to begin.'}</span></div><div className="environment-actions"><button className="button primary small" disabled={!endpoint || busy === 'save-purview'} onClick={() => void onSavePurview(endpoint, tenant)}>{busy === 'save-purview' ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />} Save endpoint</button><button className="button secondary small" disabled={!connections?.purview.configured || busy === 'validate-purview'} onClick={() => void onValidatePurview()}>{busy === 'validate-purview' ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={13} />} Validate</button></div></div>
     </section>
     <div className="security-footnote"><div className="security-check"><ShieldCheck size={16} /></div><div><strong>Access follows your identity.</strong><span>Dexter uses the permissions already granted to your Databricks profiles and Azure CLI session. Tokens and secrets are never written to Dexter storage.</span></div><span className="security-help" aria-label="Connection security information"><CircleHelp size={15} /></span></div>

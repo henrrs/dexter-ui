@@ -25,13 +25,18 @@ test('connection screens expose separate DEV/PROD profiles and explain token-loc
 })
 
 test('Unified Discover exposes lazy source browsing and conservative access states', () => {
-  assert.match(app, /view === 'discover' \? <DiscoverView \/>/)
+  assert.match(app, /view === 'discover' \? <DiscoverView explorerOpen=/)
+  assert.doesNotMatch(app, /WORKSPACE<\/span><h2>Explorer/)
   assert.match(api, /discoverChildren/)
   assert.match(api, /discoverDetail/)
   assert.match(discover, /Read access confirmed/)
   assert.match(discover, /Access unknown/)
   assert.match(discover, /Metadata visible · no read access/)
   assert.match(discover, /Metadata sync is lazy/)
+  assert.match(discover, /workbenchTabs/)
+  assert.match(discover, /table-lineage/)
+  assert.match(discover, /Generate Synthetic Data/)
+  assert.match(discover, /states\[environment\] === 'present'/)
 })
 
 test('layout has compact desktop and responsive breakpoints without remote assets', () => {

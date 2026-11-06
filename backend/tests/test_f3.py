@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
 from dexter.catalog.unified import UnifiedDiscoverService, normalize_catalog
-from dexter.adapters.purview import discover_accounts
+from dexter.adapters.purview import discover_accounts, resolve_api_endpoint, validate_endpoint
 from dexter.db.database import migrate
 from dexter.paths import DexterPaths
 from dexter.services.local_data import LocalDataService
@@ -57,6 +57,24 @@ class CatalogCollisionProvider(ProviderFixture):
         return super().children(node_id, force)
 
 
+class MissingProdCatalogProvider(ProviderFixture):
+    def children(self, node_id, force=False):
+        if node_id == "databricks:prod":
+            return {"items": [], "stale": False, "error": None}
+        if node_id == "databricks:dev:aai_dev:core":
+            return {"items": [{"id": "databricks:aai_dev:core:events", "name": "events", "access": "read", "metastore_id": "m1"}], "stale": False, "error": None}
+        if node_id == "databricks:dev:aai_dev":
+            return {"items": [{"id": "databricks:dev:aai_dev:core", "name": "core"}], "stale": False, "error": None}
+        return super().children(node_id, force)
+
+
+class PartialCatalogProvider(ProviderFixture):
+    def children(self, node_id, force=False):
+        if node_id == "databricks:dev":
+            raise RuntimeError("simulated provider outage")
+        return super().children(node_id, force)
+
+
 class UnifiedCatalogTests(unittest.TestCase):
     def test_dev_suffix_normalization_requires_pair_or_explicit_rule(self):
         self.assertEqual(normalize_catalog("aai_dev", {"aai"}), "aai")
@@ -78,7 +96,8 @@ class UnifiedCatalogTests(unittest.TestCase):
             table = service.children(core["id"])["items"][0]
             self.assertEqual({v["environment"] for v in table["variants"]}, {"dev", "prod"})
             self.assertEqual(table["availability"]["dev"], "present")
-            self.assertEqual(table["availability"]["prod"], "restricted")
+            self.assertEqual(table["availability"]["prod"], "present")
+            self.assertEqual(next(v for v in table["variants"] if v["environment"] == "prod")["access"], "restricted")
             detail = service.detail(table["id"], "dev")
             self.assertEqual(detail["workspace"], "https://dev.example")
             self.assertEqual(detail["qualified_name"], "aai_dev.core.events")
@@ -116,6 +135,36 @@ class UnifiedCatalogTests(unittest.TestCase):
             self.assertEqual(len(matches), 2)
             self.assertTrue(all(item["ambiguous"] for item in matches))
             self.assertNotEqual(matches[0]["variants"][0]["catalog"], matches[1]["variants"][0]["catalog"])
+
+    def test_confirmed_absence_is_state_not_a_navigable_variant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
+            paths.ensure(); migrate(paths.database)
+            repo = SettingsRepository(paths.database)
+            repo.put("databricks.dev", {"profile": "DEV"})
+            repo.put("databricks.prod", {"profile": "PROD"})
+            service = UnifiedDiscoverService(MissingProdCatalogProvider(), repo, LocalDataService(paths), paths)
+            catalog = service.catalogs()["items"][0]
+            self.assertEqual(catalog["availability"]["prod"], "absent")
+            self.assertTrue(all(v["environment"] != "checked_absent" for v in catalog["variants"]))
+            schema = service.children(catalog["id"])["items"][0]
+            self.assertEqual(schema["availability"]["prod"], "absent")
+            table = service.children(schema["id"])["items"][0]
+            self.assertEqual(table["availability"]["prod"], "absent")
+            self.assertTrue(all(v["environment"] != "checked_absent" for v in table["variants"]))
+
+    def test_provider_exception_keeps_other_environment_results_and_absence_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
+            paths.ensure(); migrate(paths.database)
+            repo = SettingsRepository(paths.database)
+            repo.put("databricks.dev", {"profile": "DEV"})
+            repo.put("databricks.prod", {"profile": "PROD"})
+            page = UnifiedDiscoverService(PartialCatalogProvider(), repo, LocalDataService(paths), paths).catalogs()
+            self.assertTrue(page["stale"])
+            self.assertIn("could not be loaded", page["error"])
+            self.assertTrue(page["items"])
+            self.assertEqual(page["items"][0]["availability"]["dev"], "unknown")
 
 
 class MaterializationTests(unittest.TestCase):
@@ -226,9 +275,34 @@ class PurviewDiscoveryTests(unittest.TestCase):
         with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
             result = discover_accounts()
         self.assertEqual(result["status"], "connected")
-        self.assertEqual(result["items"][0]["endpoint"], "https://pv.purview.azure.com")
+        self.assertEqual(result["items"][0]["endpoint"], "https://api.purview-service.microsoft.com")
+        self.assertEqual(result["items"][0]["account_endpoint"], "https://pv.purview.azure.com")
+        self.assertEqual(result["items"][0]["api_surface"], "unified_catalog")
+        self.assertIn("includeExtendedProperties=true", calls[-1][0])
         self.assertEqual(calls[0][1], "Bearer " + management)
         self.assertEqual(calls[-1][1], "Bearer " + purview)
+
+    def test_unified_catalog_api_uses_service_host_not_arm_catalog_endpoint(self):
+        self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datagovernance/catalog/dataAssets"), "https://api.purview-service.microsoft.com")
+        self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datamap/api/atlas/v2/search/basic"), "https://pv.purview.azure.com")
+        token = self.token("https://purview.azure.net")
+        credential = SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
+        requests = []
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+        def urlopen(request, timeout=0):
+            requests.append(request.full_url)
+            return Response()
+        azure_module = ModuleType("azure")
+        identity_module = ModuleType("azure.identity")
+        identity_module.AzureCliCredential = lambda tenant_id=None: credential
+        azure_module.identity = identity_module
+        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
+            result = validate_endpoint("https://pv.purview.azure.com/catalog", "tenant-1", "https://purview.azure.net/.default", "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview")
+        self.assertEqual(result["status"], "connected")
+        self.assertTrue(requests[0].startswith("https://api.purview-service.microsoft.com/"))
 
 
 class AnalyticsConfigTests(unittest.TestCase):

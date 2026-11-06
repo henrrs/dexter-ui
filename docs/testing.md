@@ -37,6 +37,14 @@ Run on 2026-11-06 in the supplied workspace:
 
 No real Databricks or Purview calls were made. Live Statement Execution Arrow transfer, delegated Purview API compatibility, account discovery pagination, temporary-link expiry, disk exhaustion, cancellation during a provider stream, and cross-process reader coordination still need integration validation. Remote registry smoke tests are opt-in through `make doctor NETWORK=1`; live connector checks remain explicit.
 
+## Discover correction on 2026-11-06
+
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — passed 43 tests, including confirmed-absence expansion without synthetic child variants, partial provider failures, and Purview surface/endpoint resolution.
+- `node --test scripts/ui-contract.test.mjs` — passed all 6 tests.
+- `npm run build` — TypeScript and Vite production build passed using existing Node dependencies from a neighboring local checkout through a temporary symlink; the symlink was removed after the build.
+- `git diff --check` — passed.
+- No browser screenshot harness or authenticated Azure/Databricks service session was available, so visual screenshot review and live account/API validation remain pending. Purview HTTP behavior and delegated-token routing were verified with local mocks.
+
 ## F3 verification on 2026-11-06
 
 - `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` — passed.

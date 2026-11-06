@@ -180,6 +180,65 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .discover-placeholder .empty-glyph { margin:0 0 2px; width:38px; height:38px; }
 .discover-sync { display:flex; justify-content:space-between; padding:12px 3px; color:#747b79; font:8px var(--mono); }
 .discover-sync .live-dot { width:5px; height:5px; }
+.discover-page { max-width:none; padding:0; }
+.discover-page>.page-intro { display:none; }
+.discover-layout { grid-template-columns:minmax(210px,auto) minmax(0,1fr); gap:0; min-height:calc(100vh - 160px); }
+.discover-layout.explorer-collapsed { grid-template-columns:minmax(0,1fr); }
+.discover-browser { position:relative; min-width:210px; width:252px; min-height:calc(100vh - 160px); border-radius:0; border-top:0; border-bottom:0; border-left:0; }
+.discover-details { min-width:0; min-height:calc(100vh - 160px); border-radius:0; border:0; background:transparent; }
+.discover-explorer-heading { min-height:58px; padding:10px 13px; border-bottom:0; }
+.discover-explorer-heading h2 { margin:3px 0 0; color:#e0e3e0; font:600 16px Manrope,sans-serif; }
+.discover-explorer-actions { display:flex; gap:2px; }
+.discover-controls { display:block; padding:0 10px 10px; border-bottom:1px solid var(--border); }
+.discover-subnav { display:flex; gap:14px; margin:0 0 8px; border-bottom:1px solid #282d2e; }
+.discover-subnav button { display:flex; align-items:center; gap:5px; padding:7px 8px; color:#aeb4b1; background:none; border:0; border-bottom:2px solid transparent; font-size:10px; cursor:pointer; }
+.discover-subnav button.active { color:#e5b83f; border-bottom-color:#e5b83f; }
+.discover-controls .explorer-search { height:33px; }
+.discover-tree { max-height:calc(100vh - 280px); min-height:0; }
+.discover-legend { position:absolute; bottom:0; left:0; right:0; gap:9px; font-size:8px; }
+.tree-object-icon { flex:0 0 14px; color:#e4b42e; }
+.tree-lock { flex:0 0 auto; color:#9a9f9c; }
+.discover-node-name.metadata-only { color:#868c89; }
+.availability-pills button.absent { color:#545a59; border-color:#343a39; background:#171a1a; }
+.availability-pills button.unknown { color:#b09866; border-color:#67552f; background:#201d16; border-style:dashed; }
+.discover-details>.discover-placeholder { min-height:calc(100vh - 230px); }
+.workbench-tabs { display:flex; gap:4px; min-height:44px; padding:5px 10px 0; border-bottom:1px solid var(--border); overflow-x:auto; }
+.workbench-tab { display:flex; align-items:center; max-width:230px; min-width:125px; border:1px solid #323839; border-bottom:0; border-radius:6px 6px 0 0; background:#171a1b; }
+.workbench-tab.active { background:#202425; border-color:#4a5152; }
+.workbench-tab button { display:flex; align-items:center; gap:6px; min-width:0; padding:8px; overflow:hidden; color:#c4cbc7; background:none; border:0; font-size:9px; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.workbench-tab button:first-child { flex:1; }
+.workbench-tab button:last-child { color:#8a918e; }
+.workbench-section-tabs { position:sticky; top:0; z-index:2; display:flex; gap:19px; padding:0 19px; border-bottom:1px solid #303535; background:#131617; }
+.workbench-section-tabs a { padding:12px 0 9px; color:#aeb6b2; text-decoration:none; font-size:10px; }
+.workbench-section-tabs a:first-child { color:#efbc36; border-bottom:2px solid #eab72c; }
+.workbench-overview { display:flex; flex-direction:column; gap:6px; margin:13px 16px 0; padding:13px 15px; border:1px solid #343b3c; border-radius:6px; background:#181c1d; }
+.workbench-overview strong { color:#e4e8e5; font:600 16px Manrope,sans-serif; }
+.workbench-overview>span { color:#909a95; font:9px var(--mono); overflow-wrap:anywhere; }
+.lineage-unavailable { margin:12px 16px; padding-bottom:10px; border:1px solid #303636; border-radius:5px; }
+.lineage-unavailable>span { display:block; padding:4px 20px; color:#858d89; font-size:10px; }
+.discover-operation-cards { margin:14px 16px 20px; border:1px solid #303636; border-radius:6px; background:#171a1b; }
+.discover-operation-cards>.discover-section-title { border-top:0; font-weight:600; font-size:12px; }
+.operation-card-grid { display:grid; grid-template-columns:repeat(4,minmax(125px,1fr)); gap:8px; padding:0 10px 10px; }
+.operation-card { position:relative; display:flex; min-height:105px; flex-direction:column; align-items:flex-start; gap:7px; padding:11px; text-align:left; color:#e1e4e2; background:#1d2223; border:1px solid #434b4c; border-radius:6px; }
+.operation-card svg { color:#e5b52d; }
+.operation-card strong { font-size:11px; }
+.operation-card span { color:#a1a8a4; font-size:9px; line-height:1.4; }
+.operation-card b { position:absolute; top:11px; right:11px; color:#e7b931; }
+.operation-card:disabled { opacity:.63; cursor:not-allowed; }
+.operation-card.make-local-action { border-color:#9d7414; background:linear-gradient(130deg,#403514,#24231d); }
+.discover-ask-context { display:flex; flex-direction:column; gap:16px; padding:14px; }
+.discover-context-card { display:flex; align-items:center; gap:9px; padding:10px; border:1px solid #444d4e; border-radius:6px; background:#1b2021; }
+.discover-context-card>svg { color:#e6b52d; }
+.discover-context-card>div { flex:1; min-width:0; display:flex; flex-direction:column; gap:4px; }
+.discover-context-card strong,.discover-context-card small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.discover-context-card strong { color:#e3e7e4; font-size:10px; }
+.discover-context-card small { color:#929b96; font:8px var(--mono); }
+.discover-context-card span { color:#7ea88c; font:8px var(--mono); text-transform:uppercase; }
+.context-quick-actions { display:grid; gap:6px; }
+.context-quick-actions button { display:flex; align-items:center; gap:8px; min-height:35px; padding:8px 10px; text-align:left; color:#b5bdb9; border:1px solid #3d4546; border-radius:5px; background:#1b2021; font-size:10px; }
+.context-quick-actions button:disabled { opacity:.72; }
+.context-quick-actions button span { padding:2px 4px; border:1px solid #707777; border-radius:3px; font:8px var(--mono); }
+@media (max-width:1100px) { .operation-card-grid { grid-template-columns:repeat(2,minmax(125px,1fr)); } }
 @media (max-width:900px) { .discover-layout { grid-template-columns:1fr; } .discover-browser,.discover-details { min-height:420px; } .discover-tree { max-height:460px; } }
 .workspace { flex:1; min-width:360px; display:flex; flex-direction:column; background:radial-gradient(ellipse at 45% 0%, #211f19 0%, transparent 26%), #111315; }
 .workspace-toolbar { min-height:40px; padding:0 19px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #242728; }

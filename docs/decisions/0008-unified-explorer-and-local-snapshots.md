@@ -13,7 +13,7 @@
 
 ## Purview discovery and identity
 
-Azure CLI supplies one ARM token for subscription/account listing and a separate token for the Purview API audience. Dexter validates both audiences and probes the delegated Unified Catalog endpoint. A sole compatible account is selected; multiple accounts are returned for an explicit selection. Only resource IDs, tenant/subscription references, endpoint, and display name are stored. There is no token persistence or service-principal fallback. Unsupported delegated access leaves the integration unavailable and reports a safe diagnosis.
+Azure CLI supplies one ARM token for subscription/account listing and a separate token for the Purview API audience. Dexter validates both audiences and probes the delegated Unified Catalog endpoint at Microsoft's documented service root (`https://api.purview-service.microsoft.com`), not by appending the Unified Catalog route to the ARM account `catalog` endpoint. A sole compatible account is selected; multiple accounts are returned for an explicit selection. Only resource IDs, tenant/subscription references, service endpoint, and display name are stored. There is no token persistence or service-principal fallback. Unsupported delegated access leaves the integration unavailable and reports a safe diagnosis.
 
 ## Make Local and storage
 
@@ -26,4 +26,4 @@ Azure CLI supplies one ARM token for subscription/account listing and a separate
 
 ## Consequences and limitations
 
-The discovery cache remains provider-scoped and TTL-based so this tree can reuse F2 pages without invalidating or reloading all remote catalogs. The table-level permission signal still relies on Unity Catalog `browse_only`; a future adapter can add effective `SELECT` permission checks. Purview Unified Catalog is preview and delegated compatibility varies by tenant. No live Azure or Databricks transfer was available in the local validation environment; the API payload/stream contract is covered with local fixtures, but a real workspace run remains an integration check.
+The discovery cache remains provider-scoped and TTL-based so this tree can reuse F2 pages without invalidating or reloading all remote catalogs. Confirmed absence is a per-environment availability map on the opaque logical node ID; only physical provider results live in `variants`, avoiding the `KeyError: 'node_id'` during child expansion. L/D/P indicate known existence only; read restrictions are a separate access/lock state. The table-level permission signal still relies on Unity Catalog `browse_only`; a future adapter can add effective `SELECT` permission checks. Purview Unified Catalog is preview and delegated compatibility varies by tenant. No live Azure or Databricks transfer was available in the local validation environment; the API payload/stream contract is covered with local fixtures, but a real workspace run remains an integration check.
