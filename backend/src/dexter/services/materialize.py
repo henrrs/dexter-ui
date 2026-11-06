@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 import random
 import shutil
@@ -48,6 +49,36 @@ def _link_for_chunk(links, chunk_index: int, fallback_index: int):
     return None
 
 
+def _transfer_failure_reason(exc: Exception) -> str:
+    """Return a small, safe diagnostic category; never include signed URLs or raw errors."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, http.client.IncompleteRead):
+        return "incomplete_chunk"
+    if isinstance(exc, http.client.HTTPException):
+        return "http_stream_error"
+    if isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout):
+        if "incomplete result chunk" in str(exc).lower():
+            return "incomplete_chunk"
+        return "read_timeout"
+    if isinstance(exc, ssl.SSLError):
+        return "tls_error"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, socket.gaierror):
+        return "dns_resolution_failed"
+    if isinstance(reason, ssl.SSLError):
+        return "tls_error"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "read_timeout"
+    if isinstance(reason, ConnectionResetError):
+        return "connection_reset"
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(exc, (urllib.error.URLError, ConnectionError)):
+        return "network_error"
+    return type(exc).__name__.lower()
+
+
 def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, link_index: int,
                            initial_link, staging, operations, operation_id: str,
                            minimum_free: int) -> str:
@@ -58,6 +89,8 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
     for attempt in range(CHUNK_RETRY_ATTEMPTS):
         last_error = None
         succeeded = False
+        downloaded_bytes = 0
+        started_at = time.monotonic()
         url = _get(current_link, "external_link") or _get(current_link, "url")
         if not isinstance(url, str):
             raise RuntimeError("Databricks returned an invalid temporary result link")
@@ -126,7 +159,11 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
         except urllib.error.HTTPError as exc:
             last_error = exc
             if exc.code not in {401, 403, 404, 408, 429, 500, 502, 503, 504}:
+                operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer stopped: http_{exc.code}", "error")
                 raise RuntimeError(f"Databricks rejected result chunk download (HTTP {exc.code})") from None
+        except http.client.IncompleteRead as exc:
+            downloaded_bytes += len(exc.partial or b"")
+            last_error = exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError, ConnectionError) as exc:
             last_error = exc
         except OSError as exc:
@@ -142,8 +179,7 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                     pass
                 result_path = None
 
-        if attempt + 1 >= CHUNK_RETRY_ATTEMPTS:
-            break
+        link_renewed = False
         if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {401, 403, 404}:
             try:
                 refreshed = workspace.api_client.do(
@@ -154,13 +190,25 @@ def _download_result_chunk(*, workspace, statement_id: str, chunk_index: int, li
                 if renewed_link is None:
                     raise TimeoutError("Databricks result link expired and could not be renewed")
                 current_link = renewed_link
+                link_renewed = True
             except Exception as exc:
                 last_error = exc
-        operations.log(operation_id, f"Databricks result chunk transfer failed; retrying ({attempt + 2}/{CHUNK_RETRY_ATTEMPTS})", "warning")
+        reason = _transfer_failure_reason(last_error)
+        elapsed = time.monotonic() - started_at
+        if attempt + 1 >= CHUNK_RETRY_ATTEMPTS:
+            operations.log(operation_id, f"Result chunk {chunk_index + 1} failed after {attempt + 1}/{CHUNK_RETRY_ATTEMPTS} attempts: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "error")
+            break
+        operations.log(operation_id, f"Result chunk {chunk_index + 1} transfer retry {attempt + 2}/{CHUNK_RETRY_ATTEMPTS}: reason={reason}, http_status={getattr(last_error, 'code', 'none')}, bytes_received={downloaded_bytes}, elapsed_seconds={elapsed:.1f}, signed_link_renewed={str(link_renewed).lower()}", "warning")
         delay = min(4.0, 0.25 * (2 ** attempt) + random.uniform(0.0, 0.25))
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in {429, 503}:
+            try:
+                retry_after = float(last_error.headers.get("Retry-After", ""))
+                delay = min(30.0, max(delay, retry_after))
+            except (TypeError, ValueError):
+                pass
         time.sleep(delay)
 
-    raise TimeoutError("Databricks result chunk download timed out or its signed URL expired after retries") from last_error
+    raise TimeoutError(f"Databricks result chunk failed after {CHUNK_RETRY_ATTEMPTS} attempts: {_transfer_failure_reason(last_error)}") from last_error
 
 
 def build_select(catalog: str, schema: str, table: str, columns: list[str], filters: list[dict], known_columns: set[str]) -> tuple[str, list]:
@@ -370,6 +418,30 @@ def _safe_error(exc: Exception) -> str:
     if isinstance(exc, PermissionError) or status == 403 or "permissiondenied" in name: return "The selected identity is not authorized to read this table."
     if status == 401 or "unauthenticated" in name: return "Authentication for the selected local profile failed."
     if isinstance(exc, TimeoutError):
+        if "result chunk failed after" in message:
+            reason = message.rsplit(":", 1)[-1].strip()
+            if reason == "read_timeout":
+                return "The Databricks result transfer repeatedly stalled for over 120 seconds; see operation logs for bytes received per attempt."
+            if reason == "incomplete_chunk":
+                return "The Databricks result chunk repeatedly arrived with fewer bytes than declared."
+            if reason == "http_stream_error":
+                return "The Databricks result stream was interrupted or malformed on all four attempts."
+            if reason.startswith("http_401") or reason.startswith("http_403") or reason.startswith("http_404"):
+                status = reason.removeprefix("http_")
+                return f"The temporary Databricks result link was rejected after renewal attempts (HTTP {status})."
+            if reason == "http_429":
+                return "Databricks throttled result downloads on all four attempts (HTTP 429)."
+            if reason.startswith("http_5"):
+                return "The Databricks result service returned server errors on all four attempts."
+            if reason == "dns_resolution_failed":
+                return "The host serving the Databricks result could not be resolved."
+            if reason == "tls_error":
+                return "TLS validation failed while downloading the Databricks result; check the local proxy or certificate configuration."
+            if reason == "connection_reset":
+                return "The connection to the Databricks result service was repeatedly reset."
+            if reason == "connection_refused":
+                return "The connection to the Databricks result service was refused."
+            return f"The Databricks result transfer failed on all four attempts ({reason}). See operation logs for details."
         if "result chunk" in message or "result link" in message:
             return "Downloading a Databricks result chunk timed out or its signed link expired after four attempts."
         if "48-hour" in message:
