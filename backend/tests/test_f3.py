@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
 from dexter.catalog.unified import UnifiedDiscoverService, normalize_catalog
-from dexter.adapters.purview import _is_supported_account_host, discover_accounts, resolve_api_endpoint, validate_endpoint
+from dexter.adapters.purview import discover_accounts
 from dexter.db.database import migrate
 from dexter.paths import DexterPaths
 from dexter.services.local_data import LocalDataService
@@ -242,167 +242,61 @@ class MaterializationTests(unittest.TestCase):
 
 
 class PurviewDiscoveryTests(unittest.TestCase):
-    @staticmethod
-    def token(audience: str) -> str:
-        payload = base64.urlsafe_b64encode(json.dumps({"aud": audience, "tid": "tenant-1"}).encode()).decode().rstrip("=")
+    tenant_id = "cf56e405-d2b0-4266-b210-aa04636b6161"
+
+    @classmethod
+    def token(cls, audience: str = "https://purview.azure.net", tenant: str | None = None) -> str:
+        payload = base64.urlsafe_b64encode(json.dumps({"aud": audience, "tid": tenant or cls.tenant_id}).encode()).decode().rstrip("=")
         return "header." + payload + ".signature"
 
-    def test_account_discovery_uses_arm_and_purview_cli_audiences_separately(self):
-        management = self.token("https://management.azure.com/")
-        purview = self.token("https://purview.azure.net")
-        credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=management if scope.startswith("https://management") else purview))
+    def run_discovery(self, token: str, response=None):
         calls = []
-
+        credential = SimpleNamespace(get_token=lambda scope: (calls.append(("token", scope)), SimpleNamespace(token=token))[1])
         class Response:
             status = 200
-            def __init__(self, payload): self.payload = payload
             def __enter__(self): return self
             def __exit__(self, *_args): return None
-            def read(self): return json.dumps(self.payload).encode()
-
         def urlopen(request, timeout=0):
-            url = request.full_url
-            calls.append((url, request.get_header("Authorization")))
-            if "/subscriptions?" in url:
-                return Response({"value": [{"subscriptionId": "sub-1"}]})
-            if "/providers/Microsoft.Purview/accounts?" in url:
-                return Response({"value": [{"id": "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Purview/accounts/pv", "name": "pv", "properties": {"endpoints": {"catalog": "https://pv.purview.azure.com"}}}]})
-            return Response({"value": []})
-
+            calls.append(("request", request, timeout))
+            if isinstance(response, Exception): raise response
+            return response or Response()
         azure_module = ModuleType("azure")
         identity_module = ModuleType("azure.identity")
         identity_module.AzureCliCredential = lambda: credential
         azure_module.identity = identity_module
         with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
             result = discover_accounts()
+        return result, calls
+
+    def test_discovery_uses_tenant_from_cli_token_and_only_gets_unified_catalog(self):
+        result, calls = self.run_discovery(self.token())
         self.assertEqual(result["status"], "connected")
-        self.assertEqual(result["items"][0]["endpoint"], "https://api.purview-service.microsoft.com")
-        self.assertEqual(result["items"][0]["account_endpoint"], "https://pv.purview.azure.com")
-        self.assertEqual(result["items"][0]["api_surface"], "unified_catalog")
-        self.assertIn("includeExtendedProperties=true", calls[-1][0])
-        self.assertEqual(calls[0][1], "Bearer " + management)
-        self.assertEqual(calls[-1][1], "Bearer " + purview)
+        self.assertEqual(result["tenant_id"], self.tenant_id)
+        self.assertEqual(result["endpoint"], f"https://{self.tenant_id}-api.purview-service.microsoft.com")
+        self.assertEqual(result["api_surface"], "unified_catalog")
+        self.assertEqual(len(calls), 2)
+        scope = calls[0][1]
+        request = calls[1][1]
+        self.assertEqual(scope, "https://purview.azure.net/.default")
+        self.assertEqual(request.get_method(), "GET")
+        self.assertTrue(request.full_url.startswith(result["endpoint"] + "/datagovernance/catalog/dataAssets?"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + self.token())
+        self.assertEqual(calls[1][2], 12)
 
-    def test_account_specific_purview_service_host_is_kept_and_probed(self):
-        management = self.token("https://management.azure.com/")
-        purview = self.token("https://purview.azure.net")
-        credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=management if scope.startswith("https://management") else purview))
-        account_endpoint = "https://cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com/catalog"
-        calls = []
+    def test_invalid_token_audience_does_not_call_unified_catalog(self):
+        result, calls = self.run_discovery(self.token("https://management.azure.com/"))
+        self.assertEqual(result["category"], "authentication")
+        self.assertEqual(result["status"], "expired")
+        self.assertEqual(len(calls), 1)
 
-        class Response:
-            status = 200
-            def __init__(self, payload): self.payload = payload
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-            def read(self): return json.dumps(self.payload).encode()
-
-        def urlopen(request, timeout=0):
-            url = request.full_url
-            calls.append(url)
-            if "/subscriptions?" in url: return Response({"value": [{"subscriptionId": "sub-1"}]})
-            if "/providers/Microsoft.Purview/accounts?" in url:
-                return Response({"value": [{"id": "account-id", "name": "xpi-prd-datagovernance-pview", "properties": {"provisioningState": "Succeeded", "endpoints": {"catalog": account_endpoint}}}]})
-            if url.startswith("https://cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com/datagovernance/catalog/dataAssets?"):
-                return Response({"value": []})
-            raise AssertionError(f"Unexpected Purview probe: {url}")
-
-        azure_module = ModuleType("azure")
-        identity_module = ModuleType("azure.identity")
-        identity_module.AzureCliCredential = lambda: credential
-        azure_module.identity = identity_module
-        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
-            result = discover_accounts()
-        self.assertEqual(result["status"], "connected")
-        self.assertEqual(result["accounts"][0]["name"], "xpi-prd-datagovernance-pview")
-        self.assertEqual(result["items"][0]["endpoint"], account_endpoint.removesuffix("/catalog"))
-        self.assertTrue(any(url.startswith(result["items"][0]["endpoint"] + "/datagovernance/catalog/dataAssets?") for url in calls))
-
-    def test_unified_catalog_api_uses_service_host_not_arm_catalog_endpoint(self):
-        tenant_api_host = "cf56e405-d2b0-4266-b210-aa04636b6161-api.purview-service.microsoft.com"
-        self.assertTrue(_is_supported_account_host(tenant_api_host))
-        self.assertFalse(_is_supported_account_host("untrusted-api.purview-service.microsoft.com"))
-        self.assertFalse(_is_supported_account_host("purview-service.microsoft.com"))
-        self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datagovernance/catalog/dataAssets"), "https://api.purview-service.microsoft.com")
-        self.assertEqual(resolve_api_endpoint(f"https://{tenant_api_host}/catalog", "/datagovernance/catalog/dataAssets"), f"https://{tenant_api_host}")
-        self.assertEqual(resolve_api_endpoint("https://pv.purview.azure.com/catalog", "/datamap/api/atlas/v2/search/basic"), "https://pv.purview.azure.com")
-        token = self.token("https://purview.azure.net")
-        credential = SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
-        requests = []
-        class Response:
-            status = 200
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-        def urlopen(request, timeout=0):
-            requests.append(request.full_url)
-            return Response()
-        azure_module = ModuleType("azure")
-        identity_module = ModuleType("azure.identity")
-        identity_module.AzureCliCredential = lambda tenant_id=None: credential
-        azure_module.identity = identity_module
-        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
-            result = validate_endpoint("https://pv.purview.azure.com/catalog", "tenant-1", "https://purview.azure.net/.default", "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview")
-        self.assertEqual(result["status"], "connected")
-        self.assertTrue(requests[0].startswith("https://api.purview-service.microsoft.com/"))
-
-    def test_discovery_keeps_arm_account_and_falls_back_to_read_only_data_map_search(self):
-        management = self.token("https://management.azure.com/")
-        purview = self.token("https://purview.azure.net")
-        credential = SimpleNamespace(get_token=lambda scope: SimpleNamespace(token=management if scope.startswith("https://management") else purview))
-        calls = []
-
-        class Response:
-            status = 200
-            def __init__(self, payload=None): self.payload = payload or {}
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-            def read(self): return json.dumps(self.payload).encode()
-
-        def urlopen(request, timeout=0):
-            calls.append(request)
-            url = request.full_url
-            if "/subscriptions?" in url: return Response({"value": [{"subscriptionId": "sub-1"}]})
-            if "/providers/Microsoft.Purview/accounts?" in url:
-                return Response({"value": [{"id": "account-id", "name": "pv", "properties": {"endpoints": {"catalog": "https://pv.purview.azure.com/catalog"}}}]})
-            if "api.purview-service.microsoft.com" in url:
-                raise urllib.error.HTTPError(url, 403, "forbidden", {}, None)
-            return Response({"value": []})
-
-        azure_module = ModuleType("azure")
-        identity_module = ModuleType("azure.identity")
-        identity_module.AzureCliCredential = lambda: credential
-        azure_module.identity = identity_module
-        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
-            result = discover_accounts()
-        self.assertEqual(result["status"], "connected")
-        self.assertEqual(result["accounts"][0]["api_surface"], "data_map")
-        self.assertEqual(result["items"][0]["endpoint"], "https://pv.purview.azure.com")
-        query = calls[-1]
-        self.assertEqual(query.get_method(), "POST")
-        self.assertIn("/datamap/api/search/query?api-version=2023-09-01", query.full_url)
-        self.assertNotIn("/catalog/datamap", query.full_url)
-        self.assertEqual(json.loads(query.data), {"keywords": None, "limit": 1})
-
-    def test_data_map_validation_is_a_delegated_read_only_search_request(self):
-        token = self.token("https://purview.azure.net")
-        credential = SimpleNamespace(get_token=lambda _scope: SimpleNamespace(token=token))
-        requests = []
-        class Response:
-            status = 200
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-        def urlopen(request, timeout=0):
-            requests.append(request)
-            return Response()
-        azure_module = ModuleType("azure")
-        identity_module = ModuleType("azure.identity")
-        identity_module.AzureCliCredential = lambda tenant_id=None: credential
-        azure_module.identity = identity_module
-        with patch.dict(sys.modules, {"azure": azure_module, "azure.identity": identity_module}), patch("dexter.adapters.purview.urllib.request.urlopen", side_effect=urlopen):
-            result = validate_endpoint("https://pv.purview.azure.com/catalog", "tenant-1", "https://purview.azure.net/.default", "/datamap/api/search/query?api-version=2023-09-01")
-        self.assertEqual(result["status"], "connected")
-        self.assertEqual(requests[0].get_method(), "POST")
-        self.assertEqual(requests[0].full_url, "https://pv.purview.azure.com/datamap/api/search/query?api-version=2023-09-01")
+    def test_forbidden_not_found_and_connection_failures_have_diagnostics(self):
+        for code, status, category in ((401, "expired", "authentication"), (403, "no_permission", "authorization"), (404, "error", "endpoint")):
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError("https://purview.invalid", code, "error", {}, None)
+                result, _calls = self.run_discovery(self.token(), error)
+                self.assertEqual((result["status"], result["category"]), (status, category))
+        result, _calls = self.run_discovery(self.token(), urllib.error.URLError("network unreachable"))
+        self.assertEqual((result["status"], result["category"]), ("unavailable", "connectivity"))
 
 
 class AnalyticsConfigTests(unittest.TestCase):

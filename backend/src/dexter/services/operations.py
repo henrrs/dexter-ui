@@ -128,6 +128,10 @@ class SettingsRepository:
         with transaction(self.db_path) as conn:
             conn.execute("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (key, json.dumps(value, separators=(",", ":")), now()))
 
+    def delete(self, key: str) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute("DELETE FROM settings WHERE key=?", (key,))
+
     def get_check(self, key: str) -> dict | None:
         with transaction(self.db_path) as conn:
             row = conn.execute("SELECT * FROM connection_checks WHERE key=?", (key,)).fetchone()

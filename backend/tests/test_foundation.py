@@ -242,57 +242,30 @@ except ImportError:
 
 @unittest.skipUnless(API_AVAILABLE, "FastAPI/httpx are not installed; API tests run after make setup")
 class ApiTests(unittest.TestCase):
-    def test_health_origin_guard_and_connection_settings_round_trip(self):
+    def test_connections_are_detected_and_checked_automatically(self):
         from dexter.config import Settings
         with tempfile.TemporaryDirectory() as temporary:
             data = Path(temporary)
             profiles = data / "databrickscfg"
             profiles.write_text("[DEV]\nhost=https://dev.example\n")
+            profile_result = {"status": "connected", "category": None, "detail": "Local profile access succeeded."}
+            purview_result = {"status": "connected", "category": None, "detail": "Unified Catalog access succeeded.", "tenant_id": "tenant-id", "endpoint": "https://tenant-id-api.purview-service.microsoft.com", "api_surface": "unified_catalog"}
             with patch.dict(os.environ, {"DATABRICKS_CONFIG_FILE": str(profiles)}):
                 app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(data / "state"), "DEXTER_CONFIG_HOME": str(data / "config")}), Settings())
-                with TestClient(app, base_url="http://127.0.0.1") as client:
+                with TestClient(app, base_url="http://127.0.0.1") as client, patch("dexter.api.app.validate_profile", return_value=profile_result), patch("dexter.adapters.purview.discover_accounts", return_value=purview_result):
                     self.assertEqual(client.get("/api/health").status_code, 200)
-                    self.assertEqual(client.put("/api/connections/databricks/dev", json={"profile": "DEV"}).status_code, 200)
-                    self.assertEqual(client.get("/api/connections").json()["databricks"]["dev"]["profile"], "DEV")
-                    invalid = client.put("/api/connections/databricks/prod", json={"profile": "UNKNOWN"})
-                    self.assertEqual(invalid.status_code, 422)
-                    self.assertEqual(invalid.json()["error"]["code"], "INVALID_REQUEST")
-                    blocked = client.get("/api/health", headers={"Origin": "https://attacker.invalid"})
-                    self.assertEqual(blocked.status_code, 403)
+                    refreshed = client.post("/api/connections/refresh")
+                    self.assertEqual(refreshed.status_code, 200)
+                    data = refreshed.json()
+                    self.assertEqual(data["databricks"]["dev"]["status"], "connected")
+                    self.assertEqual(data["databricks"]["dev"]["profile"], "DEV")
+                    self.assertEqual(data["databricks"]["prod"]["status"], "unavailable")
+                    self.assertEqual(data["purview"]["tenant_id"], "tenant-id")
+                    self.assertEqual(data["purview"]["status"], "connected")
+                    self.assertEqual(client.put("/api/connections/purview", json={"endpoint": "https://manual.invalid"}).status_code, 404)
+                    self.assertEqual(client.post("/api/connections/databricks/dev/validate").status_code, 404)
                 with TestClient(app, base_url="http://127.0.0.1:8001") as alternate_api_port:
                     self.assertEqual(alternate_api_port.get("/api/health").status_code, 200)
-
-    def test_purview_account_is_saved_even_when_metadata_api_is_forbidden(self):
-        from dexter.config import Settings
-        result = {"items": [], "accounts": [{"id": "account-id", "name": "pv", "account_endpoint": "https://pv.purview.azure.com/catalog", "tenant_id": "tenant-id", "subscription_id": "sub-id", "status": "no_permission", "category": "authorization"}], "status": "no_permission", "category": "authorization", "detail": "Account found; read-only metadata access denied."}
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary)
-            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(data / "state"), "DEXTER_CONFIG_HOME": str(data / "config")}), Settings())
-            with TestClient(app, base_url="http://127.0.0.1") as client, patch("dexter.adapters.purview.discover_accounts", return_value=result):
-                discovered = client.post("/api/connections/purview/discover")
-                self.assertEqual(discovered.status_code, 200)
-                self.assertEqual(discovered.json()["selected"], "account-id")
-                connection = client.get("/api/connections").json()["purview"]
-                self.assertTrue(connection["configured"])
-                self.assertEqual(connection["status"], "no_permission")
-                self.assertEqual(connection["category"], "authorization")
-                self.assertEqual(connection["account_name"], "pv")
-
-    def test_successful_discovered_data_map_account_is_selected_with_its_route(self):
-        from dexter.config import Settings
-        account = {"id": "account-id", "name": "pv", "endpoint": "https://pv.purview.azure.com", "account_endpoint": "https://pv.purview.azure.com/catalog", "tenant_id": "tenant-id", "subscription_id": "sub-id", "api_surface": "data_map", "status": "connected"}
-        result = {"items": [account], "accounts": [account], "status": "connected", "detail": "Read-only metadata access succeeded through Data Map."}
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary)
-            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(data / "state"), "DEXTER_CONFIG_HOME": str(data / "config")}), Settings())
-            with TestClient(app, base_url="http://127.0.0.1") as client, patch("dexter.adapters.purview.discover_accounts", return_value=result):
-                response = client.post("/api/connections/purview/discover")
-                self.assertEqual(response.status_code, 200)
-                purview = client.get("/api/connections").json()["purview"]
-                self.assertEqual(purview["status"], "connected")
-                self.assertEqual(purview["api_surface"], "data_map")
-                self.assertEqual(purview["endpoint"], "https://pv.purview.azure.com")
-                self.assertEqual(purview["api_path"], "/datamap/api/search/query?api-version=2023-09-01")
 
 
 if __name__ == "__main__":

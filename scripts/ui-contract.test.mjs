@@ -8,21 +8,17 @@ const api = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8')
 const discover = await readFile(new URL('../src/DiscoverView.tsx', import.meta.url), 'utf8')
 const vite = await readFile(new URL('../vite.config.ts', import.meta.url), 'utf8')
 
-test('platform shell exposes F1 navigation and links connection controls to the local API', () => {
+test('platform shell uses automatic local authentication without a settings screen', () => {
   assert.match(app, /Home/)
   assert.match(app, /Discover/)
   assert.match(app, /Planned for F4/)
-  assert.match(app, /Configure connections/)
-  assert.match(api, /\/connections\/databricks\/\$\{environment\}\/validate/)
-  assert.match(api, /\/connections\/purview\/validate/)
+  assert.match(app, /Detect local access/)
+  assert.match(app, /onRefreshConnections/)
+  assert.match(api, /\/connections\/refresh/)
+  assert.doesNotMatch(app, /Settings|Configure connections|Manage connections/)
+  assert.doesNotMatch(api, /saveDatabricks|savePurview|discoverPurview|selectPurview|validateDatabricks|validatePurview/)
 })
 
-test('connection screens expose separate DEV/PROD profiles and explain token-locality', () => {
-  assert.match(app, /databricks\.dev/)
-  assert.match(app, /databricks\.prod/)
-  assert.match(app, /Credentials remain in your host session/)
-  assert.match(app, /READ-ONLY VALIDATION/)
-})
 
 test('Unified Discover exposes lazy source browsing and conservative access states', () => {
   assert.match(app, /<DiscoverView active=\{view === 'discover'\} explorerOpen=/)
@@ -69,5 +65,5 @@ test('F3 exposes the logical catalog and local snapshot workbench', () => {
   assert.match(discover, /FULL SNAPSHOT/)
   assert.match(discover, /Query Local/)
   assert.match(discover, /Preview first 100 rows/)
-  assert.match(app, /Discover accounts/)
+  assert.doesNotMatch(app, /Discover accounts/)
 })

@@ -20,7 +20,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from dexter.adapters.databricks import discover_profiles, validate_profile
-from dexter.adapters.purview import validate_configuration, validate_endpoint
 from dexter.config import Settings
 from dexter.catalog.discovery import DiscoverService
 from dexter.catalog.unified import UnifiedDiscoverService, _variants
@@ -78,22 +77,6 @@ class LocalOriginGuard:
         await self.app(scope, receive, send)
 
 
-class DatabricksConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    profile: str = Field(min_length=1, max_length=120)
-
-
-class PurviewConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    endpoint: str = Field(min_length=9, max_length=512)
-    tenant_id: str | None = Field(default=None, max_length=256)
-
-
-class PurviewAccountSelection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    account_id: str = Field(min_length=1, max_length=512)
-
-
 class MakeLocalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     warehouse_id: str = Field(min_length=1, max_length=160)
@@ -128,7 +111,7 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
             "workspace": None,
             "status": check["status"] if check else ("configured" if config else "unavailable"),
             "category": check["category"] if check else None,
-            "detail": check["detail"] if check else ("Select a local profile to configure this environment." if not config else "Profile configured. Validate the connection to check access."),
+            "detail": check["detail"] if check else ("No unambiguous local Databricks profile was detected." if not config else "Local profile detected; access has not been checked yet."),
             "checked_at": check["checked_at"] if check else None,
         }
     for env_name in ("dev", "prod"):
@@ -150,7 +133,7 @@ def _connections(repo: SettingsRepository, settings: Settings) -> dict:
         "api_path": "/datamap/api/search/query?api-version=2023-09-01" if purview and purview.get("api_surface") == "data_map" else settings.purview_api_path,
         "status": check["status"] if check else ("configured" if purview else "unavailable"),
         "category": check["category"] if check else None,
-        "detail": check["detail"] if check else ("Configure a Purview endpoint to enable read-only validation." if not purview else "Endpoint configured. Validate to check Azure CLI authentication and access."),
+        "detail": check["detail"] if check else ("Checking the current Azure CLI tenant automatically." if not purview else "Tenant endpoint detected; access has not been checked yet."),
         "checked_at": check["checked_at"] if check else None,
     }
     return result
@@ -179,7 +162,7 @@ def _autoconfigure_profiles(repo: SettingsRepository, profiles: list[str]) -> No
         for env, markers in (("dev", ("dev", "development")), ("prod", ("prod", "production"))):
             in_name = any(marker in name for marker in markers)
             in_host = any(marker in hostname.lower() for marker in markers)
-            if in_name and in_host:
+            if in_name or in_host:
                 matches[env].append(profile)
     selected = {env: items[0] for env, items in matches.items() if len(items) == 1}
     if len(set(selected.values())) != len(selected):
@@ -187,9 +170,9 @@ def _autoconfigure_profiles(repo: SettingsRepository, profiles: list[str]) -> No
     for env, profile in selected.items():
         key = f"databricks.{env}"
         existing = repo.get(key)
-        if existing is None:
+        if existing is None or existing.get("profile") != profile:
             repo.put(key, {"profile": profile})
-            repo.put_check(key, "configured", None, "Automatically selected from matching local profile and workspace host labels. Validate to confirm access.")
+            repo.put_check(key, "configured", None, "Automatically selected from matching local profile and workspace host labels.")
 
 
 def create_app(paths: DexterPaths | None = None, settings: Settings | None = None) -> FastAPI:
@@ -246,6 +229,28 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     @app.get("/api/connections")
     def get_connections():
+        return _connections(settings_repo, settings)
+
+    @app.post("/api/connections/refresh")
+    def refresh_connections():
+        profiles, _ = discover_profiles()
+        _autoconfigure_profiles(settings_repo, profiles)
+        for environment in ("dev", "prod"):
+            key = f"databricks.{environment}"
+            config = settings_repo.get(key)
+            if config:
+                result = validate_profile(config["profile"])
+            else:
+                result = {"status": "unavailable", "category": "configuration", "detail": f"No unambiguous local Databricks {environment.upper()} profile was detected."}
+            settings_repo.put_check(key, result["status"], result.get("category"), result["detail"])
+
+        from dexter.adapters.purview import discover_accounts
+        purview = discover_accounts(settings.purview_scope, settings.purview_api_path)
+        if purview.get("tenant_id") and purview.get("endpoint"):
+            settings_repo.put("purview", {"endpoint": purview["endpoint"], "tenant_id": purview["tenant_id"], "api_surface": "unified_catalog"})
+        else:
+            settings_repo.delete("purview")
+        settings_repo.put_check("purview", purview["status"], purview.get("category"), purview["detail"])
         return _connections(settings_repo, settings)
 
     @app.get("/api/discover/sources")
@@ -425,81 +430,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(404, detail="Local dataset not found")
         return {"deleted": True, "dataset_id": dataset_id}
 
-    @app.put("/api/connections/databricks/{environment}")
-    def save_databricks(environment: str, body: DatabricksConfig):
-        if environment not in {"dev", "prod"}:
-            raise HTTPException(404, detail="Unknown Databricks environment")
-        profiles, _ = discover_profiles()
-        if body.profile not in profiles:
-            raise HTTPException(422, detail="Select a profile found in the local Databricks configuration file")
-        key = f"databricks.{environment}"
-        previous = settings_repo.get(key)
-        settings_repo.put(key, {"profile": body.profile})
-        if not previous or previous.get("profile") != body.profile:
-            settings_repo.put_check(key, "configured", None, "Profile configured. Validate the connection to check access.")
-        return get_connections()
-
-    @app.post("/api/connections/databricks/{environment}/validate")
-    def check_databricks(environment: str):
-        if environment not in {"dev", "prod"}:
-            raise HTTPException(404, detail="Unknown Databricks environment")
-        key = f"databricks.{environment}"
-        config = settings_repo.get(key)
-        if not config:
-            raise HTTPException(409, detail="Configure a local profile before validating")
-        result = _run_validation(operations, f"databricks-{environment}-connection", lambda: validate_profile(config["profile"]))
-        settings_repo.put_check(key, result["status"], result["category"], result["detail"])
-        return {"environment": environment, **result}
-
-    @app.put("/api/connections/purview")
-    def save_purview(body: PurviewConfig):
-        configuration_error = validate_configuration(body.endpoint, settings.purview_scope, settings.purview_api_path)
-        if configuration_error:
-            raise HTTPException(422, detail=configuration_error["detail"])
-        normalized = {"endpoint": body.endpoint.rstrip("/"), "tenant_id": body.tenant_id}
-        previous_config = settings_repo.get("purview")
-        settings_repo.put("purview", normalized)
-        if previous_config != normalized:
-            settings_repo.put_check("purview", "configured", None, "Endpoint configured. Validate to check Azure CLI authentication and access.")
-        return get_connections()
-
-    @app.post("/api/connections/purview/validate")
-    def check_purview():
-        config = settings_repo.get("purview")
-        if not config:
-            raise HTTPException(409, detail="Configure a Purview endpoint before validating")
-        api_path = "/datamap/api/search/query?api-version=2023-09-01" if config.get("api_surface") == "data_map" else settings.purview_api_path
-        result = _run_validation(operations, "purview-connection", lambda: validate_endpoint(config["endpoint"], config.get("tenant_id"), settings.purview_scope, api_path))
-        settings_repo.put_check("purview", result["status"], result["category"], result["detail"])
-        return result
-
-    @app.post("/api/connections/purview/discover")
-    def discover_purview_accounts():
-        from dexter.adapters.purview import discover_accounts
-        result = discover_accounts()
-        accounts = result.get("accounts", result.get("items", []))
-        if len(accounts) == 1:
-            account = accounts[0]
-            settings_repo.put("purview", {"endpoint": account.get("endpoint") or account["account_endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id"), "api_surface": account.get("api_surface")})
-            result["selected"] = account.get("id")
-            settings_repo.put_check("purview", account.get("status", result.get("status", "configured")), account.get("category", result.get("category")), result.get("detail", "Purview account discovered."))
-        elif len(accounts) > 1:
-            settings_repo.put_check("purview", "configured", None, "Multiple Purview accounts were discovered. Select the account to use.")
-        elif result.get("status"):
-            settings_repo.put_check("purview", result["status"], result.get("category"), result.get("detail", "Purview account discovery did not find a usable API."))
-        return result
-
-    @app.put("/api/connections/purview/select")
-    def select_purview_account(body: PurviewAccountSelection):
-        from dexter.adapters.purview import discover_accounts
-        result = discover_accounts()
-        account = next((item for item in result.get("accounts", result.get("items", [])) if item.get("id") == body.account_id), None)
-        if not account:
-            raise HTTPException(404, detail="That Purview account was not found in the current Azure CLI discovery results")
-        settings_repo.put("purview", {"endpoint": account.get("endpoint") or account["account_endpoint"], "tenant_id": account.get("tenant_id"), "account_id": account.get("id"), "account_name": account.get("name"), "subscription_id": account.get("subscription_id"), "api_surface": account.get("api_surface")})
-        settings_repo.put_check("purview", account.get("status", result.get("status", "configured")), account.get("category", result.get("category")), account.get("detail") or result.get("detail", "Purview account selected."))
-        return get_connections()
-
     @app.get("/api/operations")
     def list_operations(limit: int = 50):
         return operations.list(limit)
@@ -534,20 +464,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     app.state.settings = settings
     return app
 
-
-def _run_validation(operations: OperationsService, kind: str, validation) -> dict:
-    operation = operations.create(kind, "Connection check queued")
-    operations.transition(operation["id"], "running", progress=10, message="Performing read-only connection check")
-    try:
-        result = validation()
-        if result.get("status") == "connected":
-            operations.transition(operation["id"], "succeeded", progress=100, message=result["detail"])
-        else:
-            operations.transition(operation["id"], "failed", progress=100, message=result["detail"], error_code=result.get("category"), error_message=result["detail"])
-        return {**result, "operation_id": operation["id"]}
-    except Exception:
-        operations.transition(operation["id"], "failed", progress=100, message="Connection check failed", error_code="INTERNAL_ERROR", error_message="The check failed without exposing credentials or provider responses.")
-        raise
 
 
 app = create_app()

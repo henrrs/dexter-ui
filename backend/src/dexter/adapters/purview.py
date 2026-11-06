@@ -112,127 +112,53 @@ def validate_endpoint(endpoint: str, tenant_id: str | None, scope: str, api_path
         return {"status": "unavailable", "category": "connectivity", "detail": "The configured Purview endpoint could not be reached."}
 
 
-def discover_accounts() -> dict:
-    """Find Purview accounts visible to the current Azure CLI identity via ARM."""
+def discover_accounts(scope: str = "https://purview.azure.net/.default", api_path: str = "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1") -> dict:
+    """Use the current Azure CLI tenant token to probe its Unified Catalog endpoint."""
     try:
         from azure.identity import AzureCliCredential
-        credential = AzureCliCredential()
-        token = credential.get_token("https://management.azure.com/.default")
-        claims = _token_claims(token.token)
-        if not claims or claims.get("aud") not in {"https://management.azure.com/", "https://management.azure.com"}:
-            return {"items": [], "status": "error", "detail": "Azure CLI returned a token for an unexpected Azure management audience."}
+        token = AzureCliCredential().get_token(scope)
     except ImportError:
-        return {"items": [], "accounts": [], "status": "unavailable", "category": "integration", "detail": "Azure Identity is not installed."}
+        return {"status": "unavailable", "category": "integration", "detail": "Azure Identity is not installed in this Dexter environment."}
     except Exception as exc:
-        return {"items": [], "accounts": [], "status": "unavailable", "category": "authentication", "detail": "Azure CLI authentication is unavailable. Run az login and retry."}
-    headers = {"Authorization": f"Bearer {token.token}", "Accept": "application/json"}
+        message = str(exc).casefold()
+        if any(term in message for term in ("timeout", "connection", "network", "proxy", "dns", "name resolution")):
+            return {"status": "unavailable", "category": "connectivity", "detail": "Azure CLI could not reach the authentication service to obtain a Purview token."}
+        if any(term in message for term in ("not installed", "executable not found", "command not found", "azure cli not found")):
+            return {"status": "unavailable", "category": "integration", "detail": "Azure CLI is not available in this Dexter runtime."}
+        return {"status": "expired", "category": "authentication", "detail": "Azure CLI has no valid Purview session. Run az login and retry."}
 
-    def pages(url: str):
-        result = []
-        while url:
-            parsed_url = urlparse(url)
-            if parsed_url.scheme != "https" or parsed_url.hostname != "management.azure.com":
-                raise ValueError("Azure Resource Manager returned an unexpected pagination endpoint")
-            request = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(request, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            if not isinstance(payload, dict):
-                break
-            result.extend(payload.get("value", []))
-            url = payload.get("nextLink")
-        return result
-
+    claims = _token_claims(token.token)
+    if not claims:
+        return {"status": "expired", "category": "authentication", "detail": "Azure CLI returned an unreadable Purview token."}
+    tenant_id = claims.get("tid")
+    if not isinstance(tenant_id, str):
+        return {"status": "expired", "category": "authentication", "detail": "The Purview token does not contain a tenant ID."}
     try:
-        subscriptions = pages("https://management.azure.com/subscriptions?api-version=2022-12-01")
-        accounts = []
-        for subscription in subscriptions:
-            sub_id = subscription.get("subscriptionId")
-            if not isinstance(sub_id, str):
-                continue
-            url = f"https://management.azure.com/subscriptions/{sub_id}/providers/Microsoft.Purview/accounts?api-version=2021-12-01"
-            for account in pages(url):
-                properties = account.get("properties") if isinstance(account.get("properties"), dict) else {}
-                endpoints = properties.get("endpoints") if isinstance(properties.get("endpoints"), dict) else {}
-                endpoint = endpoints.get("catalog")
-                parsed = urlparse(endpoint or "")
-                if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-                    continue
-                if not _is_supported_account_host(parsed.hostname):
-                    continue
-                accounts.append({"id": account.get("id"), "name": account.get("name"), "tenant_id": claims.get("tid"), "account_endpoint": endpoint.rstrip("/"), "subscription_id": sub_id})
-        if not accounts:
-            return {"items": [], "accounts": [], "status": "unavailable", "category": "discovery", "detail": "No Purview accounts were found in Azure subscriptions visible to the signed-in identity."}
-        try:
-            purview_token = credential.get_token("https://purview.azure.net/.default")
-        except Exception:
-            return {"items": [], "accounts": accounts, "status": "unavailable", "category": "authentication", "detail": "Purview accounts were discovered, but Azure CLI could not provide a Purview token. Run az login and retry."}
-        purview_claims = _token_claims(purview_token.token) or {}
-        if purview_claims.get("aud") not in {"https://purview.azure.net", "https://purview.azure.net/"}:
-            return {"items": [], "accounts": accounts, "status": "error", "category": "authentication", "detail": "Azure CLI did not return a token with the Purview API audience."}
-        data_headers = {"Authorization": f"Bearer {purview_token.token}", "Accept": "application/json"}
-        supported = []
-        diagnostics = []
-        # Prefer a tenant-specific platform endpoint when ARM returns one. Otherwise
-        # use the shared service root documented for Unified Catalog.
-        routes = {}
-        for account in accounts:
-            base = resolve_api_endpoint(account["account_endpoint"], "/datagovernance/catalog/dataAssets")
-            routes.setdefault(base, []).append(account)
-        unified_error = None
-        for api_endpoint, route_accounts in routes.items():
-            probe_url = api_endpoint + "/datagovernance/catalog/dataAssets?api-version=2026-03-20-preview&includeExtendedProperties=true&top=1"
-            try:
-                request = urllib.request.Request(probe_url, headers=data_headers, method="GET")
-                with urllib.request.urlopen(request, timeout=8) as response:
-                    if 200 <= response.status < 300:
-                        supported.extend({**account, "endpoint": api_endpoint, "api_surface": "unified_catalog", "status": "connected"} for account in route_accounts)
-            except urllib.error.HTTPError as exc:
-                diagnostic = _http_diagnostic(exc.code)
-                unified_error = unified_error or diagnostic
-                diagnostics.extend({"account": account.get("name"), **diagnostic, "http_status": exc.code, "api_surface": "unified_catalog"} for account in route_accounts)
-            except (TimeoutError, OSError, urllib.error.URLError):
-                diagnostic = {"status": "unavailable", "category": "connectivity", "detail": "The Unified Catalog service could not be reached."}
-                unified_error = unified_error or diagnostic
-                diagnostics.extend({"account": account.get("name"), **diagnostic, "api_surface": "unified_catalog"} for account in route_accounts)
+        tenant_id = str(uuid.UUID(tenant_id))
+    except ValueError:
+        return {"status": "expired", "category": "authentication", "detail": "The Purview token contains an invalid tenant ID."}
 
-        # Data Map uses the account endpoint with its /catalog suffix removed and
-        # a read-only Discovery query. Probe each account because this API is scoped.
-        if not supported:
-            for account in accounts:
-                endpoint = account["account_endpoint"]
-                base = resolve_api_endpoint(endpoint, "/datamap/api/search/query")
-                url = base + "/datamap/api/search/query?api-version=2023-09-01"
-                headers = {**data_headers, "Content-Type": "application/json"}
-                request = urllib.request.Request(url, data=json.dumps({"keywords": None, "limit": 1}).encode(), headers=headers, method="POST")
-                try:
-                    with urllib.request.urlopen(request, timeout=8) as response:
-                        if 200 <= response.status < 300:
-                            supported.append({**account, "endpoint": base, "api_surface": "data_map", "status": "connected"})
-                except urllib.error.HTTPError as exc:
-                    diag = _http_diagnostic(exc.code)
-                    diagnostics.append({"account": account.get("name"), **diag, "http_status": exc.code})
-                except (TimeoutError, OSError, urllib.error.URLError):
-                    diagnostics.append({"account": account.get("name"), "status": "unavailable", "category": "connectivity", "detail": "The Data Map API could not be reached."})
-        if supported:
-            usable_by_id = {item.get("id"): item for item in supported}
-            account_results = [{**account, **usable_by_id.get(account.get("id"), {})} for account in accounts]
-            detail = f"Found {len(accounts)} Purview account(s); read-only metadata access succeeded through {supported[0]['api_surface'].replace('_', ' ').title()}."
-            status, category = "connected", None
-        else:
-            failure = next((item for item in diagnostics if item.get("category") == "authorization"), None) or next((item for item in diagnostics if item.get("category") == "authentication"), None) or next((item for item in diagnostics if item.get("category") == "endpoint"), None) or (diagnostics[0] if diagnostics else unified_error)
-            failure = failure or {"status": "unavailable", "category": "connectivity", "detail": "No supported read-only Purview API was reachable."}
-            status, category = failure["status"], failure.get("category")
-            detail = f"{len(accounts)} Purview account(s) discovered, but metadata access failed: {failure.get('detail', 'API access failed.')}"
-            account_results = [{**account, "status": status, "category": category} for account in accounts]
-        return {"items": supported, "accounts": account_results, "status": status, "category": category, "detail": detail, "diagnostics": diagnostics}
+    expected_audience = scope.removesuffix("/.default").rstrip("/")
+    token_audience = claims.get("aud")
+    accepted_audiences = {expected_audience, expected_audience + "/"}
+    if not isinstance(token_audience, str) or token_audience not in accepted_audiences:
+        return {"status": "expired", "category": "authentication", "tenant_id": tenant_id, "detail": "Azure CLI returned a token with an invalid Purview audience."}
+    if not api_path.startswith("/datagovernance/catalog/"):
+        return {"status": "error", "category": "configuration", "tenant_id": tenant_id, "detail": "Automatic Purview discovery requires a Unified Catalog read-only endpoint."}
+
+    endpoint = f"https://{tenant_id}-api.purview-service.microsoft.com"
+    url = endpoint + api_path
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token.token}", "Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            if 200 <= response.status < 300:
+                return {"status": "connected", "category": None, "detail": "Tenant Purview Unified Catalog read-only request succeeded.", "tenant_id": tenant_id, "endpoint": endpoint, "api_surface": "unified_catalog"}
+            return {"status": "error", "category": "connectivity", "detail": f"Purview returned unexpected HTTP {response.status}.", "tenant_id": tenant_id, "endpoint": endpoint, "api_surface": "unified_catalog"}
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return {"items": [], "accounts": [], "status": "expired", "category": "authentication", "detail": "Azure Resource Manager rejected the Azure CLI token. Run az login and retry."}
-        if exc.code == 403:
-            return {"items": [], "accounts": [], "status": "no_permission", "detail": "Azure CLI identity lacks permission to list Purview accounts in one or more subscriptions.", "category": "authorization"}
-        return {"items": [], "accounts": [], "status": "error", "detail": f"Azure management returned HTTP {exc.code}.", "category": "connectivity"}
-    except (OSError, urllib.error.URLError, ValueError, TypeError):
-        return {"items": [], "status": "unavailable", "detail": "Could not list accessible Purview accounts through Azure Resource Manager."}
+        diagnostic = _http_diagnostic(exc.code)
+        return {**diagnostic, "tenant_id": tenant_id, "endpoint": endpoint, "api_surface": "unified_catalog"}
+    except (TimeoutError, OSError, urllib.error.URLError):
+        return {"status": "unavailable", "category": "connectivity", "detail": "The tenant-specific Purview endpoint could not be reached.", "tenant_id": tenant_id, "endpoint": endpoint, "api_surface": "unified_catalog"}
 
 
 def _http_diagnostic(status_code: int) -> dict:
