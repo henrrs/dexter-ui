@@ -2,13 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import { ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
-import type { DiscoverNode, DiscoverPage } from './api'
+import type { DiscoverNode, DiscoverPage, SchemaCompareResult } from './api'
 import type { Operation } from './types'
 
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
 type QueryEnvironment = 'local' | 'dev' | 'prod'
-type WorkbenchTab = { key: string; node: DiscoverNode; environment: QueryEnvironment; queryEnvironment?: QueryEnvironment; view: 'table' | 'local-query' }
-type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage' | 'query'
+type CompareTabState = { prodNodeId: string; devNodeId: string | null; result?: SchemaCompareResult; loading: boolean; error?: string; filter: string }
+type WorkbenchTab = { key: string; node: DiscoverNode; environment: QueryEnvironment; queryEnvironment?: QueryEnvironment; view: 'table' | 'local-query' | 'compare'; comparison?: CompareTabState }
+type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage' | 'query' | 'compare'
 type QueryResultTab = 'results' | 'schema' | 'execution'
 type QueryExecution = { environment: QueryEnvironment; engine: 'DuckDB' | 'Databricks SQL'; warehouse: string | null; physicalObject: string | null; sql: string; executedSql?: string; state: 'running' | 'succeeded' | 'failed'; durationMs?: number; returnedRows?: number; truncated?: boolean; message?: string }
 type LineageResult = { available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }
@@ -48,6 +49,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [deletingLocal, setDeletingLocal] = useState(false)
   const [activeOperation, setActiveOperation] = useState<Operation | null>(null)
   const [localSql, setLocalSql] = useState('')
+  const [localSqlWasGenerated, setLocalSqlWasGenerated] = useState(false)
   const [localRows, setLocalRows] = useState<Record<string, unknown>[]>([])
   const [localColumns, setLocalColumns] = useState<string[]>([])
   const [localQueryError, setLocalQueryError] = useState('')
@@ -277,8 +279,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       : preferredEnvironment ?? activeEnvironment
     setQueryEnvironment(nextQueryEnvironment)
     setQueryEnvironmentChosen(true)
-    if (!workbenchTabs.some((item) => item.key === key) && !localSql.trim()) {
+    if ((!workbenchTabs.some((item) => item.key === key) || localSqlWasGenerated) && (!localSql.trim() || localSqlWasGenerated)) {
       setLocalSql(`SELECT * FROM ${qualifiedTableIdentifier(node, nextQueryEnvironment)} LIMIT 100`)
+      setLocalSqlWasGenerated(true)
     }
     if (activeTabKey !== key || activeSection !== 'query') {
       setLocalRows([])
@@ -564,6 +567,89 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
   const loadedChildren = (node: DiscoverNode) => node.children ?? pages[node.id]?.items ?? []
   const matchesLoadedBranch = (node: DiscoverNode): boolean => matches(node) || loadedChildren(node).some(matchesLoadedBranch)
+  const compareChoices = useMemo(() => {
+    const found = new Map<string, DiscoverNode>()
+    const visit = (items: DiscoverNode[]) => items.forEach((item) => {
+      if (item.kind === 'table' || item.kind === 'view') found.set(item.id, item)
+      visit(item.children ?? pages[item.id]?.items ?? [])
+    })
+    visit(sources)
+    Object.values(pages).forEach((page) => visit(page.items))
+    if (selected && (selected.kind === 'table' || selected.kind === 'view')) found.set(selected.id, selected)
+    return [...found.values()].sort((left, right) => (left.qualified_name ?? left.name).localeCompare(right.qualified_name ?? right.name))
+  }, [sources, pages, selected])
+
+  const updateComparison = (key: string, update: (current: CompareTabState) => CompareTabState) => {
+    setWorkbenchTabs((tabs) => tabs.map((tab) => tab.key === key && tab.view === 'compare' && tab.comparison
+      ? { ...tab, comparison: update(tab.comparison) }
+      : tab))
+  }
+  const loadComparison = async (key: string, prodNodeId: string, devNodeId: string | null, force = false) => {
+    updateComparison(key, (current) => ({ ...current, loading: true, error: undefined, result: force ? current.result : undefined }))
+    try {
+      const result = await api.compareSchemas(prodNodeId, devNodeId, force)
+      updateComparison(key, (current) => ({ ...current, loading: false, result, error: undefined }))
+    } catch (error) {
+      updateComparison(key, (current) => ({ ...current, loading: false, result: undefined, error: error instanceof Error ? error.message : 'Schema metadata could not be compared.' }))
+    }
+  }
+  const openCompare = () => {
+    if (!selected) return
+    const prodVariant = selected.variants?.find((variant) => variant.environment === 'prod')
+    if (!prodVariant) return
+    const key = `${selected.id}:compare`
+    const existing = workbenchTabs.find((tab) => tab.key === key && tab.view === 'compare')
+    const comparison = existing?.comparison ?? {
+      prodNodeId: selected.id,
+      devNodeId: selected.variants?.some((variant) => variant.environment === 'dev') ? selected.id : null,
+      loading: true,
+      filter: 'all',
+    }
+    const tab: WorkbenchTab = { key, node: selected, environment: 'prod', view: 'compare', comparison }
+    setWorkbenchTabs((tabs) => tabs.some((item) => item.key === key) ? tabs.map((item) => item.key === key ? tab : item) : [...tabs, tab])
+    setSelected(selected)
+    setActiveTabKey(key)
+    setActiveEnvironment('prod')
+    setActiveSection('compare')
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: selected.name, qualifiedName: selected.qualified_name ?? selected.name, environment: 'prod' } }))
+    if (!existing?.comparison) void loadComparison(key, comparison.prodNodeId, comparison.devNodeId)
+  }
+  const changeCompareObject = (key: string, environment: 'prod' | 'dev', nodeId: string) => {
+    const tab = workbenchTabs.find((item) => item.key === key && item.view === 'compare')
+    if (!tab?.comparison) return
+    if (environment === 'dev' && !nodeId) {
+      updateComparison(key, (current) => ({ ...current, devNodeId: null, loading: true, result: undefined, error: undefined }))
+      void loadComparison(key, tab.comparison.prodNodeId, null)
+      return
+    }
+    const selectedNode = compareChoices.find((item) => item.id === nodeId)
+    if (!selectedNode) return
+    const prodNodeId = environment === 'prod' ? nodeId : tab.comparison.prodNodeId
+    const devNodeId = environment === 'dev' ? nodeId : selectedNode.variants?.some((variant) => variant.environment === 'dev') ? nodeId : null
+    const nextNode = environment === 'prod' ? selectedNode : tab.node
+    updateComparison(key, (current) => ({ ...current, prodNodeId, devNodeId, loading: true, result: undefined, error: undefined }))
+    if (environment === 'prod') {
+      setWorkbenchTabs((tabs) => tabs.map((item) => item.key === key ? { ...item, node: nextNode } : item))
+      window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: nextNode.name, qualifiedName: nextNode.qualified_name ?? nextNode.name, environment: 'prod' } }))
+    }
+    setSelected(nextNode)
+    void loadComparison(key, prodNodeId, devNodeId)
+  }
+  const activateTab = (tab: WorkbenchTab) => {
+    if (tab.view === 'local-query') {
+      void openLocalQuery(tab.node, tab.queryEnvironment)
+      return
+    }
+    if (tab.view === 'compare') {
+      setSelected(tab.node)
+      setActiveTabKey(tab.key)
+      setActiveEnvironment('prod')
+      setActiveSection('compare')
+      window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: tab.node.name, qualifiedName: tab.node.qualified_name ?? tab.node.name, environment: 'prod' } }))
+      return
+    }
+    void selectNode(tab.node, tab.environment)
+  }
 
   const purviewMetadata = selected?.purview_metadata ?? selected?.variants?.find((variant) => variant.environment === 'purview')?.metadata
   const purviewRecord = asRecord(purviewMetadata)
@@ -624,8 +710,78 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     {!explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
     <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
       <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
-      {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${activeTabKey === tab.key ? 'active' : ''}`} key={tab.key}><button onClick={() => tab.view === 'local-query' ? void openLocalQuery(tab.node, tab.queryEnvironment) : void selectNode(tab.node, tab.environment)}>{tab.view === 'local-query' ? <Play size={12} /> : <Database size={12} />}{tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.node.name}</button><button aria-label={`Minimize ${tab.view === 'local-query' ? `query for ${tab.node.name}` : tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (activeTabKey === tab.key) { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.view === 'local-query' ? `query for ${tab.node.name}` : tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (activeTabKey === tab.key) { const next = remaining.at(-1); if (next) next.view === 'local-query' ? void openLocalQuery(next.node, next.queryEnvironment) : void selectNode(next.node, next.environment); else { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div></div>}
-      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'query' ? <div className="workbench-section-content sql-workspace">
+      {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => {
+        const label = tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.view === 'compare' ? `Compare · ${tab.node.name}` : tab.node.name
+        return <div className={`workbench-tab ${activeTabKey === tab.key ? 'active' : ''}`} key={tab.key}>
+          <button onClick={() => activateTab(tab)}>{tab.view === 'local-query' ? <Play size={12} /> : tab.view === 'compare' ? <Layers3 size={12} /> : <Database size={12} />}{label}</button>
+          <button aria-label={`Minimize ${label}`} title="Minimize tab; click its name to reopen" onClick={() => { if (activeTabKey === tab.key) { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button>
+          <button aria-label={`Close ${label}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (activeTabKey === tab.key) { const next = remaining.at(-1); if (next) activateTab(next); else { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button>
+        </div>
+      })}</div></div>}
+      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'compare' ? (() => {
+        const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')
+        const comparison = compareTab?.comparison
+        if (!compareTab || !comparison) return <div className="compare-empty"><LoaderCircle size={16} className="spin" /> Preparing comparison…</div>
+        const prodNode = compareChoices.find((node) => node.id === comparison.prodNodeId) ?? compareTab.node
+        const devNode = compareChoices.find((node) => node.id === comparison.devNodeId) ?? null
+        const result = comparison.result
+        const cacheEntries = result ? [result.sides.prod.metadata_cache, result.sides.dev.metadata_cache].filter((item): item is NonNullable<typeof item> => Boolean(item)) : []
+        const hasStaleSchemaCache = cacheEntries.some((item) => item.state === 'stale')
+        const schemaCacheTime = cacheEntries.length ? Math.min(...cacheEntries.map((item) => item.fetched_at)) : null
+        const prodVariant = prodNode.variants?.find((variant) => variant.environment === 'prod')
+        const devFallbackVariant = compareChoices.flatMap((node) => node.variants?.map((variant) => ({ node, variant })) ?? [])
+          .find(({ node, variant }) => variant.environment === 'dev' && variant.schema === prodVariant?.schema
+            && (variant.logical_catalog === prodVariant?.logical_catalog || node.qualified_name?.split('.')[0] === prodNode.qualified_name?.split('.')[0]))?.variant
+        const devPhysicalName = (comparisonResult?: SchemaCompareResult) => comparisonResult?.sides.dev.qualified_name
+          ?? (devNode ? variantQualifiedName(devNode.variants?.find((variant) => variant.environment === 'dev')) ?? devNode.qualified_name : null)
+          ?? (devFallbackVariant && prodVariant?.table ? `${devFallbackVariant.catalog}.${devFallbackVariant.schema}.${prodVariant.table}` : null)
+          ?? (comparisonResult?.sides.dev.state === 'absent' ? 'DEV physical table identity unavailable' : prodNode.qualified_name)
+        const statusLabel = (side: 'prod' | 'dev', node: DiscoverNode | null) => {
+          const source = result?.sides?.[side]
+          if (source?.state === 'available') return source.access === 'restricted' ? 'Metadata available · data access restricted' : source.access === 'read' ? 'Available' : 'Metadata available · data access unconfirmed'
+          if (source?.state === 'absent') return 'Not found'
+          if (source?.state === 'unknown') return 'Availability not confirmed'
+          if (source?.state === 'metadata_incomplete') return 'Schema metadata incomplete'
+          if (source?.state === 'unavailable') return 'Metadata unavailable'
+          const variant = node?.variants?.find((item) => item.environment === side)
+          if (variant) return variant.access === 'restricted' ? 'Metadata access restricted' : 'Loading metadata…'
+          return node?.availability?.[side] === 'absent' ? 'Not found' : 'Availability not confirmed'
+        }
+        const filteredDifferences = result?.differences.filter((item) => comparison.filter === 'all'
+          || (comparison.filter === 'different' && item.status !== 'matching')
+          || item.status === comparison.filter) ?? []
+        const selectChoices = (environment: 'prod' | 'dev') => compareChoices.filter((node) => node.variants?.some((variant) => variant.environment === environment)).map((node) => <option key={node.id} value={node.id}>{variantQualifiedName(node.variants?.find((variant) => variant.environment === environment)) ?? node.qualified_name ?? node.name}</option>)
+        const statusText = (status: string, changes: string[]) => status === 'matching' ? 'Matching'
+          : status === 'prod_only' ? 'PROD-only'
+            : status === 'dev_only' ? 'DEV-only'
+              : changes.includes('type_changed') ? 'Type Changed'
+                : changes.includes('nullability_changed') ? 'Nullability Changed'
+                  : changes.includes('constraints_changed') ? 'Constraints Changed' : 'Definition Changed'
+        const fieldSummary = (field: NonNullable<SchemaCompareResult['differences'][number]['prod']>) => [
+          field.original_type || field.canonical_type,
+          field.nullable === null ? null : field.nullable ? 'nullable' : 'not null',
+          field.constraints.length ? `constraints: ${field.constraints.join(', ')}` : null,
+          ...Object.entries(field.technology_properties).map(([key, value]) => `${key}: ${String(value)}`),
+        ].filter(Boolean).join(' · ')
+        return <div className="compare-workspace">
+          <header className="compare-header"><div><span className="eyebrow">READ-ONLY SCHEMA ANALYSIS</span><h2>Compare Tables</h2><code>Dexter / Discover / {prodNode.name}</code>{cacheEntries.length > 0 && <small className={`compare-cache-indicator ${hasStaleSchemaCache ? 'stale' : ''}`}>{hasStaleSchemaCache ? 'Showing stale cached schema' : cacheEntries.every((item) => item.state === 'cached') ? 'Schema metadata from cache' : 'Schema metadata refreshed'}{schemaCacheTime ? ` · ${new Date(schemaCacheTime * 1000).toLocaleString()}` : ''}</small>}</div><button className="icon-button subtle" aria-label="Refresh schema metadata" title="Refresh schema metadata" disabled={comparison.loading} onClick={() => void loadComparison(compareTab.key, comparison.prodNodeId, comparison.devNodeId, true)}><RefreshCw size={14} className={comparison.loading ? 'spin' : ''} /></button></header>
+          <div className="compare-object-selectors"><label><span>Source · PROD</span><select aria-label="PROD table to compare" value={comparison.prodNodeId} onChange={(event) => changeCompareObject(compareTab.key, 'prod', event.target.value)}>{selectChoices('prod')}</select><code>{result?.sides.prod.qualified_name ?? variantQualifiedName(prodNode.variants?.find((variant) => variant.environment === 'prod')) ?? prodNode.qualified_name}</code><small className={result?.sides.prod.state === 'unavailable' ? 'compare-state-warning' : 'compare-state-ready'}>{statusLabel('prod', prodNode)}</small></label>
+            <label><span>Target · DEV</span><select aria-label="DEV table to compare" value={comparison.devNodeId ?? ''} onChange={(event) => changeCompareObject(compareTab.key, 'dev', event.target.value)}><option value="">Same logical table in DEV</option>{selectChoices('dev')}</select><code>{devPhysicalName(result)}</code><small className={result?.sides.dev.state === 'absent' ? 'compare-state-missing' : result?.sides.dev.state === 'unavailable' || result?.sides.dev.state === 'unknown' ? 'compare-state-warning' : 'compare-state-ready'}>{statusLabel('dev', devNode ?? prodNode)}</small></label></div>
+          <section className="compare-schema-section"><header><h3>Schema comparison</h3><span className={`compare-state-pill ${result?.state === 'matching' ? 'matching' : result?.state === 'dev_table_not_found' ? 'missing' : result?.state === 'different' ? 'different' : ''}`}>{comparison.loading ? 'Loading schemas…' : result?.state === 'matching' ? 'Schemas match' : result?.state === 'different' ? 'Schemas differ' : result?.state === 'dev_table_not_found' ? 'DEV table not found' : result ? 'Metadata unavailable' : 'Waiting for metadata'}</span></header>
+            {comparison.error && <div className="compare-message error" role="alert">{comparison.error}<button className="button secondary small" onClick={() => void loadComparison(compareTab.key, comparison.prodNodeId, comparison.devNodeId)}>Retry</button></div>}
+            {comparison.loading && !result && <div className="compare-message"><LoaderCircle size={14} className="spin" /> Loading schema metadata from the selected Databricks profiles. No warehouse or table records are accessed.</div>}
+            {!comparison.loading && result?.message && <div className={`compare-message ${result.state === 'metadata_unavailable' ? 'warning' : ''}`} role="status">{result.message}{result.compatibility === 'review_required' && <span>Structural changes need review; the engine does not assume DEV must mirror PROD.</span>}</div>}
+            {result && <div className={`compare-compatibility ${result.compatibility}`}><span>Compatibility assessment</span><strong>{result.compatibility === 'structurally_equivalent' ? 'Structurally equivalent' : result.compatibility === 'structural_difference' ? 'Structural differences · not inherently incompatible' : result.compatibility === 'review_required' ? 'Review type, nullability, and constraint changes' : result.compatibility === 'not_comparable' ? 'Not comparable without a DEV table' : 'Unknown · schema evidence is incomplete'}</strong></div>}
+            {result?.summary && Object.keys(result.summary).length > 0 && <div className="compare-summary">{Object.entries(result.summary).filter(([, count]) => count > 0).map(([key, count]) => <span className={`summary-${key.replaceAll('_', '-')}`} key={key}>{count} {key === 'matching' ? 'matching' : key.replaceAll('_', '-')}</span>)}</div>}
+            {result?.schema_changes?.includes('constraints_changed') && <div className="compare-message warning">Table-level constraints differ between PROD and DEV.</div>}
+            {result && result.differences.length > 0 && <div className="compare-filter-row"><label htmlFor={`compare-filter-${compareTab.key}`}>Show</label><select id={`compare-filter-${compareTab.key}`} value={comparison.filter} onChange={(event) => updateComparison(compareTab.key, (current) => ({ ...current, filter: event.target.value }))}><option value="all">All fields</option><option value="different">Differences only</option><option value="matching">Matching</option><option value="prod_only">PROD-only</option><option value="dev_only">DEV-only</option><option value="type_changed">Type changed</option><option value="nullability_changed">Nullability changed</option><option value="constraints_changed">Constraints changed</option></select><small>{filteredDifferences.length} fields</small></div>}
+            {result?.state === 'dev_table_not_found' && <div className="compare-prepare-placeholder"><strong>DEV table not found</strong><span>The PROD schema is shown below. No empty DEV schema is fabricated.</span><button disabled title="Prepare DEV is planned and unavailable in this release">Prepare DEV · planned</button></div>}
+            {result && result.differences.length > 0 && <div className="compare-difference-table-wrap"><table className="compare-difference-table"><thead><tr><th>Column</th><th>PROD</th><th>DEV</th><th>Difference</th></tr></thead><tbody>{filteredDifferences.map((item) => <tr key={item.name} className={`diff-${item.status}`}><td><details><summary><span className="diff-status-mark">{item.status === 'matching' ? '✓' : ['type_changed', 'nullability_changed', 'constraints_changed', 'definition_changed'].includes(item.status) ? '!' : '+'}</span>{item.name}</summary>{(item.prod || item.dev) && <small>{fieldSummary(item.prod ?? item.dev!)}</small>}</details></td><td>{item.prod?.original_type || '—'}</td><td>{item.dev?.original_type || '—'}</td><td><span className={`diff-status-label ${item.status}`}>{statusText(item.status, item.changes)}</span></td></tr>)}</tbody></table>{filteredDifferences.length === 0 && <div className="compare-message">No fields match this filter.</div>}</div>}
+            {result?.state === 'matching' && <div className="compare-equivalent">✓ Both schemas have equivalent structure.</div>}
+            <footer className="compare-readonly-note">Schema metadata only · No records read · No compute started · No table changes</footer>
+          </section>
+        </div>
+      })() : activeSection === 'query' ? <div className="workbench-section-content sql-workspace">
         <header className="sql-workspace-header"><div><span className="eyebrow">SQL WORKSPACE</span><h2>{selected.name}</h2><code>{selected.qualified_name ?? selected.id}</code></div></header>
         <nav className="sql-environment-switch" aria-label="Query environment">
           {(['local', 'dev', 'prod'] as const).map((environment) => {
@@ -647,7 +803,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             return <button key={environment} type="button" className={queryEnvironment === environment ? 'active' : ''}
               aria-label={`${environment === 'local' ? 'Local' : environment.toUpperCase()}. ${reason}`}
               aria-pressed={queryEnvironment === environment} aria-disabled={unavailable} aria-describedby="sql-environment-status" title={reason}
-              onClick={() => { if (unavailable) return; setQueryEnvironment(environment); setQueryEnvironmentChosen(true); setLocalQueryError('') }}>
+              onClick={() => { if (unavailable) return; setQueryEnvironment(environment); setQueryEnvironmentChosen(true); if (localSqlWasGenerated) setLocalSql(`SELECT * FROM ${qualifiedTableIdentifier(selected, environment)} LIMIT 100`); setLocalQueryError('') }}>
               {environment === 'local' ? 'Local' : environment.toUpperCase()}
             </button>
           })}
@@ -704,7 +860,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               title={queryEnvironment === 'local' && !queryHasLocal ? 'No local snapshot is available.' : queryAvailabilityReason || undefined}
               onClick={() => void runQuery()}>{queryRunning ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />} Run Query · {queryEnvironment === 'local' ? 'Local' : queryEnvironment.toUpperCase()}</button>
           </div>
-          <textarea aria-label="SQL query editor" value={localSql} onChange={(event) => setLocalSql(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void runQuery() } }} spellCheck={false} />
+          <textarea aria-label="SQL query editor" value={localSql} onChange={(event) => { setLocalSql(event.target.value); setLocalSqlWasGenerated(false) }} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void runQuery() } }} spellCheck={false} />
           <div className="sql-editor-hint">Ctrl/⌘ + Enter to run · SQL stays unchanged when you switch environments.</div>
           {localQueryError && <div className="discover-error sql-query-error" role="alert">{localQueryError}</div>}
         </div>
@@ -756,7 +912,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
           {(selected.kind === 'table' || selected.kind === 'view') && <div className="discover-operation-cards"><div className="discover-section-title">Operations</div><div className="operation-card-grid">
             <button className="operation-card make-local-action" onClick={() => { setLocalQueryError(''); setMakeLocalOpen(true) }} disabled={selected.access !== 'read' || activeEnvironment !== 'prod'} title={activeEnvironment !== 'prod' ? 'Make Local is only available when viewing the PROD table.' : undefined}><HardDrive size={16} /><strong>{queryHasLocal ? 'Refresh Local Copy' : 'Make Local'}</strong><span>{activeEnvironment !== 'prod' ? 'Available only from PROD.' : queryHasLocal ? `Snapshot from ${localSnapshotLabel}. Select columns to refresh it.` : 'Select columns for a local snapshot.'}</span><b>→</b></button>
             <button className="operation-card" disabled title="Planned; no generation backend is connected"><Sparkles size={16} /><strong>Generate Synthetic Data</strong><span>Mock data in DEV · planned</span><b>→</b></button>
-            <button className="operation-card" disabled title="Planned; comparison is not implemented"><Layers3 size={16} /><strong>Compare Tables</strong><span>Cross environment · planned</span><b>→</b></button>
+            <button className="operation-card" disabled={!selected.variants?.some((variant) => variant.environment === 'prod')} onClick={openCompare} title={!selected.variants?.some((variant) => variant.environment === 'prod') ? 'Compare Tables requires a confirmed PROD table.' : 'Compare PROD and DEV schema metadata.'}><Layers3 size={16} /><strong>Compare Tables</strong><span>Compare PROD and DEV schemas</span><b>→</b></button>
             <button className="operation-card" disabled={!canOpenQuery} onClick={() => void openLocalQuery(selected, activeEnvironment === 'dev' || activeEnvironment === 'prod' ? activeEnvironment : undefined)}><Database size={16} /><strong>Query</strong><span>Run SQL locally or in Databricks.</span><b>→</b></button>
           </div></div>}
           {showActiveOperation && activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}{['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then(setActiveOperation).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small className="operation-status-message" role="status" aria-live="polite">{formatMaterializationStatus(activeOperation)}</small></div>}
@@ -880,16 +1036,12 @@ function variantQualifiedName(variant?: { catalog?: string; schema?: string; tab
 }
 
 function qualifiedTableIdentifier(node: DiscoverNode, environment: QueryEnvironment): string {
-  const local = node.variants?.find((variant) => variant.environment === 'local')
-  const selected = node.variants?.find((variant) => variant.environment === environment) ?? local
+  const selected = node.variants?.find((variant) => variant.environment === environment)
   const parts = selected ? [selected.catalog, selected.schema, selected.table] : []
   if (parts.length === 3 && parts.every((part): part is string => Boolean(part))) {
     return parts.join('.')
   }
-  const qualified = node.qualified_name?.split('.') ?? []
-  return qualified.length === 3
-    ? qualified.join('.')
-    : node.name
+  return node.name
 }
 
 function formatBytes(value: number): string {

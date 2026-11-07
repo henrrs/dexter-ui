@@ -245,6 +245,15 @@ except ImportError:
 
 @unittest.skipUnless(API_AVAILABLE, "FastAPI/httpx are not installed; API tests run after make setup")
 class ApiTests(unittest.TestCase):
+    def test_schema_compare_endpoint_is_registered_and_rejects_invalid_identity(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")}), Settings())
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.post("/api/discover/schema-compare", json={"prod_node_id": "invalid", "dev_node_id": None})
+            self.assertEqual(response.status_code, 422)
+
     def test_connections_are_detected_and_checked_automatically(self):
         from dexter.config import Settings
         with tempfile.TemporaryDirectory() as temporary:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
@@ -14,6 +15,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from dexter.catalog.cache import DiscoveryCache, context_key
 
 logger = logging.getLogger(__name__)
+_SENSITIVE_METADATA_KEY = re.compile(r"(?:secret|token|password|credential|private.?key|access.?key|sas)", re.I)
 # Listing TTLs describe cache age; catalog/schema/table listings refresh only
 # on an explicit Explorer request. Detail metadata keeps its one-hour TTL.
 TTL = {"catalog": 6 * 3600, "schema": 30 * 60, "table": 15 * 60, "detail": 3600}
@@ -21,6 +23,18 @@ TTL = {"catalog": 6 * 3600, "schema": 30 * 60, "table": 15 * 60, "detail": 3600}
 
 def _value(value, name, default=None):
     return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def _safe_metadata(value, key: str | None = None):
+    if key and _SENSITIVE_METADATA_KEY.search(key):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(item_key): _safe_metadata(item, str(item_key)) for item_key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_metadata(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _row(value, source, env, kind, identity, qualified_name=None):
@@ -65,7 +79,7 @@ class DiscoverService:
             return self._purview(force)
         return []
 
-    def detail(self, node_id: str):
+    def detail(self, node_id: str, force: bool = False):
         if node_id.startswith("local:table:"):
             dataset_id = node_id.removeprefix("local:table:")
             path = self.paths.datasets / dataset_id / "manifest.json"
@@ -89,6 +103,8 @@ class DiscoverService:
             config = self.settings_repo.get(f"databricks.{env}")
             if not config:
                 return None
+            cached = None
+            workspace_host = ""
             try:
                 from databricks.sdk import WorkspaceClient
                 from dexter.adapters.databricks import profile_config_file
@@ -97,9 +113,10 @@ class DiscoverService:
                 context = context_key("databricks", env, config["profile"], workspace_host)
                 cache_key = f"detail:{catalog}.{schema}.{table}"
                 cached = self.cache.get(context, cache_key)
-                if cached and not cached["stale"]:
+                if cached and not force and not cached["stale"]:
                     if not cached["items"]: return None
-                    return {**cached["items"][0], "workspace": workspace_host, "profile": config["profile"]}
+                    return {**cached["items"][0], "workspace": workspace_host, "profile": config["profile"],
+                            "metadata_cache": {"state": "cached", "fetched_at": cached["fetched_at"]}}
                 identity = workspace.current_user.me()
                 identity_key = _value(identity, "id") or _value(identity, "user_name") or "unknown"
                 value = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
@@ -112,12 +129,35 @@ class DiscoverService:
                     row["metastore_id"] = _value(current_metastore, "metastore_id") or _value(current_metastore, "id")
                 except Exception:
                     row["metastore_id"] = None
-                row["columns"] = [{"name": _value(column, "name"), "type": _value(column, "type_text") or str(_value(column, "type_name", "unknown")), "type_text": _value(column, "type_text"), "nullable": _value(column, "nullable")} for column in (_value(value, "columns", []) or [])]
+                column_fields = (
+                    "type_name", "type_precision", "type_scale", "type_interval_type", "position",
+                    "comment", "partition_index", "generated_expression", "identity_field", "mask",
+                    "default_value", "constraints", "children", "fields",
+                )
+                row["columns"] = [{
+                    "name": _value(column, "name"),
+                    "type": _value(column, "type_text") or str(_value(column, "type_name", "unknown")),
+                    "type_text": _value(column, "type_text"),
+                    "nullable": _value(column, "nullable"),
+                    **{key: _safe_metadata(_value(column, key), key) for key in column_fields if _value(column, key) is not None},
+                } for column in (_value(value, "columns", []) or [])]
+                row["constraints"] = _safe_metadata(_value(value, "table_constraints") or _value(value, "constraints") or [])
+                row["technology_properties"] = _safe_metadata({
+                    key: _value(value, key) for key in (
+                        "table_type", "data_source_format", "properties", "partition_columns",
+                        "cluster_by", "row_filter", "view_definition",
+                    ) if _value(value, key) is not None
+                })
                 row["access"] = "restricted" if row["browse_only"] is True else "read" if row["browse_only"] is False else "unknown"
-                self.cache.put(context, cache_key, [row], TTL["detail"])
+                cached_result = self.cache.put(context, cache_key, [row], TTL["detail"])
+                row["metadata_cache"] = {"state": "refreshed", "fetched_at": cached_result["fetched_at"]}
                 return row
             except Exception as exc:
                 logger.info("Databricks detail failed (%s)", type(exc).__name__)
+                if cached and cached.get("items"):
+                    return {**cached["items"][0], "workspace": workspace_host, "profile": config["profile"],
+                            "metadata_cache": {"state": "stale", "fetched_at": cached["fetched_at"],
+                                               "message": "Schema refresh failed; showing the last cached metadata."}}
                 return None
         return None
 

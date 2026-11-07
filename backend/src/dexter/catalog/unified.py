@@ -9,6 +9,8 @@ import logging
 import re
 from pathlib import Path
 
+from dexter.domain.schema import canonical_schema, compare_schemas
+
 logger = logging.getLogger(__name__)
 
 
@@ -261,6 +263,79 @@ class UnifiedDiscoverService:
         if asset:
             return {**asset, "id": node_id, "kind": kind, "source": "purview", "environment": "governance", "access": "unknown", "read_access": None, "variants": variants, "availability": availability or self._availability(variants)}
         return None
+
+    def compare_schemas(self, prod_node_id: str, dev_node_id: str | None = None, force: bool = False) -> dict:
+        """Compare two resolved physical table schemas using metadata-only provider reads."""
+        try:
+            prod_kind, _, _ = _variants(prod_node_id)
+            dev_kind, _, _ = _variants(dev_node_id or prod_node_id)
+        except Exception:
+            raise ValueError("Invalid unified table identity") from None
+        if prod_kind not in {"table", "view"} or dev_kind not in {"table", "view"}:
+            raise ValueError("Schema comparison requires table or view identities")
+        prod_side = self._schema_side(prod_node_id, "prod", force)
+        dev_side = self._schema_side(dev_node_id or prod_node_id, "dev", force)
+        prod_schema = prod_side.get("schema")
+        dev_schema = dev_side.get("schema")
+        if prod_side["state"] != "available":
+            result = compare_schemas(None, dev_schema)
+            result["message"] = prod_side.get("message") or "PROD schema metadata is unavailable."
+        elif dev_side["state"] == "absent":
+            result = compare_schemas(prod_schema, None)
+        elif dev_side["state"] != "available":
+            result = {
+                "state": "metadata_unavailable", "compatibility": "unknown", "summary": {},
+                "differences": [], "prod_schema": prod_schema, "dev_schema": dev_schema,
+                "message": dev_side.get("message") or "DEV schema metadata is unavailable.",
+            }
+        else:
+            result = compare_schemas(prod_schema, dev_schema)
+        result["sides"] = {"prod": {key: value for key, value in prod_side.items() if key != "schema"},
+                           "dev": {key: value for key, value in dev_side.items() if key != "schema"}}
+        result["read_only"] = True
+        result["compute_started"] = False
+        return result
+
+    def _schema_side(self, node_id: str, environment: str, force: bool) -> dict:
+        try:
+            kind, variants, availability = _variants(node_id)
+        except Exception:
+            return {"environment": environment, "state": "unavailable", "message": "The selected table identity is invalid."}
+        if kind not in {"table", "view"}:
+            return {"environment": environment, "state": "unavailable", "message": "Select a table or view."}
+        variant = next((item for item in variants if item.get("environment") == environment), None)
+        if not variant:
+            state = availability.get(environment, "unknown")
+            return {
+                "environment": environment, "state": "absent" if state == "absent" else "unknown",
+                "availability": state,
+                "message": f"No corresponding table was found in {environment.upper()}." if state == "absent"
+                           else f"Table availability in {environment.upper()} is not confirmed.",
+            }
+        physical_id = variant.get("node_id")
+        detail = self.provider.detail(physical_id, force=force)
+        if not detail:
+            return {
+                "environment": environment, "state": "unavailable", "availability": "present",
+                "access": variant.get("access", "unknown"),
+                "qualified_name": ".".join(str(variant.get(key, "")) for key in ("catalog", "schema", "table")),
+                "message": f"{environment.upper()} table exists, but its schema metadata could not be read with the current profile.",
+            }
+        columns = detail.get("columns")
+        complete = isinstance(columns, list) and bool(columns) and all(isinstance(column, dict) and column.get("name") and (column.get("type_text") or column.get("type") or column.get("type_name")) for column in columns)
+        qname = str(detail.get("qualified_name") or variant.get("qualified_name") or ".".join(str(variant.get(key, "")) for key in ("catalog", "schema", "table")))
+        schema = canonical_schema(
+            columns if isinstance(columns, list) else [], qname,
+            constraints=detail.get("constraints"),
+            technology_properties=detail.get("technology_properties"),
+            complete=complete,
+        )
+        return {
+            "environment": environment, "state": "available" if complete else "metadata_incomplete",
+            "availability": "present", "access": detail.get("access", variant.get("access", "unknown")),
+            "qualified_name": qname, "schema": schema, "metadata_cache": detail.get("metadata_cache"),
+            "message": None if complete else f"{environment.upper()} schema metadata is incomplete.",
+        }
 
     def _node(self, kind: str, name: str, variants: list[dict], availability: dict | None = None) -> dict:
         if kind in {"table", "view"}:

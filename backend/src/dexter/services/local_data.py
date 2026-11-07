@@ -60,31 +60,40 @@ class LocalDataService:
         self.reconcile_legacy_manifests()
 
     def reconcile_legacy_manifests(self) -> int:
-        """Index valid F2 Parquet manifests without refetching any remote catalog pages."""
+        """Re-index durable Parquet manifests if the SQLite index was lost or replaced."""
         imported = 0
         root = self.paths.datasets.resolve()
-        for manifest_path in self.paths.datasets.glob("*/manifest.json"):
+        manifests = set(self.paths.datasets.glob("*/manifest.json"))
+        manifests.update(self.paths.datasets.glob("*/snapshots/*/manifest.json"))
+        for manifest_path in sorted(manifests):
             try:
                 if manifest_path.is_symlink() or manifest_path.parent.is_symlink() or root not in manifest_path.resolve().parents:
                     continue
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                relative = manifest.get("data_file")
-                if not isinstance(relative, str) or manifest.get("format", "parquet").lower() != "parquet":
+                if manifest.get("format", "parquet").lower() != "parquet":
                     continue
-                data_path = (manifest_path.parent / relative).resolve(strict=True)
-                if manifest_path.parent.resolve() not in data_path.parents or not data_path.is_file() or data_path.stat().st_size == 0:
+                names = manifest.get("data_files") or manifest.get("files")
+                if not isinstance(names, list):
+                    names = [manifest.get("data_file")]
+                if not names or any(not isinstance(name, str) or Path(name).name != name for name in names):
                     continue
+                data_paths = [(manifest_path.parent / name).resolve(strict=True) for name in names]
+                if any(manifest_path.parent.resolve() not in path.parents or not path.is_file() or path.stat().st_size <= 0 for path in data_paths):
+                    continue
+                data_path = manifest_path.parent if len(names) > 1 or manifest.get("data_files") or manifest.get("files") else data_paths[0]
                 dataset_id = str(manifest.get("dataset_id") or manifest_path.parent.name)
                 name = str(manifest.get("name") or dataset_id)
                 qualified = str(manifest.get("qualified_name") or name)
                 source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {"environment": "legacy-local", "catalog": "", "schema": "", "table": name, "workspace": "legacy"}
-                source_key = "legacy:" + dataset_id
+                source_fields = ("environment", "workspace", "catalog", "schema", "table")
+                source_key = self.source_key(source) if all(source.get(key) for key in source_fields) else "legacy:" + dataset_id
                 stamp = str(manifest.get("created_at") or _now())
+                byte_count = sum(path.stat().st_size for path in data_paths)
                 with transaction(self.db_path) as db:
                     existing = db.execute("SELECT 1 FROM local_datasets WHERE dataset_id=?", (dataset_id,)).fetchone()
                     if existing: continue
-                    db.execute("INSERT OR IGNORE INTO local_datasets(dataset_id,source_key,source_json,name,qualified_name,snapshot_id,snapshot_path,manifest_json,row_count,byte_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (dataset_id, source_key, json.dumps(source), name, qualified, str(manifest.get("snapshot_id") or "legacy"), str(data_path), json.dumps(manifest), int(manifest.get("row_count") or 0), int(data_path.stat().st_size), stamp))
-                    imported += 1
+                    cursor = db.execute("INSERT OR IGNORE INTO local_datasets(dataset_id,source_key,source_json,name,qualified_name,snapshot_id,snapshot_path,manifest_json,row_count,byte_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (dataset_id, source_key, json.dumps(source), name, qualified, str(manifest.get("snapshot_id") or "legacy"), str(data_path), json.dumps(manifest), int(manifest.get("row_count") or 0), int(manifest.get("byte_count") or byte_count), stamp))
+                    imported += cursor.rowcount
             except (OSError, ValueError, TypeError, KeyError):
                 continue
         return imported

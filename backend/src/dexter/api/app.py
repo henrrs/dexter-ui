@@ -110,6 +110,13 @@ class RemoteQueryRequest(BaseModel):
     limit: int = Field(default=500, ge=1, le=2_000)
 
 
+class SchemaCompareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prod_node_id: str = Field(min_length=1, max_length=100_000)
+    dev_node_id: str | None = Field(default=None, max_length=100_000)
+    force: bool = False
+
+
 def _read_only_select(sql: str) -> str:
     statement = sql.strip()
     if statement.endswith(";"):
@@ -355,6 +362,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if not asset_guid:
             return {"available": False, "items": [], "relations": [], "message": "No matching Purview asset is available for lineage lookup."}
         return discover.purview_lineage(str(asset_guid))
+
+    @app.post("/api/discover/schema-compare")
+    def compare_table_schemas(body: SchemaCompareRequest):
+        try:
+            return unified.compare_schemas(body.prod_node_id, body.dev_node_id, force=body.force)
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from None
 
     @app.get("/api/discover/catalog-nodes/{node_id:path}")
     def discover_catalog_detail(node_id: str, environment: str | None = None):

@@ -10,7 +10,7 @@
 - The logical node payload contains real physical variants only. Confirmed absence is a separate per-environment availability map carried with the opaque node ID and inherited during lazy expansion. Provider errors remain explicit and do not confirm absence. Since the local dataset index is complete, a missing local variant is confirmed absent.
 - L/D/P are always visible and mean existence. Read access is separate; metadata-only Purview entries display a lock and cannot use preview or materialization actions.
 - Unified Catalog account discovery still uses Azure CLI and ARM, but its Data Assets calls use the documented Unified Catalog service root. The ARM account `catalog` endpoint is not treated as the Unified Catalog host. There is no fallback to Atlas or a privileged identity.
-- Make Local and valid local queries remain operational. Synthetic data and table comparison are explicitly disabled entry points until their backends exist; lineage says when no provider supplies lineage.
+- Make Local and valid local queries remain operational. Synthetic data remains a planned entry point. At F3 time, table comparison was disabled; F4.1 adds read-only schema comparison while row-level data comparison remains unimplemented. Lineage says when no provider supplies lineage.
 
 ## Consequences
 

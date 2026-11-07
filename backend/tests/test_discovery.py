@@ -41,6 +41,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(cache.get("user-a", "catalogs")["stale"])
         self.assertEqual(cache.get("user-b", "catalogs")["items"][0]["name"], "prod")
 
+    def test_persistent_discovery_cache_survives_service_reconstruction(self):
+        DiscoveryCache(self.paths.database).put("dev-profile", "catalogs", [{"name": "analytics_dev"}], 86400)
+        restored = DiscoveryCache(self.paths.database).get("dev-profile", "catalogs")
+        self.assertEqual(restored["items"], [{"name": "analytics_dev"}])
+        self.assertFalse(restored["stale"])
+
     def test_local_manifest_requires_existing_file_inside_dataset_directory(self):
         dataset = self.paths.datasets / "good"
         dataset.mkdir()
@@ -56,6 +62,30 @@ class DiscoveryTests(unittest.TestCase):
         rows = service._local_root()
         self.assertEqual([row["name"] for row in rows], ["Good"])
         self.assertEqual(rows[0]["access"], "read")
+
+    def test_local_snapshot_index_and_manifest_survive_service_restart(self):
+        from dexter.services.local_data import LocalDataService
+        dataset = self.paths.datasets / "dataset-id" / "snapshots" / "snapshot-id"
+        dataset.mkdir(parents=True)
+        (dataset / "part-000.parquet").write_bytes(b"durable parquet placeholder")
+        source = {"environment": "prod", "workspace": "https://workspace", "metastore_id": "m1", "catalog": "tech", "schema": "gold", "table": "orders"}
+        manifest = {"dataset_id": "dataset-id", "snapshot_id": "snapshot-id", "source": source, "name": "orders",
+                    "qualified_name": "tech.gold.orders", "format": "parquet", "data_files": ["part-000.parquet"],
+                    "columns": [{"name": "id", "type": "int64"}], "row_count": 1, "byte_count": 27, "created_at": "2026-11-07T00:00:00+00:00"}
+        (dataset / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        first = LocalDataService(self.paths)
+        self.assertEqual(first.list()[0]["snapshot_id"], "snapshot-id")
+        restarted = LocalDataService(self.paths)
+        self.assertEqual(restarted.list()[0]["qualified_name"], "tech.gold.orders")
+        restarted.recover()
+        self.assertTrue((dataset / "part-000.parquet").exists())
+        self.assertEqual(restarted.list()[0]["snapshot_id"], "snapshot-id")
+        self.paths.database.unlink()
+        for suffix in ("-wal", "-shm"):
+            Path(str(self.paths.database) + suffix).unlink(missing_ok=True)
+        migrate(self.paths.database)
+        reindexed = LocalDataService(self.paths)
+        self.assertEqual(reindexed.list()[0]["source_key"], reindexed.source_key(source))
 
     def test_reconciliation_requires_metastore_and_exact_fully_qualified_name(self):
         fqn = "databricks://meta-1/catalogs/analytics/schemas/sales/tables/orders"

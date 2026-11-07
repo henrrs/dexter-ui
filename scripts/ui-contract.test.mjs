@@ -71,3 +71,17 @@ test('SQL Workspace exposes explicit destinations and the shared local snapshot 
   assert.match(discover, /Preview first 100 rows/)
   assert.doesNotMatch(app, /Discover accounts/)
 })
+
+test('Compare Tables opens a reusable read-only schema comparison tab', () => {
+  assert.match(api, /compareSchemas: .*\/discover\/schema-compare/)
+  assert.match(discover, /view: 'table' \| 'local-query' \| 'compare'/)
+  assert.match(discover, /Compare Tables/)
+  assert.match(discover, /Schema comparison/)
+  assert.match(discover, /PROD-only/)
+  assert.match(discover, /DEV-only/)
+  assert.match(discover, /Type Changed/)
+  assert.match(discover, /No empty DEV schema is fabricated/)
+  assert.match(discover, /Prepare DEV is planned and unavailable/)
+  assert.match(discover, /localSqlWasGenerated/)
+  assert.match(discover, /qualifiedTableIdentifier\(selected, environment\)/)
+})
