@@ -14,6 +14,8 @@ from urllib.parse import quote, urlencode, urlsplit
 from dexter.catalog.cache import DiscoveryCache, context_key
 
 logger = logging.getLogger(__name__)
+# Listing TTLs describe cache age; catalog/schema/table listings refresh only
+# on an explicit Explorer request. Detail metadata keeps its one-hour TTL.
 TTL = {"catalog": 6 * 3600, "schema": 30 * 60, "table": 15 * 60, "detail": 3600}
 
 
@@ -160,7 +162,7 @@ class DiscoverService:
         cache_context = context_key("databricks", env, profile, workspace_host)
         node_key = "/".join(path) or "catalogs"
         cached = self.cache.get(cache_context, node_key)
-        if cached and not cached["stale"] and not force:
+        if cached and not force:
             return cached
         try:
             me = workspace.current_user.me()
@@ -218,7 +220,7 @@ class DiscoverService:
             identity = str(claims.get("oid") or claims.get("appid") or "unknown")
             cache_context = context_key("purview", config["endpoint"], tenant, identity, str(audience))
             cached = self.cache.get(cache_context, "assets")
-            if cached and not cached["stale"] and not force:
+            if cached and not force:
                 return cached
             api_surface = config.get("api_surface", "unified_catalog")
             if api_surface == "data_map":
@@ -393,7 +395,7 @@ class DiscoverService:
             cache_context = context_key("purview-data-map", config["endpoint"], tenant, identity, str(audience), metastore_id)
             cache_key = "schema-assets:" + context_key(catalog.casefold(), schema.casefold())
             cached = self.cache.get(cache_context, cache_key)
-            if cached and not cached["stale"] and not force:
+            if cached and not force:
                 return cached
 
             api_path = "/datamap/api/search/query"

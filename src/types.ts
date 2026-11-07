@@ -34,5 +34,5 @@ export type Operation = {
   cancel_requested: boolean
   created_at: string
   updated_at: string
-  details?: { phase?: string; rows?: number; bytes?: number; files?: number; total_chunks?: number; environment?: string; qualified_name?: string; retry_available?: boolean; resume_available?: boolean }
+  details?: { phase?: string; rows?: number; bytes?: number; files?: number; total_chunks?: number; environment?: string; qualified_name?: string; materialization_request?: { catalog?: string; schema?: string; table?: string }; retry_available?: boolean; resume_available?: boolean }
 }

@@ -15,6 +15,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [sources, setSources] = useState<DiscoverNode[]>([])
   const [pages, setPages] = useState<Record<string, PageState>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const treeStateRef = useRef({ sources, pages, expanded })
+  treeStateRef.current = { sources, pages, expanded }
   const [loading, setLoading] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<DiscoverNode | null>(null)
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([])
@@ -94,43 +96,117 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     } finally { setLoading((prior) => { const next = new Set(prior); next.delete(node.id); return next }) }
   }
 
-  const refreshLoadedNodes = async () => {
-    await loadSources(true)
-    const refreshed: DiscoverNode[] = []
-    await Promise.all([...expanded].map(async (nodeId) => {
-      try {
-        const page = await api.discoverCatalogChildren(nodeId, true)
-        refreshed.push(...page.items)
-        setPages((prior) => ({ ...prior, [nodeId]: { items: page.items, stale: page.stale, error: page.error } }))
-      } catch { /* Keep the current cached tree on a partial refresh failure. */ }
-    }))
-    const findReplacement = (node: DiscoverNode) => {
-      const variantIds = new Set(node.variants?.map((variant) => variant.node_id) ?? [])
-      return refreshed.find((candidate) => candidate.id === node.id
-        || candidate.variants?.some((variant) => variantIds.has(variant.node_id)))
+  const refreshOpenHierarchy = async (force: boolean) => {
+    if (sourcesLoadInFlight.current) return
+    const { sources: oldSources, pages: oldPages, expanded: oldExpanded } = treeStateRef.current
+    sourcesLoadInFlight.current = true
+    setRefreshing(true)
+    try {
+      // Refresh the visible catalog inventory first. Descendant requests use
+      // the refreshed node identities, since unified IDs encode their variants.
+      const refreshedSources = (await api.discoverSources(force)).items
+      setSources(refreshedSources)
+      setSourcesLoaded(true)
+      setSourcesError(null)
+
+      const openCatalogs = oldSources.filter((node) => node.kind === 'catalog' && oldExpanded.has(node.id))
+      const catalogResults = await Promise.all(openCatalogs.map(async (oldCatalog) => {
+        const catalog = findRefreshedNode(oldCatalog, refreshedSources)
+        if (!catalog) return { oldCatalog, catalog: null, page: null as DiscoverPage | null, error: null as string | null }
+        try {
+          const page = normalizeDiscoverPage(await api.discoverCatalogChildren(catalog.id, force))
+          return { oldCatalog, catalog, page, error: null as string | null }
+        } catch (error) {
+          return { oldCatalog, catalog, page: null as DiscoverPage | null, error: error instanceof Error ? error.message : 'Schema metadata could not be refreshed.' }
+        }
+      }))
+
+      const schemaRequests = catalogResults.flatMap((catalogResult) => {
+        const oldSchemas = oldPages[catalogResult.oldCatalog.id]?.items ?? []
+        if (!catalogResult.page && catalogResult.catalog) return []
+        const refreshedSchemas = catalogResult.page?.items ?? []
+        return oldSchemas
+          .filter((node) => node.kind === 'schema' && oldExpanded.has(node.id))
+          .map((oldSchema) => ({ oldSchema, refreshedSchema: findRefreshedNode(oldSchema, refreshedSchemas), catalogResult }))
+      })
+      const schemaResults = await Promise.all(schemaRequests.map(async (request) => {
+        const { oldSchema, refreshedSchema } = request
+        if (!refreshedSchema) return { ...request, page: null as DiscoverPage | null, error: null as string | null }
+        try {
+          const page = normalizeDiscoverPage(await api.discoverCatalogChildren(refreshedSchema.id, force))
+          return { ...request, page, error: null as string | null }
+        } catch (error) {
+          return { ...request, page: null as DiscoverPage | null, error: error instanceof Error ? error.message : 'Table metadata could not be refreshed.' }
+        }
+      }))
+
+      setPages((prior) => {
+        const next = { ...prior }
+        for (const result of catalogResults) {
+          delete next[result.oldCatalog.id]
+          if (!result.catalog) continue
+          const page = result.page ?? prior[result.oldCatalog.id]
+          if (page) next[result.catalog.id] = { items: page.items, stale: page.stale || Boolean(result.error), error: result.error ?? page.error }
+        }
+        for (const result of schemaResults) {
+          delete next[result.oldSchema.id]
+          if (!result.refreshedSchema) continue
+          const page = result.page ?? prior[result.oldSchema.id]
+          if (page) next[result.refreshedSchema.id] = { items: page.items, stale: page.stale || Boolean(result.error), error: result.error ?? page.error }
+        }
+        return next
+      })
+
+      setExpanded((prior) => {
+        const next = new Set(prior)
+        for (const result of catalogResults) {
+          next.delete(result.oldCatalog.id)
+          if (result.catalog) next.add(result.catalog.id)
+        }
+        for (const result of schemaResults) {
+          next.delete(result.oldSchema.id)
+          if (result.refreshedSchema) next.add(result.refreshedSchema.id)
+        }
+        return next
+      })
+
+      const refreshedTables = schemaResults.flatMap((result) => result.page?.items ?? [])
+      const findTableReplacement = (node: DiscoverNode) => findRefreshedNode(node, refreshedTables)
+      setSelected((prior) => {
+        if (!prior) return prior
+        const replacement = findTableReplacement(prior)
+        return replacement
+          ? { ...prior, ...replacement, columns: prior.columns ?? replacement.columns, access: prior.access ?? replacement.access }
+          : prior
+      })
+      setWorkbenchTabs((priorTabs) => priorTabs.map((tab) => {
+        const replacement = findTableReplacement(tab.node)
+        return replacement
+          ? {
+            ...tab,
+            key: tab.view === 'local-query' ? `${replacement.id}:local-query` : replacement.id,
+            node: { ...tab.node, ...replacement, columns: tab.node.columns ?? replacement.columns, access: tab.node.access ?? replacement.access },
+          }
+          : tab
+      }))
+      setActiveTabKey((activeKey) => {
+        const activeTab = workbenchTabs.find((tab) => tab.key === activeKey)
+        if (!activeTab) return activeKey
+        const replacement = findTableReplacement(activeTab.node)
+        if (!replacement) return activeKey
+        return activeTab.view === 'local-query' ? `${replacement.id}:local-query` : replacement.id
+      })
+    } catch (error) {
+      setSourcesError(error instanceof Error ? error.message : 'Catalog metadata could not be refreshed.')
+    } finally {
+      setRefreshing(false)
+      sourcesLoadInFlight.current = false
     }
-    setSelected((prior) => {
-      if (!prior) return prior
-      const replacement = findReplacement(prior)
-      return replacement
-        ? { ...prior, ...replacement, columns: prior.columns ?? replacement.columns, access: prior.access ?? replacement.access }
-        : prior
-    })
-    setWorkbenchTabs((priorTabs) => priorTabs.map((tab) => {
-      const replacement = findReplacement(tab.node)
-      return replacement
-        ? { ...tab, node: { ...tab.node, ...replacement, columns: tab.node.columns ?? replacement.columns, access: tab.node.access ?? replacement.access } }
-        : tab
-    }))
   }
 
-  const refreshCatalog = async () => {
-    await loadSources(true)
-    await Promise.all([...expanded].map(async (nodeId) => {
-      const node = [...sources, ...Object.values(pages).flatMap((page) => page.items)].find((item) => item.id === nodeId)
-      if (node) await loadChildren(node, true)
-    }))
-  }
+  const refreshLoadedNodes = async () => refreshOpenHierarchy(false)
+
+  const refreshCatalog = async () => refreshOpenHierarchy(true)
 
   const toggle = async (node: DiscoverNode) => {
     const open = expanded.has(node.id)
@@ -169,7 +245,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         ? activeEnvironment
         : environments.includes('prod') ? 'prod' : 'dev'
     if (!workbenchTabs.some((item) => item.key === key)) {
-      setLocalSql(`SELECT * FROM ${quoteSqlIdentifier(node.name)} LIMIT 100`)
+      setLocalSql(`SELECT * FROM ${qualifiedTableIdentifier(node, nextQueryEnvironment)} LIMIT 100`)
     }
     if (activeTabKey !== key || activeSection !== 'query') {
       setLocalRows([])
@@ -201,6 +277,20 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const queryHasLocal = Boolean(queryLocalVariant?.dataset_id)
   const localSnapshotDate = queryLocalVariant?.snapshot_created_at
   const localSnapshotLabel = formatSnapshotDate(localSnapshotDate)
+  const operationQualifiedName = activeOperation?.details?.qualified_name
+    ?? variantQualifiedName(activeOperation?.details?.materialization_request)
+  const selectedPhysicalName = variantQualifiedName(selected?.variants?.find((variant) => variant.environment === 'prod'))
+  const selectedLocalName = variantQualifiedName(queryLocalVariant)
+  const selectedNames = [
+    selected?.qualified_name,
+    selectedPhysicalName,
+    selectedLocalName,
+  ].filter((name): name is string => Boolean(name)).map((name) => name.toLocaleLowerCase())
+  const operationMatchesSelected = Boolean(operationQualifiedName && selectedNames.includes(operationQualifiedName.toLocaleLowerCase()))
+  const operationIsTerminalFailure = activeOperation && ['failed', 'interrupted'].includes(activeOperation.state)
+  const snapshotSupersedesOperation = Boolean(operationIsTerminalFailure && localSnapshotDate
+    && Date.parse(localSnapshotDate) >= Date.parse(activeOperation.updated_at))
+  const showActiveOperation = Boolean(activeOperation && operationMatchesSelected && !snapshotSupersedesOperation)
   const queryNeedsDatabricks = queryTarget === 'databricks' || (queryTarget === 'auto' && !queryHasLocal)
   const queryRemoteVariant = selected?.variants?.find((variant) => variant.environment === queryEnvironment)
   const queryCanUseDatabricks = queryRemoteVariant?.access === 'read'
@@ -494,7 +584,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             <button className="operation-card" disabled title="Planned; comparison is not implemented"><Layers3 size={16} /><strong>Compare Tables</strong><span>Cross environment · planned</span><b>→</b></button>
             <button className="operation-card" disabled={!canOpenQuery} onClick={() => void openLocalQuery(selected, activeEnvironment === 'dev' || activeEnvironment === 'prod' ? activeEnvironment : undefined)}><Database size={16} /><strong>Query</strong><span>Run SQL locally or in Databricks.</span><b>→</b></button>
           </div></div>}
-          {activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}{['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then(setActiveOperation).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small className="operation-status-message" role="status" aria-live="polite">{formatMaterializationStatus(activeOperation)}</small></div>}
+          {showActiveOperation && activeOperation && <div className="make-local-card operation-progress"><div className="discover-section-title">Make Local · {activeOperation.state.toUpperCase()}<span>{activeOperation.details?.phase ?? 'queued'} · {activeOperation.progress}% · {activeOperation.details?.rows ?? 0} rows · {activeOperation.details?.bytes ?? 0} bytes · {activeOperation.details?.files ?? 0} files · {Math.max(0, Math.floor((Date.now() - Date.parse(activeOperation.created_at)) / 1000))}s</span>{['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel materialization" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={14} /></button>}{['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then(setActiveOperation).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}</div><div className="operation-progress-track"><span style={{ width: `${activeOperation.progress}%` }} /></div><small className="operation-status-message" role="status" aria-live="polite">{formatMaterializationStatus(activeOperation)}</small></div>}
           {makeLocalOpen && <div className="make-local-modal-backdrop"><section className="make-local-dialog" role="dialog" aria-modal="true" aria-labelledby="make-local-dialog-title">
             <header className="make-local-dialog-header"><div><span className="eyebrow">LOCAL SNAPSHOT</span><h3 id="make-local-dialog-title">Make {selected.name} local</h3><code>{selected.qualified_name ?? selected.name}</code></div><button className="icon-button subtle" aria-label="Close Make Local" onClick={() => setMakeLocalOpen(false)}><X size={16} /></button></header>
             <div className="make-local-dialog-body">
@@ -564,6 +654,23 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   </>
 }
 
+function normalizeDiscoverPage(response: DiscoverPage | DiscoverNode[]): DiscoverPage {
+  return Array.isArray(response)
+    ? { items: response, stale: false, error: null, fetched_at: null, expires_at: null }
+    : response
+}
+
+function findRefreshedNode(node: DiscoverNode, candidates: DiscoverNode[]): DiscoverNode | undefined {
+  const exact = candidates.find((candidate) => candidate.id === node.id)
+  if (exact) return exact
+  const name = (node.qualified_name ?? node.name).toLocaleLowerCase()
+  const sameName = candidates.filter((candidate) => candidate.kind === node.kind
+    && (candidate.qualified_name ?? candidate.name).toLocaleLowerCase() === name)
+  if (sameName.length === 1) return sameName[0]
+  const variantIds = new Set(node.variants?.map((variant) => variant.node_id) ?? [])
+  return sameName.find((candidate) => candidate.variants?.some((variant) => variantIds.has(variant.node_id)))
+}
+
 function formatMaterializationStatus(operation: Operation): string {
   const details = operation.details ?? {}
   const rows = (details.rows ?? 0).toLocaleString()
@@ -593,6 +700,25 @@ function formatMaterializationStatus(operation: Operation): string {
 
 function quoteSqlIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`
+}
+
+function variantQualifiedName(variant?: { catalog?: string; schema?: string; table?: string }): string | undefined {
+  return variant?.catalog && variant.schema && variant.table
+    ? [variant.catalog, variant.schema, variant.table].join('.')
+    : undefined
+}
+
+function qualifiedTableIdentifier(node: DiscoverNode, environment: 'dev' | 'prod'): string {
+  const local = node.variants?.find((variant) => variant.environment === 'local')
+  const selected = local ?? node.variants?.find((variant) => variant.environment === environment)
+  const parts = selected ? [selected.catalog, selected.schema, selected.table] : []
+  if (parts.length === 3 && parts.every((part): part is string => Boolean(part))) {
+    return parts.map(quoteSqlIdentifier).join('.')
+  }
+  const qualified = node.qualified_name?.split('.') ?? []
+  return qualified.length === 3
+    ? qualified.map(quoteSqlIdentifier).join('.')
+    : quoteSqlIdentifier(node.name)
 }
 
 function formatSnapshotDate(value?: string): string {

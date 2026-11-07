@@ -320,6 +320,23 @@ class LocalDataService:
                 if dataset["name"].casefold() != "local_table":
                     escaped_name = dataset["name"].replace('"', '""')
                     db.execute(f'CREATE VIEW "{escaped_name}" AS SELECT * FROM local_table')
+                source = dataset.get("source") or {}
+                parts = [source.get("catalog"), source.get("schema"), source.get("table")]
+                if not all(isinstance(part, str) and part for part in parts):
+                    parts = dataset["qualified_name"].split(".")
+                if len(parts) == 3 and all(isinstance(part, str) and part for part in parts):
+                    catalog_name, schema_name, table_name = parts
+                    quote = lambda value: '"' + value.replace('"', '""') + '"'
+                    catalog = quote(catalog_name)
+                    current_catalog = db.execute("SELECT current_catalog()").fetchone()[0]
+                    if catalog_name.casefold() != str(current_catalog).casefold():
+                        db.execute(f"ATTACH ':memory:' AS {catalog}")
+                    db.execute(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{quote(schema_name)}")
+                    source_table = f"{quote(str(current_catalog))}.main.local_table"
+                    db.execute(
+                        f"CREATE VIEW {catalog}.{quote(schema_name)}.{quote(table_name)} "
+                        f"AS SELECT * FROM {source_table}"
+                    )
                 statements = db.extract_statements(statement)
                 if len(statements) != 1 or not str(statements[0].type).upper().endswith("SELECT"):
                     raise ValueError("Only a single read-only query is allowed")
