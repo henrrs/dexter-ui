@@ -15,14 +15,15 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [sources, setSources] = useState<DiscoverNode[]>([])
   const [pages, setPages] = useState<Record<string, PageState>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
-  const treeStateRef = useRef({ sources, pages, expanded })
-  treeStateRef.current = { sources, pages, expanded }
   const [loading, setLoading] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<DiscoverNode | null>(null)
   const [workbenchTabs, setWorkbenchTabs] = useState<WorkbenchTab[]>([])
   const [activeTabKey, setActiveTabKey] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<WorkbenchSection>('overview')
   const [query, setQuery] = useState('')
+  const [collapsedBySearch, setCollapsedBySearch] = useState<Set<string>>(new Set())
+  const treeStateRef = useRef({ sources, pages, expanded, query, collapsedBySearch })
+  treeStateRef.current = { sources, pages, expanded, query, collapsedBySearch }
   const [refreshing, setRefreshing] = useState(false)
   const [sourcesLoaded, setSourcesLoaded] = useState(false)
   const sourcesLoadInFlight = useRef(false)
@@ -98,7 +99,17 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
 
   const refreshOpenHierarchy = async (force: boolean) => {
     if (sourcesLoadInFlight.current) return
-    const { sources: oldSources, pages: oldPages, expanded: oldExpanded } = treeStateRef.current
+    const {
+      sources: oldSources, pages: oldPages, expanded: oldExpanded,
+      query: oldQuery, collapsedBySearch: oldCollapsedBySearch,
+    } = treeStateRef.current
+    const oldChildren = (node: DiscoverNode) => node.children ?? oldPages[node.id]?.items ?? []
+    const oldMatches = (node: DiscoverNode): boolean => {
+      const text = `${node.name} ${node.qualified_name ?? ''} ${node.source} ${node.environment}`.toLocaleLowerCase()
+      return text.includes(oldQuery.trim().toLocaleLowerCase()) || oldChildren(node).some(oldMatches)
+    }
+    const wasOpen = (node: DiscoverNode) => !oldCollapsedBySearch.has(node.id)
+      && (oldExpanded.has(node.id) || Boolean(oldQuery.trim() && oldChildren(node).some(oldMatches)))
     sourcesLoadInFlight.current = true
     setRefreshing(true)
     try {
@@ -109,15 +120,16 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       setSourcesLoaded(true)
       setSourcesError(null)
 
-      const openCatalogs = oldSources.filter((node) => node.kind === 'catalog' && oldExpanded.has(node.id))
+      const openCatalogs = oldSources.filter((node) => node.kind === 'catalog' && wasOpen(node))
       const catalogResults = await Promise.all(openCatalogs.map(async (oldCatalog) => {
         const catalog = findRefreshedNode(oldCatalog, refreshedSources)
-        if (!catalog) return { oldCatalog, catalog: null, page: null as DiscoverPage | null, error: null as string | null }
+        const wasExpanded = oldExpanded.has(oldCatalog.id)
+        if (!catalog) return { oldCatalog, catalog: null, page: null as DiscoverPage | null, error: null as string | null, wasExpanded }
         try {
           const page = normalizeDiscoverPage(await api.discoverCatalogChildren(catalog.id, force))
-          return { oldCatalog, catalog, page, error: null as string | null }
+          return { oldCatalog, catalog, page, error: null as string | null, wasExpanded }
         } catch (error) {
-          return { oldCatalog, catalog, page: null as DiscoverPage | null, error: error instanceof Error ? error.message : 'Schema metadata could not be refreshed.' }
+          return { oldCatalog, catalog, page: null as DiscoverPage | null, error: error instanceof Error ? error.message : 'Schema metadata could not be refreshed.', wasExpanded }
         }
       }))
 
@@ -126,8 +138,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         if (!catalogResult.page && catalogResult.catalog) return []
         const refreshedSchemas = catalogResult.page?.items ?? []
         return oldSchemas
-          .filter((node) => node.kind === 'schema' && oldExpanded.has(node.id))
-          .map((oldSchema) => ({ oldSchema, refreshedSchema: findRefreshedNode(oldSchema, refreshedSchemas), catalogResult }))
+          .filter((node) => node.kind === 'schema' && wasOpen(node))
+          .map((oldSchema) => ({ oldSchema, refreshedSchema: findRefreshedNode(oldSchema, refreshedSchemas), catalogResult, wasExpanded: oldExpanded.has(oldSchema.id) }))
       })
       const schemaResults = await Promise.all(schemaRequests.map(async (request) => {
         const { oldSchema, refreshedSchema } = request
@@ -161,14 +173,15 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         const next = new Set(prior)
         for (const result of catalogResults) {
           next.delete(result.oldCatalog.id)
-          if (result.catalog) next.add(result.catalog.id)
+          if (result.catalog && result.wasExpanded) next.add(result.catalog.id)
         }
         for (const result of schemaResults) {
           next.delete(result.oldSchema.id)
-          if (result.refreshedSchema) next.add(result.refreshedSchema.id)
+          if (result.refreshedSchema && result.wasExpanded) next.add(result.refreshedSchema.id)
         }
         return next
       })
+      setCollapsedBySearch(new Set())
 
       const refreshedTables = schemaResults.flatMap((result) => result.page?.items ?? [])
       const findTableReplacement = (node: DiscoverNode) => findRefreshedNode(node, refreshedTables)
@@ -209,8 +222,16 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const refreshCatalog = async () => refreshOpenHierarchy(true)
 
   const toggle = async (node: DiscoverNode) => {
-    const open = expanded.has(node.id)
+    const children = node.children ?? pages[node.id]?.items ?? []
+    const searchOpensNode = Boolean(query.trim() && children.some(matchesLoadedBranch))
+    const open = !collapsedBySearch.has(node.id) && (expanded.has(node.id) || searchOpensNode)
     setExpanded((prior) => { const next = new Set(prior); open ? next.delete(node.id) : next.add(node.id); return next })
+    setCollapsedBySearch((prior) => {
+      const next = new Set(prior)
+      if (open && searchOpensNode) next.add(node.id)
+      else next.delete(node.id)
+      return next
+    })
     if (!open && node.kind !== 'table' && node.kind !== 'view') await loadChildren(node)
   }
 
@@ -492,7 +513,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const hasPurviewDetails = Boolean(metadataDescription || metadataOwner || classifications.length || labels.length || metadataType)
   const renderNodes = (nodes: DiscoverNode[], depth = 0): ReactNode => nodes.filter((node) => !query.trim() || matchesLoadedBranch(node)).map((node) => {
     const children = loadedChildren(node)
-    const open = expanded.has(node.id) || Boolean(query.trim() && children.some(matchesLoadedBranch))
+    const searchOpensNode = Boolean(query.trim() && children.some(matchesLoadedBranch))
+    const open = !collapsedBySearch.has(node.id) && (expanded.has(node.id) || searchOpensNode)
     const expandable = !['table', 'view'].includes(node.kind)
     const pending = loading.has(node.id)
     const access = node.access ?? 'unknown'
@@ -517,7 +539,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const visible = useMemo(() => sources.filter((node) => !query.trim() || matchesLoadedBranch(node)), [sources, pages, query])
   if (!active) return null
   return <>
-    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search loaded catalogs, schemas and tables…" value={query} onChange={(event) => setQuery(event.target.value)} /></label></div>
+    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search loaded catalogs, schemas and tables…" value={query} onChange={(event) => { setQuery(event.target.value); setCollapsedBySearch(new Set()) }} /></label></div>
         <div className="discover-tree">
           {sources.length === 0 && (!sourcesLoaded || refreshing)
             ? <div className="loading-state"><LoaderCircle size={15} className="spin" /> Loading catalog metadata…</div>
@@ -698,10 +720,6 @@ function formatMaterializationStatus(operation: Operation): string {
   }
 }
 
-function quoteSqlIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`
-}
-
 function variantQualifiedName(variant?: { catalog?: string; schema?: string; table?: string }): string | undefined {
   return variant?.catalog && variant.schema && variant.table
     ? [variant.catalog, variant.schema, variant.table].join('.')
@@ -710,15 +728,15 @@ function variantQualifiedName(variant?: { catalog?: string; schema?: string; tab
 
 function qualifiedTableIdentifier(node: DiscoverNode, environment: 'dev' | 'prod'): string {
   const local = node.variants?.find((variant) => variant.environment === 'local')
-  const selected = local ?? node.variants?.find((variant) => variant.environment === environment)
+  const selected = node.variants?.find((variant) => variant.environment === environment) ?? local
   const parts = selected ? [selected.catalog, selected.schema, selected.table] : []
   if (parts.length === 3 && parts.every((part): part is string => Boolean(part))) {
-    return parts.map(quoteSqlIdentifier).join('.')
+    return parts.join('.')
   }
   const qualified = node.qualified_name?.split('.') ?? []
   return qualified.length === 3
-    ? qualified.map(quoteSqlIdentifier).join('.')
-    : quoteSqlIdentifier(node.name)
+    ? qualified.join('.')
+    : node.name
 }
 
 function formatSnapshotDate(value?: string): string {

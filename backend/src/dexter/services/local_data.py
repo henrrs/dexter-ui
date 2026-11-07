@@ -332,7 +332,9 @@ class LocalDataService:
                     if catalog_name.casefold() != str(current_catalog).casefold():
                         db.execute(f"ATTACH ':memory:' AS {catalog}")
                     db.execute(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{quote(schema_name)}")
-                    source_table = f"{quote(str(current_catalog))}.main.local_table"
+                    # Arrow relations registered through DuckDB's Python API live
+                    # in the connection's temporary catalog, not its main catalog.
+                    source_table = '"temp".main.local_table'
                     db.execute(
                         f"CREATE VIEW {catalog}.{quote(schema_name)}.{quote(table_name)} "
                         f"AS SELECT * FROM {source_table}"
