@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -15,6 +16,14 @@ from dexter.db.database import connect, transaction
 from dexter.services.analytics_config import load_limits
 
 _dataset_lock = threading.RLock()
+
+
+class MaterializationConflict(RuntimeError):
+    """Another operation currently owns the local snapshot reservation."""
+
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        super().__init__(f"A previous Make Local operation owns this table reservation: {operation_id}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -132,19 +141,41 @@ class LocalDataService:
         return self._serialize(row) if row and self._valid_path(row["snapshot_path"]) else None
 
     def reserve(self, operation_id: str, source: dict, name: str, qualified_name: str, staging: Path) -> str:
-        source_key = json.dumps({
-            "environment": source["environment"], "workspace": source["workspace"],
-            "metastore_id": source.get("metastore_id"), "catalog": source["catalog"],
-            "schema": source["schema"], "table": source["table"],
-        }, sort_keys=True, separators=(",", ":"))
+        source_key = self.source_key(source)
         with transaction(self.db_path) as db:
             existing = db.execute("SELECT source_key,staging_path FROM local_materialization_locks WHERE operation_id=?", (operation_id,)).fetchone()
             if existing:
                 if existing["source_key"] != source_key or existing["staging_path"] != str(staging):
                     raise RuntimeError("The saved materialization reservation does not match this retry")
             else:
-                db.execute("INSERT INTO local_materialization_locks(source_key,operation_id,staging_path) VALUES(?,?,?)", (source_key, operation_id, str(staging)))
+                try:
+                    db.execute("INSERT INTO local_materialization_locks(source_key,operation_id,staging_path) VALUES(?,?,?)", (source_key, operation_id, str(staging)))
+                except sqlite3.IntegrityError as exc:
+                    owner = db.execute(
+                        "SELECT operation_id FROM local_materialization_locks WHERE source_key=?",
+                        (source_key,),
+                    ).fetchone()
+                    if owner and owner["operation_id"] != operation_id:
+                        raise MaterializationConflict(owner["operation_id"]) from exc
+                    raise
         return source_key
+
+    @staticmethod
+    def source_key(source: dict) -> str:
+        return json.dumps({
+            "environment": source["environment"], "workspace": source["workspace"],
+            "metastore_id": source.get("metastore_id"), "catalog": source["catalog"],
+            "schema": source["schema"], "table": source["table"],
+        }, sort_keys=True, separators=(",", ":"))
+
+    def reservation_owner(self, source: dict) -> str | None:
+        source_key = self.source_key(source)
+        with transaction(self.db_path) as db:
+            row = db.execute(
+                "SELECT operation_id FROM local_materialization_locks WHERE source_key=?",
+                (source_key,),
+            ).fetchone()
+            return str(row["operation_id"]) if row else None
 
     @_synchronized
     def publish(self, operation_id: str, source_key: str, source: dict, name: str, qualified_name: str,
@@ -283,7 +314,12 @@ class LocalDataService:
                 memory_limit = load_limits(self.paths.config).memory_limit
                 db.execute(f"SET memory_limit='{memory_limit}'")
                 db.execute("SET threads=2")
-                db.register("local_table", ds.dataset(dataset["snapshot_path"], format="parquet", exclude_invalid_files=True))
+                local_arrow_dataset = ds.dataset(dataset["snapshot_path"], format="parquet", exclude_invalid_files=True)
+                db.register("local_table", local_arrow_dataset)
+                # Use the source table name in new SQL while keeping old saved queries valid.
+                if dataset["name"].casefold() != "local_table":
+                    escaped_name = dataset["name"].replace('"', '""')
+                    db.execute(f'CREATE VIEW "{escaped_name}" AS SELECT * FROM local_table')
                 statements = db.extract_statements(statement)
                 if len(statements) != 1 or not str(statements[0].type).upper().endswith("SELECT"):
                     raise ValueError("Only a single read-only query is allowed")

@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -98,6 +99,37 @@ class RemotePreviewRequest(BaseModel):
     node_id: str = Field(min_length=1, max_length=100_000)
     environment: str = Field(pattern="^(dev|prod)$")
     warehouse_id: str = Field(min_length=1, max_length=160)
+
+
+class RemoteQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=100_000)
+    environment: str = Field(pattern="^(dev|prod)$")
+    warehouse_id: str = Field(min_length=1, max_length=160)
+    sql: str = Field(min_length=1, max_length=20_000)
+    limit: int = Field(default=500, ge=1, le=2_000)
+
+
+def _read_only_select(sql: str) -> str:
+    statement = sql.strip()
+    if statement.endswith(";"):
+        statement = statement[:-1].rstrip()
+    if not statement:
+        raise HTTPException(422, detail="Enter one read-only SELECT query without multiple statements")
+    try:
+        import duckdb
+        parser = duckdb.connect(":memory:")
+        try:
+            parsed = parser.extract_statements(statement)
+            if len(parsed) != 1 or not str(parsed[0].type).upper().endswith("SELECT"):
+                raise HTTPException(422, detail="Only one read-only SELECT query is allowed")
+        finally:
+            parser.close()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(422, detail="The SQL query could not be parsed as a single read-only SELECT") from None
+    return statement
 
 
 def _connections(repo: SettingsRepository, settings: Settings) -> dict:
@@ -394,6 +426,37 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         minimum_free = analytics_limits.minimum_free_disk_mb * 1024 * 1024
         if shutil.disk_usage(paths.datasets).free < minimum_free:
             raise HTTPException(409, detail=f"At least {analytics_limits.minimum_free_disk_mb} MiB of local free space is required")
+        source_identity = {
+            "environment": parts[1], "workspace": detail.get("workspace"),
+            "metastore_id": detail.get("metastore_id"), "catalog": parts[2],
+            "schema": parts[3], "table": parts[4],
+        }
+        reserved_operation_id = local_data.reservation_owner(source_identity)
+        if reserved_operation_id:
+            # Reuse an active or resumable operation instead of creating a new one
+            # that would collide with its unique per-table snapshot reservation.
+            operations.recover_stale_workers()
+            reserved_operation = operations.get(reserved_operation_id)
+            reserved_details = (reserved_operation or {}).get("details") or {}
+            if (reserved_operation
+                    and (reserved_operation["state"] in {"queued", "running"}
+                         or (reserved_operation["state"] in {"failed", "interrupted"}
+                             and reserved_details.get("resume_available") is True))):
+                operations.log(
+                    reserved_operation_id,
+                    "A repeated Make Local request found this table's existing reservation; the existing operation was reopened.",
+                )
+                return reserved_operation
+            local_data.recover()
+            reserved_operation_id = local_data.reservation_owner(source_identity)
+            if reserved_operation_id:
+                reserved_operation = operations.get(reserved_operation_id)
+                if reserved_operation:
+                    operations.log(
+                        reserved_operation_id,
+                        "A repeated Make Local request found this table's existing reservation; the existing operation was reopened.",
+                    )
+                    return reserved_operation
         operation = operations.create("make-local", "Full snapshot queued")
         resume_request = {"node_id": physical_id, "environment": parts[1], "catalog": parts[2],
                           "schema": parts[3], "table": parts[4], "columns": body.columns,
@@ -504,6 +567,89 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         except Exception as exc:
             logger.info("Remote preview failed (%s)", type(exc).__name__)
             raise HTTPException(503, detail="The selected profile could not complete the authorized preview") from None
+
+    @app.post("/api/discover/query")
+    def run_remote_query(body: RemoteQueryRequest):
+        try:
+            kind, variants, _ = _variants(body.node_id)
+        except Exception:
+            raise HTTPException(422, detail="Invalid unified table identity") from None
+        variant = next((item for item in variants if item.get("environment") == body.environment), None)
+        if kind not in {"table", "view"} or not variant:
+            raise HTTPException(422, detail="Select a table or view available in the selected environment")
+        physical_id = variant.get("node_id")
+        parts = physical_id.split(":") if isinstance(physical_id, str) else []
+        detail = discover.detail(physical_id) if len(parts) == 5 else None
+        if (not detail or parts[0] != "databricks" or parts[1] != body.environment
+                or detail.get("access") != "read"):
+            raise HTTPException(403, detail="The selected Databricks profile does not have read access to this table")
+        config = settings_repo.get(f"databricks.{body.environment}")
+        if not config:
+            raise HTTPException(409, detail="The selected environment has no configured Databricks profile")
+        statement = _read_only_select(body.sql)
+        # Wrap the user's SELECT so the response stays bounded even when the SQL has no LIMIT.
+        bounded_statement = f"SELECT * FROM (\n{statement}\n) AS dexter_query LIMIT {body.limit + 1}"
+        try:
+            from databricks.sdk import WorkspaceClient
+            from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
+            workspace = WorkspaceClient(
+                profile=config["profile"], config_file=str(profile_config_file(config["profile"])),
+            )
+            ensure_sql_warehouse_running(workspace, body.warehouse_id)
+            response = workspace.api_client.do(
+                "POST", "/api/2.0/sql/statements/", body={
+                    "statement": bounded_statement,
+                    "warehouse_id": body.warehouse_id,
+                    "catalog": parts[2],
+                    "schema": parts[3],
+                    "wait_timeout": "50s",
+                    "on_wait_timeout": "CONTINUE",
+                    "format": "JSON_ARRAY",
+                    "disposition": "INLINE",
+                },
+            )
+            status = str((response.get("status") or {}).get("state", "")).upper().split(".")[-1]
+            statement_id = response.get("statement_id")
+            deadline = time.monotonic() + 60
+            while status in {"PENDING", "RUNNING"} and statement_id and time.monotonic() < deadline:
+                time.sleep(0.5)
+                response = workspace.api_client.do(
+                    "GET", f"/api/2.0/sql/statements/{statement_id}",
+                )
+                status = str((response.get("status") or {}).get("state", "")).upper().split(".")[-1]
+            if status != "SUCCEEDED":
+                if statement_id and status in {"PENDING", "RUNNING"}:
+                    workspace.api_client.do("POST", f"/api/2.0/sql/statements/{statement_id}/cancel")
+                    raise HTTPException(504, detail="The Databricks query did not finish in time")
+                remote_error = (response.get("status") or {}).get("error") or {}
+                message = " ".join(str(remote_error.get("message") or "").split())[:400]
+                raise HTTPException(422, detail=message or "Databricks could not run this SQL query")
+            schema_columns = ((response.get("manifest") or {}).get("schema") or {}).get("columns", [])
+            columns = [item.get("name", "") for item in schema_columns]
+            data = ((response.get("result") or {}).get("data_array") or [])
+            rows = [dict(zip(columns, row)) for row in data[:body.limit]]
+            total_rows = (response.get("manifest") or {}).get("total_row_count")
+            truncated = len(data) > body.limit or (isinstance(total_rows, int) and total_rows > body.limit)
+            return {"columns": columns, "rows": rows, "truncated": truncated}
+        except HTTPException:
+            raise
+        except PermissionError:
+            raise HTTPException(403, detail="The selected SQL warehouse is not accessible to this Databricks profile") from None
+        except RuntimeError as exc:
+            if "warehouse" in str(exc).lower():
+                raise HTTPException(503, detail="The selected SQL warehouse could not be started") from None
+            logger.info("Databricks query failed (%s)", type(exc).__name__)
+            raise HTTPException(503, detail="The selected profile could not complete this query") from None
+        except Exception as exc:
+            status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+            logger.info("Databricks query failed (%s)", type(exc).__name__)
+            if status == 401:
+                raise HTTPException(401, detail="The selected Databricks profile could not authenticate") from None
+            if status == 403:
+                raise HTTPException(403, detail="The selected profile is not authorized to run this query") from None
+            if status in {400, 404}:
+                raise HTTPException(422, detail="Databricks rejected this query. Check the SQL and table names.") from None
+            raise HTTPException(503, detail="The selected profile could not complete this query") from None
 
     @app.get("/api/local-datasets")
     def list_local_datasets():

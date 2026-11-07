@@ -113,7 +113,7 @@ class UnifiedDiscoverService:
             catalog, schema, table = parts
             variants = groups.setdefault(catalog.casefold(), [])
             if not any(v.get("environment") == "local" and v.get("table", "").casefold() == table.casefold() and v.get("schema", "").casefold() == schema.casefold() for v in variants):
-                variants.append({"environment": "local", "catalog": catalog, "schema": schema, "table": table, "node_id": f"local:table:{dataset['dataset_id']}", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "access": "read"})
+                variants.append({"environment": "local", "catalog": catalog, "schema": schema, "table": table, "node_id": f"local:table:{dataset['dataset_id']}", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at"), "access": "read"})
             if not any(node["name"].casefold() == catalog.casefold() for node in nodes):
                 nodes.append({"id": _variants_id("catalog", variants), "name": catalog, "qualified_name": catalog, "kind": "catalog", "source": "unified", "environment": "logical", "access": "unknown", "variants": variants, "availability": self._availability(variants), "children": None})
         for node in nodes:
@@ -151,7 +151,7 @@ class UnifiedDiscoverService:
                     asset = variant.get("metadata", {})
                     groups.setdefault(variant["schema"].casefold(), []).append({"environment": "purview", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "metadata": asset})
                 elif variant.get("environment") == "local" and variant.get("node_id"):
-                    groups.setdefault(variant["schema"].casefold(), []).append({"environment": "local", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "dataset_id": variant.get("dataset_id"), "metastore_id": variant.get("metastore_id"), "access": "read"})
+                    groups.setdefault(variant["schema"].casefold(), []).append({"environment": "local", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "dataset_id": variant.get("dataset_id"), "metastore_id": variant.get("metastore_id"), "snapshot_created_at": variant.get("snapshot_created_at"), "access": "read"})
             items = []
             for schema_name, schema_variants in sorted(groups.items()):
                 availability = self._child_availability(schema_variants, successful_pages, schema_name, parent_availability)
@@ -239,6 +239,7 @@ class UnifiedDiscoverService:
                     "metadata_visible": True, "read_access": True, "access": "read",
                     "workspace": dataset["source"].get("workspace"),
                     "metastore_id": dataset["source"].get("metastore_id"),
+                    "created_at": dataset.get("created_at"),
                     "columns": dataset["manifest"].get("columns", []),
                     "row_count": dataset["row_count"], "format": "parquet",
                     "variants": variants, "availability": availability or self._availability(variants)}
@@ -265,7 +266,7 @@ class UnifiedDiscoverService:
             for dataset in self.local_data.list():
                 existing_local_ids = {v.get("dataset_id") for v in variants if v.get("environment") == "local"}
                 if dataset["qualified_name"].casefold() in qnames and dataset["dataset_id"] not in existing_local_ids:
-                    variants.append({"environment": "local", "catalog": dataset["source"].get("catalog"), "schema": dataset["source"].get("schema"), "table": dataset["source"].get("table"), "node_id": f"local:table:{dataset['dataset_id']}", "access": "read", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id")})
+                    variants.append({"environment": "local", "catalog": dataset["source"].get("catalog"), "schema": dataset["source"].get("schema"), "table": dataset["source"].get("table"), "node_id": f"local:table:{dataset['dataset_id']}", "access": "read", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at")})
         availability = availability or self._availability(variants)
         if any(v.get("environment") == "local" for v in variants): availability["local"] = "present"
         node_id = _variants_id(kind, variants, availability)

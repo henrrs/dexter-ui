@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 from dexter.services.analytics_config import load_limits
+from dexter.services.local_data import MaterializationConflict
 
 MAX_ARROW_CHUNK_BYTES = 2 * 1024 ** 3
 CHUNK_RETRY_ATTEMPTS = 4
@@ -1139,6 +1140,13 @@ def _parameter_type(value):
 
 
 def _safe_error(exc: Exception) -> str:
+    if isinstance(exc, MaterializationConflict):
+        return (
+            "Another Make Local operation already owns this table's local snapshot reservation "
+            f"(operation {exc.operation_id}). Resume that operation or wait for it to finish."
+        )
+    if type(exc).__module__ == "sqlite3" and type(exc).__name__ == "IntegrityError":
+        return f"Local snapshot state violated a SQLite constraint: {exc}"
     if isinstance(exc, SubmissionOutcomeUnknown):
         return "Databricks may have accepted the query, but Dexter did not save its statement ID. Check query history before starting another copy."
     if isinstance(exc, RemoteResultExpired):
@@ -1219,6 +1227,7 @@ def _root_cause(exc: Exception) -> Exception:
 
 
 def _error_code(exc: Exception) -> str:
+    if isinstance(exc, MaterializationConflict): return "MATERIALIZATION_CONFLICT"
     if isinstance(exc, SubmissionOutcomeUnknown): return "SUBMISSION_UNKNOWN"
     if isinstance(exc, RemoteResultExpired): return "REMOTE_RESULT_EXPIRED"
     if isinstance(exc, WorkerLeaseLost): return "WORKER_LEASE_LOST"

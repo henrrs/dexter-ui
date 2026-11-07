@@ -29,6 +29,7 @@ export const api = {
   warehouses: (nodeId: string, environment: 'dev' | 'prod') => request<{ items: Array<{ id: string; name: string; state: string }>; message: string | null }>(`/discover/nodes/${encodeURIComponent(nodeId)}/warehouses?environment=${environment}`),
   makeLocal: (nodeId: string, body: { environment: 'dev' | 'prod'; warehouse_id: string; columns: string[]; filters: Array<{ column: string; operator: string; value?: unknown }> }) => request<Operation>('/discover/make-local', { method: 'POST', body: JSON.stringify({ ...body, node_id: nodeId }) }),
   previewRemote: (nodeId: string, environment: 'dev' | 'prod', warehouse_id: string) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>('/discover/preview', { method: 'POST', body: JSON.stringify({ node_id: nodeId, environment, warehouse_id }) }),
+  queryDatabricks: (nodeId: string, environment: 'dev' | 'prod', warehouse_id: string, sql: string, limit = 500) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>('/discover/query', { method: 'POST', body: JSON.stringify({ node_id: nodeId, environment, warehouse_id, sql, limit }) }),
   operation: (id: string) => request<Operation>(`/operations/${id}`),
   operationLogs: (id: string) => request<{ items: Array<{ created_at: string; level: string; message: string }> }>(`/operations/${id}/logs`),
   cancelOperation: (id: string) => request<Operation>(`/operations/${id}/cancel`, { method: 'POST' }),
@@ -46,11 +47,11 @@ export type DiscoverNode = {
   exists?: boolean; metadata_visible?: boolean; read_access?: boolean | null
   metastore_id?: string | null; classifications?: string[]
   workspace?: string; profile?: string; logical_name?: string
-  variants?: Array<{ environment: string; catalog: string; schema?: string; table?: string; node_id: string; access?: string; metastore_id?: string; dataset_id?: string; metadata?: Record<string, unknown> }>
+  variants?: Array<{ environment: string; catalog: string; schema?: string; table?: string; node_id: string; access?: string; metastore_id?: string; dataset_id?: string; snapshot_created_at?: string; metadata?: Record<string, unknown> }>
   availability?: { local: 'present' | 'unknown' | 'absent'; dev: 'present' | 'unknown' | 'absent'; prod: 'present' | 'unknown' | 'absent' }
   ambiguous?: boolean
   purview_metadata?: Record<string, unknown>
   children?: DiscoverNode[] | null; row_count?: number | null; format?: string
 }
 export type DiscoverPage = { items: DiscoverNode[]; fetched_at: number | null; expires_at: number | null; stale: boolean; error: string | null }
-export type LocalDataset = { dataset_id: string; name: string; qualified_name: string; snapshot_path: string; row_count: number; byte_count: number; source: { environment: string; workspace: string; catalog: string; schema: string; table: string }; manifest: { columns: Array<{ name: string; type: string; nullable: boolean }> } }
+export type LocalDataset = { dataset_id: string; name: string; qualified_name: string; snapshot_path: string; row_count: number; byte_count: number; created_at: string; source: { environment: string; workspace: string; catalog: string; schema: string; table: string }; manifest: { columns: Array<{ name: string; type: string; nullable: boolean }> } }
