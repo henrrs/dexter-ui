@@ -29,7 +29,7 @@ from dexter.db.database import migrate
 from dexter.logging_config import configure_logging
 from dexter.paths import DexterPaths
 from dexter.services.operations import OperationsService, SettingsRepository, QUEUED_WORKER_LEASE_SECONDS
-from dexter.services.local_data import LocalDataService
+from dexter.services.local_data import LocalDataService, LocalDatasetBusy
 from dexter.services.materialize import make_local_worker
 from dexter.services.analytics_config import load_limits
 
@@ -626,11 +626,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 raise HTTPException(422, detail=message or "Databricks could not run this SQL query")
             schema_columns = ((response.get("manifest") or {}).get("schema") or {}).get("columns", [])
             columns = [item.get("name", "") for item in schema_columns]
+            result_schema = [{
+                "name": item.get("name", ""),
+                "type": str(item.get("type_text") or item.get("type_name") or item.get("type") or "unknown"),
+            } for item in schema_columns]
             data = ((response.get("result") or {}).get("data_array") or [])
             rows = [dict(zip(columns, row)) for row in data[:body.limit]]
             total_rows = (response.get("manifest") or {}).get("total_row_count")
             truncated = len(data) > body.limit or (isinstance(total_rows, int) and total_rows > body.limit)
-            return {"columns": columns, "rows": rows, "truncated": truncated}
+            return {"columns": columns, "schema": result_schema, "rows": rows, "truncated": truncated, "executed_sql": bounded_statement}
         except HTTPException:
             raise
         except PermissionError:
@@ -668,8 +672,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     @app.delete("/api/local-datasets/{dataset_id}")
     def delete_local_dataset(dataset_id: str):
-        if not local_data.delete(dataset_id):
-            raise HTTPException(404, detail="Local dataset not found")
+        try:
+            if not local_data.delete(dataset_id):
+                raise HTTPException(404, detail="Local dataset not found")
+        except LocalDatasetBusy:
+            raise HTTPException(409, detail="A snapshot refresh is in progress. Wait for it to finish before deleting this local copy.") from None
         return {"deleted": True, "dataset_id": dataset_id}
 
     @app.get("/api/operations")

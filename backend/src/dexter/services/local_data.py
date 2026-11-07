@@ -26,6 +26,14 @@ class MaterializationConflict(RuntimeError):
         super().__init__(f"A previous Make Local operation owns this table reservation: {operation_id}")
 
 
+class LocalDatasetBusy(RuntimeError):
+    """An active refresh owns the source snapshot being deleted."""
+
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        super().__init__("A Make Local refresh is still using this snapshot")
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -140,6 +148,7 @@ class LocalDataService:
             db.close()
         return self._serialize(row) if row and self._valid_path(row["snapshot_path"]) else None
 
+    @_synchronized
     def reserve(self, operation_id: str, source: dict, name: str, qualified_name: str, staging: Path) -> str:
         source_key = self.source_key(source)
         with transaction(self.db_path) as db:
@@ -280,18 +289,25 @@ class LocalDataService:
             db.execute("DELETE FROM local_materialization_locks WHERE operation_id=?", (operation_id,))
         shutil.rmtree(staging, ignore_errors=True)
 
+    @_synchronized
     def delete(self, dataset_id: str) -> bool:
-        with _dataset_lock:
-            with transaction(self.db_path) as db:
-                row = db.execute("SELECT snapshot_path FROM local_datasets WHERE dataset_id=?", (dataset_id,)).fetchone()
-                if not row:
-                    return False
-                db.execute("DELETE FROM local_datasets WHERE dataset_id=?", (dataset_id,))
-            path = Path(row[0])
-            if self._valid_path(path):
-                shutil.rmtree(path if path.is_dir() else path.parent, ignore_errors=True)
-            return True
+        with transaction(self.db_path) as db:
+            row = db.execute("SELECT source_key,snapshot_path FROM local_datasets WHERE dataset_id=?", (dataset_id,)).fetchone()
+            if not row:
+                return False
+            owner = db.execute(
+                "SELECT operation_id FROM local_materialization_locks WHERE source_key=?",
+                (row["source_key"],),
+            ).fetchone()
+            if owner:
+                raise LocalDatasetBusy(str(owner["operation_id"]))
+            db.execute("DELETE FROM local_datasets WHERE dataset_id=?", (dataset_id,))
+        path = Path(row["snapshot_path"])
+        if self._valid_path(path):
+            shutil.rmtree(path if path.is_dir() else path.parent, ignore_errors=True)
+        return True
 
+    @_synchronized
     def query(self, dataset_id: str, sql: str, limit: int = 500) -> dict:
         dataset = self.get(dataset_id)
         if not dataset:
@@ -354,7 +370,8 @@ class LocalDataService:
                 table = pa.Table.from_batches(batches, schema=reader.schema)
                 truncated = table.num_rows > limit
                 table = table.slice(0, limit)
-                return {"columns": table.column_names, "rows": table.to_pylist(), "truncated": truncated}
+                schema = [{"name": field.name, "type": str(field.type)} for field in table.schema]
+                return {"columns": table.column_names, "schema": schema, "rows": table.to_pylist(), "truncated": truncated, "executed_sql": statement}
             finally:
                 db.close()
 

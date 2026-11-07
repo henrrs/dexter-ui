@@ -94,7 +94,9 @@ class UnifiedDiscoverService:
                 successful_roots.add(env)
         nodes = []
         for variants in groups.values():
-            availability = {"local": "unknown", "dev": "unknown", "prod": "unknown"}
+            # The local snapshot index is a complete inventory, so a missing
+            # local variant is confirmed absent rather than unknown.
+            availability = {"local": "absent", "dev": "unknown", "prod": "unknown"}
             for variant in variants:
                 env = variant.get("environment")
                 if env in availability:
@@ -113,7 +115,7 @@ class UnifiedDiscoverService:
             catalog, schema, table = parts
             variants = groups.setdefault(catalog.casefold(), [])
             if not any(v.get("environment") == "local" and v.get("table", "").casefold() == table.casefold() and v.get("schema", "").casefold() == schema.casefold() for v in variants):
-                variants.append({"environment": "local", "catalog": catalog, "schema": schema, "table": table, "node_id": f"local:table:{dataset['dataset_id']}", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at"), "access": "read"})
+                variants.append({"environment": "local", "catalog": catalog, "schema": schema, "table": table, "node_id": f"local:table:{dataset['dataset_id']}", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at"), "snapshot_id": dataset.get("snapshot_id"), "snapshot_byte_count": dataset.get("byte_count"), "snapshot_source_environment": dataset["source"].get("environment"), "access": "read"})
             if not any(node["name"].casefold() == catalog.casefold() for node in nodes):
                 nodes.append({"id": _variants_id("catalog", variants), "name": catalog, "qualified_name": catalog, "kind": "catalog", "source": "unified", "environment": "logical", "access": "unknown", "variants": variants, "availability": self._availability(variants), "children": None})
         for node in nodes:
@@ -146,12 +148,12 @@ class UnifiedDiscoverService:
                         if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"] or not isinstance(row.get("name"), str) or not row["name"]:
                             page_errors.append("Provider returned malformed schema metadata.")
                             continue
-                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "logical_catalog": variant.get("logical_catalog", variant["catalog"]), "schema": row["name"], "node_id": row["id"], "metastore_id": row.get("metastore_id")})
+                        groups.setdefault(row["name"].casefold(), []).append({"environment": variant["environment"], "catalog": variant["catalog"], "logical_catalog": variant.get("logical_catalog", variant["catalog"]), "schema": row["name"], "node_id": row["id"], "metastore_id": row.get("metastore_id") or variant.get("metastore_id")})
                 elif variant.get("environment") == "purview" and variant.get("node_id"):
                     asset = variant.get("metadata", {})
                     groups.setdefault(variant["schema"].casefold(), []).append({"environment": "purview", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "metadata": asset})
                 elif variant.get("environment") == "local" and variant.get("node_id"):
-                    groups.setdefault(variant["schema"].casefold(), []).append({"environment": "local", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "dataset_id": variant.get("dataset_id"), "metastore_id": variant.get("metastore_id"), "snapshot_created_at": variant.get("snapshot_created_at"), "access": "read"})
+                    groups.setdefault(variant["schema"].casefold(), []).append({"environment": "local", "catalog": variant["catalog"], "schema": variant["schema"], "table": variant["table"], "node_id": variant["node_id"], "dataset_id": variant.get("dataset_id"), "metastore_id": variant.get("metastore_id"), "snapshot_created_at": variant.get("snapshot_created_at"), "snapshot_id": variant.get("snapshot_id"), "snapshot_byte_count": variant.get("snapshot_byte_count"), "snapshot_source_environment": variant.get("snapshot_source_environment"), "access": "read"})
             items = []
             for schema_name, schema_variants in sorted(groups.items()):
                 availability = self._child_availability(schema_variants, successful_pages, schema_name, parent_availability)
@@ -266,7 +268,7 @@ class UnifiedDiscoverService:
             for dataset in self.local_data.list():
                 existing_local_ids = {v.get("dataset_id") for v in variants if v.get("environment") == "local"}
                 if dataset["qualified_name"].casefold() in qnames and dataset["dataset_id"] not in existing_local_ids:
-                    variants.append({"environment": "local", "catalog": dataset["source"].get("catalog"), "schema": dataset["source"].get("schema"), "table": dataset["source"].get("table"), "node_id": f"local:table:{dataset['dataset_id']}", "access": "read", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at")})
+                    variants.append({"environment": "local", "catalog": dataset["source"].get("catalog"), "schema": dataset["source"].get("schema"), "table": dataset["source"].get("table"), "node_id": f"local:table:{dataset['dataset_id']}", "access": "read", "dataset_id": dataset["dataset_id"], "metastore_id": dataset["source"].get("metastore_id"), "snapshot_created_at": dataset.get("created_at"), "snapshot_id": dataset.get("snapshot_id"), "snapshot_byte_count": dataset.get("byte_count"), "snapshot_source_environment": dataset["source"].get("environment")})
         availability = availability or self._availability(variants)
         if any(v.get("environment") == "local" for v in variants): availability["local"] = "present"
         node_id = _variants_id(kind, variants, availability)
@@ -276,7 +278,11 @@ class UnifiedDiscoverService:
 
     @classmethod
     def _child_availability(cls, variants: list[dict], successful_pages: dict[str, set[str]], name: str, parent: dict) -> dict:
-        result = {key: ("absent" if parent.get(key) == "absent" else "unknown") for key in ("local", "dev", "prod")}
+        result = {
+            "local": "absent",
+            "dev": "absent" if parent.get("dev") == "absent" else "unknown",
+            "prod": "absent" if parent.get("prod") == "absent" else "unknown",
+        }
         for variant in variants:
             env = variant.get("environment")
             if env in result and env != "purview": result[env] = "present"
@@ -287,7 +293,7 @@ class UnifiedDiscoverService:
 
     @staticmethod
     def _availability(variants: list[dict]) -> dict:
-        result = {key: "unknown" for key in ("local", "dev", "prod")}
+        result = {"local": "absent", "dev": "unknown", "prod": "unknown"}
         for variant in variants:
             env = variant.get("environment")
             if env == "purview": continue

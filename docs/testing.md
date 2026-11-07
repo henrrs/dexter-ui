@@ -22,6 +22,7 @@ Automated tests use Python's standard `unittest` and Node's built-in test runner
 | Logical catalog normalization and DEV/PROD table reconciliation | `test_f3.UnifiedCatalogTests` covers exact `_dev` pairing, physical variants, authorization state, metastore collisions, and Purview-only metadata. |
 | Full Parquet snapshot replacement and rollback | `test_f3.MaterializationTests` covers schema/row validation, active snapshot replacement, preservation on failed staging, and DuckDB local queries. |
 | SQL identifier safety and filter binding | `test_sql_builder_quotes_identifiers_and_binds_filter_literals` |
+| Explicit Local/DEV/PROD SQL targets, shared snapshot actions, query/delete coordination | `scripts/ui-contract.test.mjs` and `test_f3.MaterializationTests` |
 
 ## Execution record
 
@@ -52,3 +53,12 @@ No real Databricks or Purview calls were made. Live Statement Execution Arrow tr
 - `node --test scripts/ui-contract.test.mjs` — passed all 6 tests.
 - `npm run build` — TypeScript and Vite production build passed using the already-installed Node dependencies in a neighboring local checkout via a temporary symlink; the symlink was removed afterward. `make setup` was not run, so this did not bypass Dexter's corporate registry guard.
 - No live Azure/Databricks calls or package downloads were made. This machine did not provide the selected external workspace credentials for integration tests.
+
+## SQL Workspace refinement on 2026-11-07
+
+- `npm ci` — passed using the configured package registry.
+- `npm run build` — TypeScript and Vite production build passed.
+- `node --test scripts/ui-contract.test.mjs` — passed all 5 tests, including explicit Local/DEV/PROD destinations and shared snapshot actions.
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — passed all 48 tests, including local snapshot refresh/delete coordination, unified availability and API contracts.
+- `python3 -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
+- No live Databricks or Purview calls were made. SQL physical-name mapping across environments remains unresolved by design; the editor preserves entered SQL and the workspace discloses this limitation. Query history, Explain and cross-environment comparison remain unimplemented.

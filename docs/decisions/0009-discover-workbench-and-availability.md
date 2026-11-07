@@ -7,7 +7,7 @@
 
 - Home and Connections do not render the old Workspace Explorer. Discover owns one collapsible and resizable catalog Explorer beside its table workbench; the workbench remains neutral until a table or view is selected.
 - Selecting a table opens a workbench tab. Each tab retains its chosen DEV, PROD, or local context when the user switches to another table. The right context panel tracks the active table and environment without adding chat-session behavior.
-- The logical node payload contains real physical variants only. Confirmed absence is a separate per-environment availability map carried with the opaque node ID and inherited during lazy expansion. Provider errors remain explicit and do not confirm absence.
+- The logical node payload contains real physical variants only. Confirmed absence is a separate per-environment availability map carried with the opaque node ID and inherited during lazy expansion. Provider errors remain explicit and do not confirm absence. Since the local dataset index is complete, a missing local variant is confirmed absent.
 - L/D/P are always visible and mean existence. Read access is separate; metadata-only Purview entries display a lock and cannot use preview or materialization actions.
 - Unified Catalog account discovery still uses Azure CLI and ARM, but its Data Assets calls use the documented Unified Catalog service root. The ARM account `catalog` endpoint is not treated as the Unified Catalog host. There is no fallback to Atlas or a privileged identity.
 - Make Local and valid local queries remain operational. Synthetic data and table comparison are explicitly disabled entry points until their backends exist; lineage says when no provider supplies lineage.

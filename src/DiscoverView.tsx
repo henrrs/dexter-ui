@@ -6,9 +6,11 @@ import type { DiscoverNode, DiscoverPage } from './api'
 import type { Operation } from './types'
 
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
-type WorkbenchTab = { key: string; node: DiscoverNode; environment: 'dev' | 'prod' | 'local'; queryEnvironment?: 'dev' | 'prod'; view: 'table' | 'local-query' }
-type QueryTarget = 'local' | 'databricks' | 'auto'
+type QueryEnvironment = 'local' | 'dev' | 'prod'
+type WorkbenchTab = { key: string; node: DiscoverNode; environment: QueryEnvironment; queryEnvironment?: QueryEnvironment; view: 'table' | 'local-query' }
 type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage' | 'query'
+type QueryResultTab = 'results' | 'schema' | 'execution'
+type QueryExecution = { environment: QueryEnvironment; engine: 'DuckDB' | 'Databricks SQL'; warehouse: string | null; physicalObject: string | null; sql: string; executedSql?: string; state: 'running' | 'succeeded' | 'failed'; durationMs?: number; returnedRows?: number; truncated?: boolean; message?: string }
 type LineageResult = { available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }
 
 export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer, rightOpen, onExpandContext }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void; rightOpen: boolean; onExpandContext: () => void }) {
@@ -29,12 +31,14 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const sourcesLoadInFlight = useRef(false)
   const [sourcesError, setSourcesError] = useState<string | null>(null)
   const [activeEnvironment, setActiveEnvironment] = useState<'dev' | 'prod' | 'local'>('dev')
-  const [queryTarget, setQueryTarget] = useState<QueryTarget>('auto')
-  const [queryEnvironment, setQueryEnvironment] = useState<'dev' | 'prod'>('prod')
+  const [queryEnvironment, setQueryEnvironment] = useState<QueryEnvironment>('local')
+  const [queryEnvironmentChosen, setQueryEnvironmentChosen] = useState(false)
   const [queryRunning, setQueryRunning] = useState(false)
-  const [queryExecutedOn, setQueryExecutedOn] = useState<'local' | 'databricks' | null>(null)
+  const [queryExecution, setQueryExecution] = useState<QueryExecution | null>(null)
+  const [queryResultTab, setQueryResultTab] = useState<QueryResultTab>('results')
+  const [resultSchema, setResultSchema] = useState<Array<{ name: string; type: string }>>([])
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
-  const [warehouseId, setWarehouseId] = useState('')
+  const [warehouseIds, setWarehouseIds] = useState<Record<'dev' | 'prod', string>>({ dev: '', prod: '' })
   const [warehousesLoading, setWarehousesLoading] = useState(false)
   const [warehouseError, setWarehouseError] = useState('')
   const [warehouseRefreshKey, setWarehouseRefreshKey] = useState(0)
@@ -51,6 +55,15 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [previewing, setPreviewing] = useState(false)
   const [lineage, setLineage] = useState<LineageResult | null>(null)
   const [lineageLoading, setLineageLoading] = useState(false)
+
+  const warehouseEnvironment: 'dev' | 'prod' | null = activeSection === 'query'
+    ? makeLocalOpen ? 'prod' : queryEnvironment === 'local' ? null : queryEnvironment
+    : activeEnvironment === 'local' ? null : activeEnvironment
+  const warehouseId = warehouseEnvironment ? warehouseIds[warehouseEnvironment] : ''
+  const selectedWarehouse = warehouses.find((warehouse) => warehouse.id === warehouseId)
+  const setWarehouseId = (id: string) => {
+    if (warehouseEnvironment) setWarehouseIds((prior) => ({ ...prior, [warehouseEnvironment]: id }))
+  }
 
   const loadSources = async (force = false) => {
     if (sourcesLoadInFlight.current) return
@@ -142,7 +155,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
           .map((oldSchema) => ({ oldSchema, refreshedSchema: findRefreshedNode(oldSchema, refreshedSchemas), catalogResult, wasExpanded: oldExpanded.has(oldSchema.id) }))
       })
       const schemaResults = await Promise.all(schemaRequests.map(async (request) => {
-        const { oldSchema, refreshedSchema } = request
+        const { refreshedSchema } = request
         if (!refreshedSchema) return { ...request, page: null as DiscoverPage | null, error: null as string | null }
         try {
           const page = normalizeDiscoverPage(await api.discoverCatalogChildren(refreshedSchema.id, force))
@@ -257,23 +270,23 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     catch { /* Keep the list metadata visible when a detail endpoint is unavailable. */ }
   }
 
-  const openLocalQuery = async (node: DiscoverNode, preferredEnvironment?: 'dev' | 'prod') => {
+  const openLocalQuery = async (node: DiscoverNode, preferredEnvironment?: QueryEnvironment) => {
     const key = `${node.id}:local-query`
-    const environments = node.variants?.filter((variant) => variant.environment === 'dev' || variant.environment === 'prod').map((variant) => variant.environment as 'dev' | 'prod') ?? []
-    const nextQueryEnvironment = preferredEnvironment && environments.includes(preferredEnvironment)
-      ? preferredEnvironment
-      : activeEnvironment !== 'local' && environments.includes(activeEnvironment)
-        ? activeEnvironment
-        : environments.includes('prod') ? 'prod' : 'dev'
-    if (!workbenchTabs.some((item) => item.key === key)) {
+    const nextQueryEnvironment = queryEnvironmentChosen
+      ? queryEnvironment
+      : preferredEnvironment ?? activeEnvironment
+    setQueryEnvironment(nextQueryEnvironment)
+    setQueryEnvironmentChosen(true)
+    if (!workbenchTabs.some((item) => item.key === key) && !localSql.trim()) {
       setLocalSql(`SELECT * FROM ${qualifiedTableIdentifier(node, nextQueryEnvironment)} LIMIT 100`)
     }
     if (activeTabKey !== key || activeSection !== 'query') {
       setLocalRows([])
       setLocalColumns([])
-      setQueryExecutedOn(null)
+      setQueryExecution(null)
+      setResultSchema([])
     }
-    const tab: WorkbenchTab = { key, node, environment: 'local', queryEnvironment: nextQueryEnvironment, view: 'local-query' }
+    const tab: WorkbenchTab = { key, node, environment: nextQueryEnvironment, queryEnvironment: nextQueryEnvironment, view: 'local-query' }
     setWorkbenchTabs((items) => {
       const refreshed = items.map((item) => item.key === node.id ? { ...item, node } : item)
       return refreshed.some((item) => item.key === key)
@@ -283,7 +296,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     setActiveTabKey(key)
     setActiveSection('query')
     setActiveEnvironment('local')
-    setQueryEnvironment(nextQueryEnvironment)
     setSelected(node)
     setMakeLocalOpen(false)
     setLocalQueryError('')
@@ -291,6 +303,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     try {
       const detail = await api.discoverCatalogDetail(node.id, 'local')
       setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
+      setSelectedColumns((detail.columns ?? []).map((column) => column.name))
     } catch { /* Keep the available local asset in the query workspace. */ }
   }
 
@@ -312,38 +325,60 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const snapshotSupersedesOperation = Boolean(operationIsTerminalFailure && localSnapshotDate
     && Date.parse(localSnapshotDate) >= Date.parse(activeOperation.updated_at))
   const showActiveOperation = Boolean(activeOperation && operationMatchesSelected && !snapshotSupersedesOperation)
-  const queryNeedsDatabricks = queryTarget === 'databricks' || (queryTarget === 'auto' && !queryHasLocal)
+  const queryNeedsDatabricks = queryEnvironment !== 'local'
   const queryRemoteVariant = selected?.variants?.find((variant) => variant.environment === queryEnvironment)
   const queryCanUseDatabricks = queryRemoteVariant?.access === 'read'
     || (selected?.environment === queryEnvironment && selected.access === 'read')
+  const queryAvailability = queryEnvironment === 'local'
+    ? queryHasLocal ? 'present' : 'absent'
+    : selected?.availability?.[queryEnvironment] ?? (queryRemoteVariant ? 'present' : 'unknown')
+  const queryAvailabilityReason = queryEnvironment === 'local'
+    ? queryHasLocal ? '' : 'No local snapshot. Make Local is available when a readable PROD source exists.'
+    : queryAvailability === 'absent'
+      ? `Table unavailable in ${queryEnvironment.toUpperCase()}. No matching table was found in that catalog.`
+      : queryAvailability === 'unknown'
+        ? `Availability in ${queryEnvironment.toUpperCase()} could not be confirmed. Refresh metadata before querying.`
+        : !queryCanUseDatabricks
+          ? `The table exists in ${queryEnvironment.toUpperCase()}, but read access is not confirmed for this profile.`
+          : ''
+  const queryEnvironmentCanRun = queryEnvironment === 'local'
+    ? queryHasLocal
+    : queryAvailability === 'present' && queryCanUseDatabricks
   const canOpenQuery = queryHasLocal
     || Boolean(selected?.variants?.some((variant) => ['dev', 'prod'].includes(variant.environment) && variant.access === 'read'))
     || Boolean(selected?.source === 'databricks' && selected.access === 'read')
 
   useEffect(() => {
-    const environment = activeSection === 'query' ? queryEnvironment : activeEnvironment
-    const queryNeedsWarehouse = activeSection !== 'query' || queryNeedsDatabricks
+    const environment = warehouseEnvironment
+    const queryNeedsWarehouse = activeSection !== 'query' || queryNeedsDatabricks || makeLocalOpen
     const hasRemoteAccess = activeSection === 'query'
-      ? queryCanUseDatabricks
+      ? makeLocalOpen
+        ? selected?.variants?.find((variant) => variant.environment === 'prod')?.access === 'read'
+        : queryCanUseDatabricks
       : selected?.access === 'read'
-    if (!selected || !['table', 'view'].includes(selected.kind) || !['dev', 'prod'].includes(environment)
+    if (!selected || !['table', 'view'].includes(selected.kind) || !environment || !['dev', 'prod'].includes(environment)
         || !queryNeedsWarehouse || !hasRemoteAccess) {
-      setWarehouses([]); setWarehouseId(''); setWarehousesLoading(false); setWarehouseError('')
+      setWarehouses([]); setWarehousesLoading(false); setWarehouseError('')
       return
     }
     let alive = true
-    setWarehouses([]); setWarehouseId(''); setWarehousesLoading(true); setWarehouseError('')
+    setWarehouses([]); setWarehousesLoading(true); setWarehouseError('')
     void api.warehouses(selected.id, environment as 'dev' | 'prod')
       .then((result) => {
         if (!alive) return
         setWarehouses(result.items)
-        setWarehouseId(result.items[0]?.id ?? '')
+        setWarehouseIds((prior) => ({
+          ...prior,
+          [environment]: result.items.some((warehouse) => warehouse.id === prior[environment])
+            ? prior[environment]
+            : result.items[0]?.id ?? '',
+        }))
         setWarehouseError(result.message ?? '')
       })
       .catch((error) => { if (alive) { setWarehouses([]); setWarehouseError(error instanceof Error ? error.message : 'Could not load SQL warehouses.') } })
       .finally(() => { if (alive) setWarehousesLoading(false) })
     return () => { alive = false }
-  }, [selected?.id, selected?.kind, selected?.access, selected?.environment, selected?.variants, activeSection, activeEnvironment, queryEnvironment, queryNeedsDatabricks, queryCanUseDatabricks, warehouseRefreshKey])
+  }, [selected?.id, selected?.kind, selected?.access, selected?.environment, selected?.variants, activeSection, activeEnvironment, queryEnvironment, queryNeedsDatabricks, queryCanUseDatabricks, warehouseEnvironment, makeLocalOpen, warehouseRefreshKey])
 
   useEffect(() => {
     if (!activeOperation || ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(activeOperation.state)) return
@@ -373,13 +408,29 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }, [activeSection, selected?.id, selected?.kind])
 
   const runMakeLocal = async () => {
-    if (!selected || activeEnvironment !== 'prod' || !warehouseId || !selectedColumns.length) return
+    const sourceEnvironment = activeSection === 'query' ? 'prod' : activeEnvironment
+    if (!selected || sourceEnvironment !== 'prod' || !warehouseId || !selectedColumns.length) return
     setLocalQueryError('')
     try {
-      const operation = await api.makeLocal(selected.id, { environment: activeEnvironment as 'dev' | 'prod', warehouse_id: warehouseId, columns: selectedColumns, filters: [] })
+      const operation = await api.makeLocal(selected.id, { environment: 'prod', warehouse_id: warehouseId, columns: selectedColumns, filters: [] })
       setActiveOperation(operation)
       setMakeLocalOpen(false)
     } catch (error) { setLocalQueryError(error instanceof Error ? error.message : 'Make Local could not be started.') }
+  }
+
+  const openMakeLocalDialog = async () => {
+    if (!selected) return
+    setLocalQueryError('')
+    setMakeLocalOpen(true)
+    setWarehouseRefreshKey((key) => key + 1)
+    if (activeSection !== 'query') return
+    try {
+      const detail = await api.discoverCatalogDetail(selected.id, 'prod')
+      setSelected({ ...detail, id: selected.id, availability: selected.availability, variants: selected.variants })
+      setSelectedColumns((detail.columns ?? []).map((column) => column.name))
+    } catch (error) {
+      setLocalQueryError(error instanceof Error ? error.message : 'PROD table metadata could not be loaded for Make Local.')
+    }
   }
 
   const runRemotePreview = async () => {
@@ -391,52 +442,72 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
 
   const runQuery = async () => {
-    if (!selected || !localSql.trim()) {
+    const context = selected
+    const environment = queryEnvironment
+    const sql = localSql.trim()
+    const datasetId = context?.variants?.find((item) => item.environment === 'local')?.dataset_id
+    const remoteVariant = context?.variants?.find((item) => item.environment === environment)
+    const physicalObject = environment === 'local'
+      ? variantQualifiedName(context?.variants?.find((item) => item.environment === 'local'))
+      : variantQualifiedName(remoteVariant)
+    const engine = environment === 'local' ? 'DuckDB' as const : 'Databricks SQL' as const
+    const selectedWarehouse = warehouseId
+    if (!context || !sql) {
       setLocalQueryError('Enter a SQL query to run.')
       return
     }
-    const datasetId = selected.variants?.find((item) => item.environment === 'local')?.dataset_id
-    const useLocal = queryTarget === 'local' || (queryTarget === 'auto' && Boolean(datasetId))
     setQueryRunning(true)
-    setQueryExecutedOn(null)
     setLocalRows([])
     setLocalColumns([])
+    setResultSchema([])
+    setQueryResultTab('results')
     setLocalQueryError('')
+    const startedAt = performance.now()
+    setQueryExecution({
+      environment, engine, warehouse: environment === 'local' ? null : warehouses.find((item) => item.id === selectedWarehouse)?.name ?? null,
+      physicalObject: physicalObject ?? context.qualified_name ?? context.name,
+      sql, state: 'running',
+    })
     try {
-      if (useLocal) {
+      if (environment === 'local') {
         if (!datasetId) {
-          setLocalQueryError('There is no local copy of this table. Choose Databricks or Auto, or create a local copy with Make Local.')
-          return
+          throw new Error('No local snapshot is available. Use Make Local to create one before running this query.')
         }
-        try {
-          const result = await api.queryLocal(datasetId, localSql)
-          setQueryExecutedOn('local')
-          setLocalRows(result.rows)
-          setLocalColumns(result.columns)
-          setLocalQueryError(result.truncated ? 'Showing the first 500 rows.' : '')
-          return
-        } catch (error) {
-          const message = error instanceof Error ? error.message : ''
-          const missingLocalTable = /does not exist|not found|catalog error/i.test(message)
-          if (missingLocalTable) {
-            setLocalQueryError('This query references a table that is not available locally. Choose Databricks and select an accessible SQL warehouse, or materialize the missing table.')
-            return
-          }
-          throw error
-        }
-      }
-      if (!queryCanUseDatabricks) {
-        setLocalQueryError(`No readable Databricks table is available in ${queryEnvironment.toUpperCase()}. Choose Local if a local copy exists.`)
+        const result = await api.queryLocal(datasetId, sql)
+        setLocalRows(result.rows)
+        setLocalColumns(result.columns)
+        setResultSchema(result.schema ?? result.columns.map((name) => ({ name, type: 'Not provided by DuckDB response' })))
+        setLocalQueryError(result.truncated ? 'Showing the first 500 rows.' : '')
+        setQueryExecution({
+          environment, engine, warehouse: null, physicalObject: physicalObject ?? context.qualified_name ?? context.name,
+          sql, executedSql: result.executed_sql ?? sql, state: 'succeeded', durationMs: performance.now() - startedAt,
+          returnedRows: result.rows.length, truncated: result.truncated,
+        })
         return
       }
-      if (!warehouseId) {
-        setLocalQueryError('Select an accessible SQL warehouse before running this query.')
-        return
-      }
-      const result = await api.queryDatabricks(selected.id, queryEnvironment, warehouseId, localSql)
-      setQueryExecutedOn('databricks')
-      setLocalRows(result.rows); setLocalColumns(result.columns); setLocalQueryError(result.truncated ? 'Showing the first 500 rows.' : '')
-    } catch (error) { setLocalQueryError(error instanceof Error ? error.message : 'The query could not be completed.') }
+      if (queryAvailability !== 'present') throw new Error(queryAvailabilityReason || `Table availability in ${environment.toUpperCase()} has not been confirmed.`)
+      if (!queryCanUseDatabricks) throw new Error(queryAvailabilityReason || `Read access is not confirmed in ${environment.toUpperCase()}.`)
+      if (!selectedWarehouse) throw new Error('Choose an accessible SQL warehouse in execution settings before running this query.')
+      const result = await api.queryDatabricks(context.id, environment, selectedWarehouse, sql)
+      setLocalRows(result.rows)
+      setLocalColumns(result.columns)
+      setResultSchema(result.schema ?? result.columns.map((name) => ({ name, type: 'Not provided by Databricks response' })))
+      setLocalQueryError(result.truncated ? 'Showing the first 500 rows.' : '')
+      setQueryExecution({
+        environment, engine, warehouse: warehouses.find((item) => item.id === selectedWarehouse)?.name ?? selectedWarehouse,
+        physicalObject: physicalObject ?? context.qualified_name ?? context.name,
+        sql, executedSql: result.executed_sql ?? sql, state: 'succeeded', durationMs: performance.now() - startedAt,
+        returnedRows: result.rows.length, truncated: result.truncated,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The query could not be completed.'
+      setLocalQueryError(message)
+      setQueryExecution({
+        environment, engine, warehouse: environment === 'local' ? null : warehouses.find((item) => item.id === selectedWarehouse)?.name ?? selectedWarehouse,
+        physicalObject: physicalObject ?? context.qualified_name ?? context.name,
+        sql, state: 'failed', durationMs: performance.now() - startedAt, message,
+      })
+    }
     finally { setQueryRunning(false) }
   }
 
@@ -450,37 +521,33 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     setDeletingLocal(true)
     try {
       await api.deleteLocal(datasetId)
-      const tableTab = workbenchTabs.find((tab) => tab.view === 'table' && tab.node.id === selected.id)
-      const baseNode = tableTab?.node ?? selected
+      const baseNode = selected
       const updatedNode: DiscoverNode = {
         ...baseNode,
         ...selected,
         id: baseNode.id,
         source: baseNode.source,
-        environment: tableTab?.environment ?? baseNode.environment,
+        environment: baseNode.environment,
         variants: selected.variants?.filter((variant) => variant.environment !== 'local')
           ?? baseNode.variants?.filter((variant) => variant.environment !== 'local'),
         availability: {
-          ...(selected.availability ?? baseNode.availability ?? { local: 'unknown', dev: 'unknown', prod: 'unknown' }),
+          ...(selected.availability ?? baseNode.availability ?? { local: 'absent', dev: 'unknown', prod: 'unknown' }),
           local: 'absent',
         },
       }
-      setWorkbenchTabs((items) => items
-        .filter((tab) => !(tab.view === 'local-query' && tab.node.id === selected.id))
-        .map((tab) => tab.key === tableTab?.key ? { ...tab, node: updatedNode } : tab))
+      setWorkbenchTabs((items) => items.map((tab) => tab.node.id === selected.id ? { ...tab, node: updatedNode } : tab))
       setSelected(updatedNode)
-      setActiveTabKey(tableTab?.key ?? null)
-      setActiveSection('overview')
-      if (tableTab) setActiveEnvironment(tableTab.environment)
       setLocalRows([])
       setLocalColumns([])
+      setResultSchema([])
+      setQueryExecution(null)
       setLocalQueryError('')
       setDeleteLocalConfirmation(false)
       window.dispatchEvent(new CustomEvent('dexter:discover-context', {
         detail: {
           name: updatedNode.name,
           qualifiedName: updatedNode.qualified_name ?? updatedNode.name,
-          environment: tableTab?.environment ?? updatedNode.environment,
+          environment: queryEnvironment,
         },
       }))
       await refreshLoadedNodes()
@@ -498,7 +565,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const loadedChildren = (node: DiscoverNode) => node.children ?? pages[node.id]?.items ?? []
   const matchesLoadedBranch = (node: DiscoverNode): boolean => matches(node) || loadedChildren(node).some(matchesLoadedBranch)
 
-  const loadedNodes = [...Object.values(pages).flatMap((page) => page.items), ...sources]
   const purviewMetadata = selected?.purview_metadata ?? selected?.variants?.find((variant) => variant.environment === 'purview')?.metadata
   const purviewRecord = asRecord(purviewMetadata)
   const purviewAttributes = asRecord(purviewRecord?.attributes)
@@ -559,31 +625,118 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
       <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
       {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => <div className={`workbench-tab ${activeTabKey === tab.key ? 'active' : ''}`} key={tab.key}><button onClick={() => tab.view === 'local-query' ? void openLocalQuery(tab.node, tab.queryEnvironment) : void selectNode(tab.node, tab.environment)}>{tab.view === 'local-query' ? <Play size={12} /> : <Database size={12} />}{tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.node.name}</button><button aria-label={`Minimize ${tab.view === 'local-query' ? `query for ${tab.node.name}` : tab.node.name}`} title="Minimize tab; click its name to reopen" onClick={() => { if (activeTabKey === tab.key) { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } }}><Minus size={12} /></button><button aria-label={`Close ${tab.view === 'local-query' ? `query for ${tab.node.name}` : tab.node.name}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (activeTabKey === tab.key) { const next = remaining.at(-1); if (next) next.view === 'local-query' ? void openLocalQuery(next.node, next.queryEnvironment) : void selectNode(next.node, next.environment); else { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button></div>)}</div></div>}
-      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'query' ? <div className="workbench-section-content">
-        <div className="discover-detail-head"><div><div className="eyebrow">SQL WORKSPACE</div><h2>{selected.name}</h2></div></div>
-        <code className="qualified-path">{selected.qualified_name ?? selected.id}</code>
-        {queryHasLocal && <div className="snapshot-freshness"><HardDrive size={13} /><span>Local snapshot from <strong>{localSnapshotLabel}</strong>. Choose Databricks for current source data, or use Make Local to refresh this copy.</span></div>}
-        <div className="local-query-card">
-          <div className="discover-section-title"><Database size={14} /> Query <span>{queryExecutedOn?.toUpperCase() ?? 'READY'}</span>{queryHasLocal && <button className="button danger small" onClick={() => { setLocalQueryError(''); setDeleteLocalConfirmation(true) }}><Trash2 size={12} /> Delete local copy</button>}</div>
-          <div className="query-run-controls"><label htmlFor="query-target">Run on</label><select id="query-target" value={queryTarget} onChange={(event) => { setQueryTarget(event.target.value as QueryTarget); setLocalQueryError(''); setQueryExecutedOn(null) }}><option value="auto">Auto · prefer local</option><option value="local">Local snapshot</option><option value="databricks">Databricks</option></select></div>
-          <small className="query-mode-help">Auto uses the local snapshot when available; otherwise it runs the query in Databricks.</small>
-          {queryNeedsDatabricks && <div className="query-remote-controls">
-            <label htmlFor="query-environment">Databricks environment</label><select id="query-environment" value={queryEnvironment} onChange={(event) => setQueryEnvironment(event.target.value as 'dev' | 'prod')}>
-              {(selected.variants ?? []).filter((variant) => variant.environment === 'dev' || variant.environment === 'prod').map((variant) => <option key={variant.environment} value={variant.environment} disabled={variant.access !== 'read'}>{variant.environment.toUpperCase()} · {variant.catalog}.{variant.schema}.{variant.table}{variant.access === 'read' ? '' : ' · no read access'}</option>)}
-            </select>
-            <label htmlFor="query-warehouse">SQL warehouse</label><div className="query-warehouse-control"><select id="query-warehouse" value={warehouseId} disabled={warehousesLoading || warehouses.length === 0} onChange={(event) => setWarehouseId(event.target.value)}><option value="">{warehousesLoading ? 'Loading warehouses…' : warehouses.length ? 'Select a SQL warehouse' : 'No accessible warehouses'}</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}</select><button className="button secondary small" disabled={warehousesLoading || !queryCanUseDatabricks} onClick={() => setWarehouseRefreshKey((key) => key + 1)}><RefreshCw size={12} /> Refresh</button></div>
-            {!queryCanUseDatabricks && <div className="discover-error" role="status">No read access was confirmed for {queryEnvironment.toUpperCase()}. Choose another environment or run against a local snapshot.</div>}
-            {warehouseError && <div className="discover-error" role="alert">{warehouseError}</div>}
-          </div>}
-          <textarea aria-label="SQL query" value={localSql} onChange={(event) => setLocalSql(event.target.value)} spellCheck={false} />
-          <button className="button secondary small" disabled={queryRunning || (queryNeedsDatabricks && (!queryCanUseDatabricks || !warehouseId))} onClick={() => void runQuery()}>{queryRunning ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />} Run query</button>
-          {localQueryError && <div className="discover-error" role="alert">{localQueryError}</div>}
-          {queryExecutedOn && <div className="local-result-table"><div className="query-result-heading">Results · {queryExecutedOn === 'local' ? 'Local snapshot' : `Databricks ${queryEnvironment.toUpperCase()}`}</div>{localRows.length > 0 ? <table><thead><tr>{localColumns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{localRows.map((row, index) => <tr key={index}>{localColumns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table> : <small className="query-empty-results">Query completed with no rows.</small>}</div>}
+      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'query' ? <div className="workbench-section-content sql-workspace">
+        <header className="sql-workspace-header"><div><span className="eyebrow">SQL WORKSPACE</span><h2>{selected.name}</h2><code>{selected.qualified_name ?? selected.id}</code></div></header>
+        <nav className="sql-environment-switch" aria-label="Query environment">
+          {(['local', 'dev', 'prod'] as const).map((environment) => {
+            const variant = selected.variants?.find((item) => item.environment === environment)
+            const state = environment === 'local'
+              ? queryHasLocal ? 'present' : 'absent'
+              : selected.availability?.[environment] ?? (variant ? 'present' : 'unknown')
+            const hasRead = environment === 'local' || variant?.access === 'read'
+            const reason = environment === 'local'
+              ? queryHasLocal ? 'Local snapshot is available.' : 'No local snapshot. Make Local can create one from an accessible PROD table.'
+              : state === 'absent'
+                ? `Table unavailable in ${environment.toUpperCase()}. No matching table was found in that catalog.`
+                : state === 'unknown'
+                  ? `Availability in ${environment.toUpperCase()} is unconfirmed. Refresh metadata before querying.`
+                  : !hasRead
+                    ? `The table exists in ${environment.toUpperCase()}, but read access is not confirmed for this profile.`
+                    : `${environment.toUpperCase()} is available for queries.`
+            const unavailable = environment !== 'local' && (state === 'absent' || (state === 'present' && !hasRead))
+            return <button key={environment} type="button" className={queryEnvironment === environment ? 'active' : ''}
+              aria-label={`${environment === 'local' ? 'Local' : environment.toUpperCase()}. ${reason}`}
+              aria-pressed={queryEnvironment === environment} aria-disabled={unavailable} aria-describedby="sql-environment-status" title={reason}
+              onClick={() => { if (unavailable) return; setQueryEnvironment(environment); setQueryEnvironmentChosen(true); setLocalQueryError('') }}>
+              {environment === 'local' ? 'Local' : environment.toUpperCase()}
+            </button>
+          })}
+        </nav>
+        <div className="sql-execution-context" aria-live="polite">
+          <div className="sql-context-main"><strong>{queryEnvironment === 'local' ? 'DuckDB · Local snapshot' : `${queryEnvironment.toUpperCase()} · Databricks SQL`}</strong>
+            <span>{queryEnvironment === 'local'
+              ? queryHasLocal ? `Snapshot from ${localSnapshotLabel}` : 'No local snapshot'
+              : `${queryRemoteVariant ? variantQualifiedName(queryRemoteVariant) : queryAvailability === 'unknown' ? 'Availability not confirmed' : 'Table not available'} · ${warehousesLoading ? 'Loading warehouses' : selectedWarehouse ? `${selectedWarehouse.name} · ${selectedWarehouse.state}` : 'No warehouse selected'}`}
+            </span>
+          </div>
+          {queryEnvironment !== 'local' && <details className="sql-warehouse-settings">
+            <summary>Execution settings</summary>
+            <div className="sql-warehouse-fields"><label htmlFor="query-warehouse">SQL warehouse</label>
+              <select id="query-warehouse" value={warehouseId} disabled={warehousesLoading || warehouses.length === 0} onChange={(event) => setWarehouseId(event.target.value)}>
+                <option value="">{warehousesLoading ? 'Loading warehouses…' : warehouses.length ? 'Select a SQL warehouse' : 'No accessible warehouses'}</option>
+                {warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}
+              </select>
+              <button className="icon-button subtle" aria-label="Refresh SQL warehouses" title="Refresh SQL warehouses" disabled={warehousesLoading} onClick={() => setWarehouseRefreshKey((key) => key + 1)}><RefreshCw size={13} /></button>
+              {warehouseError && <p role="alert">{warehouseError}</p>}
+              {!warehouseError && warehouseId && selectedWarehouse?.state !== 'RUNNING' && <p>{selectedWarehouse?.state === 'STOPPED' ? 'This warehouse is stopped. Run Query starts it if your profile is authorized.' : `Warehouse state: ${selectedWarehouse?.state ?? 'unknown'}. Run Query will validate it before execution.`}</p>}
+            </div>
+          </details>}
         </div>
+        <p className={`sql-environment-status ${queryAvailabilityReason ? 'has-reason' : ''}`} id="sql-environment-status" role="status">
+          {queryAvailabilityReason || (queryEnvironment !== 'local' && !warehouseId && !warehousesLoading ? 'Choose an accessible SQL warehouse in Execution settings.' : 'SQL is sent as written. Dexter does not yet rewrite logical table names across environment-specific catalog mappings.')}
+        </p>
+        {queryEnvironment === 'local' && <section className="sql-snapshot-card" aria-label="Local snapshot management">
+          <div className="sql-snapshot-copy"><HardDrive size={16} /><div><strong>Local snapshot</strong><span>{queryHasLocal
+            ? `${localSnapshotLabel} · ${queryLocalVariant?.snapshot_byte_count != null ? formatBytes(queryLocalVariant.snapshot_byte_count) : 'size unavailable'}${queryLocalVariant?.snapshot_source_environment ? ` · source ${queryLocalVariant.snapshot_source_environment.toUpperCase()}` : ''}`
+            : 'No local snapshot'}</span></div></div>
+          {queryHasLocal ? <><button className="button secondary small" disabled={!selected.variants?.some((item) => item.environment === 'prod' && item.access === 'read') || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))}
+            title={!selected.variants?.some((item) => item.environment === 'prod' && item.access === 'read') ? 'Make Local refresh requires confirmed PROD read access.' : 'Materialize a fresh snapshot from PROD.'}
+              onClick={() => void openMakeLocalDialog()}><RefreshCw size={12} /> Refresh</button>
+            <details className="sql-snapshot-menu"><summary aria-label="More snapshot actions" title="More snapshot actions">···</summary><button onClick={() => { setLocalQueryError(''); setDeleteLocalConfirmation(true) }}>Delete local copy</button></details></>
+            : <button className="button secondary small" disabled={!selected.variants?.some((item) => item.environment === 'prod' && item.access === 'read')}
+              title={!selected.variants?.some((item) => item.environment === 'prod' && item.access === 'read') ? 'Make Local requires a readable PROD table.' : 'Create a local snapshot from PROD.'}
+              onClick={() => void openMakeLocalDialog()}><HardDrive size={12} /> Make Local</button>}
+        </section>}
+        {showActiveOperation && activeOperation && <div className="sql-materialization-status" role="status" aria-live="polite">
+          <div><strong>Snapshot · {activeOperation.state.toUpperCase()}</strong><span>{formatMaterializationStatus(activeOperation)}</span>
+            {['queued', 'running'].includes(activeOperation.state) && <button className="icon-button tiny" aria-label="Cancel snapshot refresh" onClick={() => void api.cancelOperation(activeOperation.id).then(setActiveOperation)}><XCircle size={13} /></button>}
+            {['failed', 'interrupted'].includes(activeOperation.state) && activeOperation.details?.retry_available && <button className="button secondary small" onClick={() => void api.retryOperation(activeOperation.id).then(setActiveOperation).catch((error) => setLocalQueryError(error instanceof Error ? error.message : 'The local snapshot could not be resumed.'))}><RefreshCw size={12} /> Resume</button>}
+          </div><span className="sql-materialization-track"><span style={{ width: `${activeOperation.progress}%` }} /></span>
+        </div>}
         {deleteLocalConfirmation && <div className="make-local-modal-backdrop"><section className="make-local-dialog local-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-local-title" aria-describedby="delete-local-description">
-          <header className="make-local-dialog-header"><div><span className="eyebrow">REMOVE LOCAL DATA</span><h3 id="delete-local-title">Delete this local copy?</h3><code>{selected.qualified_name ?? selected.name}</code></div></header>
+          <header className="make-local-dialog-header"><div><span className="eyebrow">REMOVE LOCAL DATA</span><h3 id="delete-local-title">Delete this local copy?</h3><code>{selected.qualified_name ?? selected.name}</code><small>Snapshot {queryLocalVariant?.snapshot_id ?? 'ID unavailable'} · {queryLocalVariant?.snapshot_byte_count != null ? formatBytes(queryLocalVariant.snapshot_byte_count) : 'size unavailable'}</small></div></header>
           <div id="delete-local-description" className="make-local-dialog-body local-delete-message"><p>This permanently removes the saved snapshot files from this machine. Any local queries using this copy will stop working.</p><p>The Databricks table and its source data will not be changed. You can create a new local copy later with Make Local.</p></div>
-          <footer className="make-local-dialog-footer"><button className="button secondary small" disabled={deletingLocal} onClick={() => setDeleteLocalConfirmation(false)}>Keep local copy</button><button className="button danger small" disabled={deletingLocal} onClick={() => void deleteLocalCopy()}>{deletingLocal ? <LoaderCircle size={13} className="spin" /> : <Trash2 size={13} />}Delete local copy</button></footer>
+          <footer className="make-local-dialog-footer"><button className="button secondary small" disabled={deletingLocal} onClick={() => setDeleteLocalConfirmation(false)}>Cancel</button><button className="button danger small" disabled={deletingLocal || queryRunning || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void deleteLocalCopy()}>{deletingLocal ? <LoaderCircle size={13} className="spin" /> : <Trash2 size={13} />}Delete copy</button></footer>
+        </section></div>}
+        <div className="sql-editor-panel">
+          <div className="sql-editor-toolbar"><div><strong>SQL editor</strong><span>{queryExecution?.state === 'running' ? 'Running…' : queryExecution?.state === 'succeeded' ? 'Last run succeeded' : queryExecution?.state === 'failed' ? 'Last run failed' : 'Ready'}</span></div>
+            <button className="button primary small" disabled={queryRunning || !localSql.trim() || !queryEnvironmentCanRun || (queryEnvironment !== 'local' && (!warehouseId || warehousesLoading))}
+              title={queryEnvironment === 'local' && !queryHasLocal ? 'No local snapshot is available.' : queryAvailabilityReason || undefined}
+              onClick={() => void runQuery()}>{queryRunning ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />} Run Query · {queryEnvironment === 'local' ? 'Local' : queryEnvironment.toUpperCase()}</button>
+          </div>
+          <textarea aria-label="SQL query editor" value={localSql} onChange={(event) => setLocalSql(event.target.value)} onKeyDown={(event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void runQuery() } }} spellCheck={false} />
+          <div className="sql-editor-hint">Ctrl/⌘ + Enter to run · SQL stays unchanged when you switch environments.</div>
+          {localQueryError && <div className="discover-error sql-query-error" role="alert">{localQueryError}</div>}
+        </div>
+        <section className="sql-results-panel" aria-label="Query output">
+          <nav className="sql-result-tabs" aria-label="Query output sections">
+            {(['results', 'schema', 'execution'] as const).map((tab) => <button key={tab} className={queryResultTab === tab ? 'active' : ''} aria-pressed={queryResultTab === tab} onClick={() => setQueryResultTab(tab)}>{tab === 'results' ? `Results${queryExecution?.state === 'succeeded' ? ` · ${queryExecution.returnedRows ?? 0}` : ''}` : tab[0].toUpperCase() + tab.slice(1)}</button>)}
+          </nav>
+          {queryResultTab === 'results' && <div className="sql-results-scroll">
+            {!queryExecution && <div className="sql-results-empty">Run a query to see its results.</div>}
+            {queryExecution?.state === 'running' && <div className="sql-results-empty"><LoaderCircle size={14} className="spin" /> Query running in {queryExecution.environment.toUpperCase()}…</div>}
+            {queryExecution?.state === 'failed' && <div className="sql-results-empty" role="alert">{queryExecution.message ?? 'Query failed.'}</div>}
+            {queryExecution?.state === 'succeeded' && localRows.length === 0 && <div className="sql-results-empty">Query completed successfully with no rows.</div>}
+            {queryExecution?.state === 'succeeded' && localRows.length > 0 && <table><thead><tr>{localColumns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{localRows.map((row, index) => <tr key={index}>{localColumns.map((column) => <td key={column}>{String(row[column] ?? 'NULL')}</td>)}</tr>)}</tbody></table>}
+            {queryExecution?.truncated && <div className="sql-results-footnote">Showing the first {localRows.length} rows returned by Dexter.</div>}
+          </div>}
+          {queryResultTab === 'schema' && <div className="sql-results-scroll"><table><thead><tr><th>Column</th><th>Type</th></tr></thead><tbody>{resultSchema.map((field) => <tr key={field.name}><td>{field.name}</td><td>{field.type}</td></tr>)}</tbody></table>{!resultSchema.length && <div className="sql-results-empty">Result schema is available after a successful query.</div>}</div>}
+          {queryResultTab === 'execution' && <div className="sql-execution-details">
+            {queryExecution ? <><div><span>Status</span><strong>{queryExecution.state}</strong></div><div><span>Environment</span><strong>{queryExecution.environment.toUpperCase()}</strong></div><div><span>Engine</span><strong>{queryExecution.engine}</strong></div><div><span>Selected object context</span><code>{queryExecution.physicalObject ?? 'Not resolved'}</code></div>{queryExecution.warehouse && <div><span>SQL warehouse</span><strong>{queryExecution.warehouse}</strong></div>}{queryExecution.durationMs != null && <div><span>Duration</span><strong>{(queryExecution.durationMs / 1000).toFixed(2)} s</strong></div>}{queryExecution.returnedRows != null && <div><span>Rows returned</span><strong>{queryExecution.returnedRows}</strong></div>}<div className="sql-executed-statement"><span>SQL from editor</span><pre>{queryExecution.sql}</pre></div>{queryExecution.executedSql && <div className="sql-executed-statement"><span>SQL sent to engine</span><pre>{queryExecution.executedSql}</pre></div>}{queryExecution.message && <div className="sql-executed-statement"><span>Message</span><p>{queryExecution.message}</p></div>}</>
+              : <div className="sql-results-empty">Execution details will appear here after a query runs.</div>}
+          </div>}
+        </section>
+        {makeLocalOpen && <div className="make-local-modal-backdrop"><section className="make-local-dialog" role="dialog" aria-modal="true" aria-labelledby="make-local-dialog-title">
+          <header className="make-local-dialog-header"><div><span className="eyebrow">LOCAL SNAPSHOT</span><h3 id="make-local-dialog-title">{queryHasLocal ? 'Refresh' : 'Make'} {selected.name} local</h3><code>{selected.qualified_name ?? selected.name}</code></div><button className="icon-button subtle" aria-label="Close Make Local" onClick={() => setMakeLocalOpen(false)}><X size={16} /></button></header>
+          <div className="make-local-dialog-body"><label className="field-label">PROD SQL WAREHOUSE</label>
+            <div className="local-filter-row"><select aria-label="SQL warehouse for Make Local" value={warehouseId} disabled={warehousesLoading || warehouses.length === 0} onChange={(event) => setWarehouseId(event.target.value)}><option value="">{warehousesLoading ? 'Loading warehouses…' : warehouses.length ? 'Select a SQL warehouse' : 'No accessible warehouses'}</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}</select><button className="button secondary small" disabled={warehousesLoading} onClick={() => setWarehouseRefreshKey((key) => key + 1)}><RefreshCw size={12} /> Refresh</button></div>
+            {warehouseError && <div className="discover-error modal-inline-error" role="alert">{warehouseError}</div>}
+            <label className="field-label">COLUMNS</label>
+            {selected.columns?.length ? <><label className="select-all-columns"><input type="checkbox" checked={selectedColumns.length === selected.columns.length} onChange={(event) => setSelectedColumns(event.target.checked ? selected.columns?.map((column) => column.name) ?? [] : [])} /><strong>All columns</strong><span>{selected.columns.length} available</span></label><div className="local-column-picker">{selected.columns.map((column) => <label key={column.name}><input type="checkbox" checked={selectedColumns.includes(column.name)} onChange={(event) => setSelectedColumns((prior) => event.target.checked ? [...prior, column.name] : prior.filter((item) => item !== column.name))} />{column.name}<code>{column.type_text ?? column.type}</code></label>)}</div></> : <div className="discover-error modal-inline-error">Column metadata is not loaded for this asset.</div>}
+            <small className="make-local-dialog-note">Refresh builds and validates a complete new snapshot before replacing the active copy. The previous snapshot stays available if refresh fails.</small>
+            {localQueryError && <div className="discover-error modal-inline-error" role="alert">{localQueryError}</div>}
+          </div>
+          <footer className="make-local-dialog-footer"><button className="button secondary small" onClick={() => setMakeLocalOpen(false)}>Cancel</button><button className="button primary small" disabled={!warehouseId || !selectedColumns.length || !selected.columns?.length || warehousesLoading || !selected.variants?.some((item) => item.environment === 'prod' && item.access === 'read') || Boolean(activeOperation && ['queued', 'running'].includes(activeOperation.state))} onClick={() => void runMakeLocal()}><HardDrive size={13} /> {queryHasLocal ? 'Refresh Local' : 'Make Local'}</button></footer>
         </section></div>}
       </div> : <>
         <div className="discover-detail-head"><div><div className="eyebrow">{selected.source.toUpperCase()} · {selected.environment.toUpperCase()}</div><h2>{selected.name}</h2></div><button className="icon-button subtle" aria-label="Refresh selected metadata" onClick={() => (selected.kind === 'table' || selected.kind === 'view') ? void selectNode(selected) : void loadChildren(selected, true)}><RefreshCw size={14} /></button></div>
@@ -726,7 +879,7 @@ function variantQualifiedName(variant?: { catalog?: string; schema?: string; tab
     : undefined
 }
 
-function qualifiedTableIdentifier(node: DiscoverNode, environment: 'dev' | 'prod'): string {
+function qualifiedTableIdentifier(node: DiscoverNode, environment: QueryEnvironment): string {
   const local = node.variants?.find((variant) => variant.environment === 'local')
   const selected = node.variants?.find((variant) => variant.environment === environment) ?? local
   const parts = selected ? [selected.catalog, selected.schema, selected.table] : []
@@ -737,6 +890,18 @@ function qualifiedTableIdentifier(node: DiscoverNode, environment: 'dev' | 'prod
   return qualified.length === 3
     ? qualified.join('.')
     : node.name
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let amount = value / 1024
+  let unit = units[0]
+  for (let index = 1; amount >= 1024 && index < units.length; index += 1) {
+    amount /= 1024
+    unit = units[index]
+  }
+  return `${amount.toFixed(1)} ${unit}`
 }
 
 function formatSnapshotDate(value?: string): string {
@@ -760,7 +925,7 @@ function metadataValues(value: unknown): string[] {
 }
 function Availability({ node, onSelect }: { node: DiscoverNode; onSelect?: (environment: 'local' | 'dev' | 'prod') => void }) {
   const availability = node.availability
-  const states = availability ?? { local: 'unknown', dev: 'unknown', prod: 'unknown' }
+  const states = availability ?? { local: 'absent', dev: 'unknown', prod: 'unknown' }
   return <span className="availability-pills" aria-label="Local, DEV, and PROD availability">
     {(['local', 'dev', 'prod'] as const).map((environment) => <button key={environment} className={states[environment]} title={`${environment.toUpperCase()} · ${accessLabel(states[environment])}`} onClick={(event) => { event.stopPropagation(); if (states[environment] === 'present') onSelect?.(environment) }} disabled={states[environment] !== 'present'}>{environment === 'local' ? 'L' : environment === 'dev' ? 'D' : 'P'}</button>)}
   </span>

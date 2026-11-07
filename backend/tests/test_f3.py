@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import base64
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -19,7 +18,7 @@ from dexter.catalog.unified import UnifiedDiscoverService, normalize_catalog
 from dexter.adapters.purview import discover_accounts
 from dexter.db.database import migrate
 from dexter.paths import DexterPaths
-from dexter.services.local_data import LocalDataService
+from dexter.services.local_data import LocalDataService, LocalDatasetBusy, MaterializationConflict
 from dexter.services.materialize import build_select
 from dexter.services.analytics_config import load_limits
 from dexter.services.operations import OperationsService, SettingsRepository
@@ -47,8 +46,16 @@ class ProviderFixture:
 
 
 class PurviewOnlyProvider(ProviderFixture):
+    def children(self, node_id, force=False):
+        if node_id == "databricks:prod:aai:core":
+            return {"items": [], "stale": False, "error": None}
+        return super().children(node_id, force)
+
     def _purview(self):
-        return {"items": [{"id": "purview:asset", "name": "secret_asset", "qualified_name": "catalog.secret_schema.secret_asset", "kind": "table", "source": "purview", "environment": "governance", "access": "unknown", "description": "Metadata only"}]}
+        return {"items": [{"id": "purview:asset", "name": "secret_asset", "qualified_name": "databricks://m1/catalogs/aai/schemas/core/tables/secret_asset", "kind": "table", "source": "purview", "environment": "governance", "access": "unknown", "description": "Metadata only"}]}
+
+    def _purview_schema(self, metastore_id, catalog, schema, force=False):
+        return self._purview()
 
 
 class CatalogCollisionProvider(ProviderFixture):
@@ -112,16 +119,16 @@ class UnifiedCatalogTests(unittest.TestCase):
             two = service._node("table", "events", [{"environment": "prod", "catalog": "aai", "schema": "core", "table": "events", "node_id": "p", "metastore_id": "m2", "access": "read"}])
             self.assertNotEqual(one["id"], two["id"])
 
-    def test_purview_only_asset_is_visible_with_unknown_data_access(self):
+    def test_purview_asset_has_unknown_access_and_confirmed_provider_absence(self):
         with tempfile.TemporaryDirectory() as temp:
             paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
             paths.ensure(); migrate(paths.database)
             service = UnifiedDiscoverService(PurviewOnlyProvider(), SettingsRepository(paths.database), LocalDataService(paths), paths)
             catalogs = service.catalogs()["items"]
-            catalog = next(item for item in catalogs if item["name"] == "catalog")
+            catalog = next(item for item in catalogs if item["name"] == "aai")
             schema = service.children(catalog["id"])["items"][0]
-            asset = service.children(schema["id"])["items"][0]
-            self.assertEqual(asset["availability"], {"local": "unknown", "dev": "unknown", "prod": "unknown"})
+            asset = next(item for item in service.children(schema["id"])["items"] if item["name"] == "secret_asset")
+            self.assertEqual(asset["availability"], {"local": "absent", "dev": "absent", "prod": "absent"})
             detail = service.detail(asset["id"])
             self.assertEqual(detail["access"], "unknown")
             self.assertIsNone(detail["read_access"])
@@ -203,7 +210,24 @@ class MaterializationTests(unittest.TestCase):
         self.assertFalse(first_path.exists())
         result = self.local.query(second["dataset_id"], "SELECT event_id FROM local_table ORDER BY event_id")
         self.assertEqual(result["rows"], [{"event_id": 9}, {"event_id": 10}])
+        self.assertEqual(result["schema"], [{"name": "event_id", "type": "int64"}])
+        qualified = self.local.query(second["dataset_id"], "SELECT event_id FROM aai_dev.core.events ORDER BY event_id")
+        self.assertEqual(qualified["rows"], [{"event_id": 9}, {"event_id": 10}])
+        self.assertEqual(qualified["executed_sql"], "SELECT event_id FROM aai_dev.core.events ORDER BY event_id")
         self.assertEqual(self.local.get(second["dataset_id"])["row_count"], 2)
+
+    def test_delete_is_blocked_while_snapshot_refresh_is_reserved(self):
+        _, active = self._snapshot([1, 2])
+        operation = self.operations.create("make-local")
+        staging = self.paths.temporary / f"make-local-{operation['id']}"
+        staging.mkdir()
+        self.local.reserve(operation["id"], active["source"], active["name"], active["qualified_name"], staging)
+        with self.assertRaises(LocalDatasetBusy):
+            self.local.delete(active["dataset_id"])
+        self.assertIsNotNone(self.local.get(active["dataset_id"]))
+        self.local.release(operation["id"], staging)
+        self.assertTrue(self.local.delete(active["dataset_id"]))
+        self.assertIsNone(self.local.get(active["dataset_id"]))
 
     def test_failed_staging_does_not_replace_active_snapshot(self):
         _, active = self._snapshot([4, 5])
@@ -228,7 +252,7 @@ class MaterializationTests(unittest.TestCase):
         stage_two = self.paths.temporary / f"make-local-{second['id']}"
         stage_one.mkdir(); stage_two.mkdir()
         self.local.reserve(first["id"], source, "events", "aai.core.events", stage_one)
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(MaterializationConflict):
             self.local.reserve(second["id"], source, "events", "aai.core.events", stage_two)
         self.local.release(first["id"], stage_one)
         self.local.release(second["id"], stage_two)

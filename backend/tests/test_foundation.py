@@ -57,10 +57,13 @@ class RuntimeFoundationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "dexter.sqlite3"
             migrate(db)
+            with connect(db) as connection:
+                first_migration_count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
             migrate(db)
             with connect(db) as connection:
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 3)
+                self.assertGreaterEqual(first_migration_count, 3)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], first_migration_count)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='operations'").fetchone()[0], 1)
 
     def test_operations_persist_validate_transitions_and_recover_after_restart(self):
@@ -262,8 +265,8 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(data["databricks"]["prod"]["status"], "unavailable")
                     self.assertEqual(data["purview"]["tenant_id"], "tenant-id")
                     self.assertEqual(data["purview"]["status"], "connected")
-                    self.assertEqual(client.put("/api/connections/purview", json={"endpoint": "https://manual.invalid"}).status_code, 404)
-                    self.assertEqual(client.post("/api/connections/databricks/dev/validate").status_code, 404)
+                    self.assertEqual(client.put("/api/connections/purview", json={"endpoint": "https://manual.invalid"}).status_code, 405)
+                    self.assertEqual(client.post("/api/connections/databricks/dev/validate").status_code, 405)
                 with TestClient(app, base_url="http://127.0.0.1:8001") as alternate_api_port:
                     self.assertEqual(alternate_api_port.get("/api/health").status_code, 200)
 
