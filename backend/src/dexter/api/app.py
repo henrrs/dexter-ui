@@ -345,8 +345,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         return unified.catalogs(force)
 
     @app.get("/api/discover/catalog-nodes/{node_id:path}/children")
-    def discover_catalog_children(node_id: str, force: bool = False):
-        return unified.children(node_id, force)
+    def discover_catalog_children(node_id: str, force: bool = False, cached_only: bool = False):
+        return unified.children(node_id, force, cached_only)
 
     @app.get("/api/discover/catalog-nodes/{node_id:path}/lineage")
     def discover_catalog_lineage(node_id: str):

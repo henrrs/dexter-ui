@@ -73,3 +73,13 @@ Validation on 2026-11-07:
 - `npm run build` — TypeScript and Vite production build passed.
 - `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
 - Tests use local fixtures. No Databricks workspace, SQL Warehouse, Purview, or table records were accessed. Visual browser screenshots and live-permission behavior remain unverified in this workspace.
+
+## F4.1 Compare Tables UX refinement
+
+Validation on 2026-11-07:
+
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — passed 65 tests, including both missing-side states without synthetic column differences, access denied versus unavailable metadata, unknown availability, and cached-only page restoration.
+- `node --test scripts/ui-contract.test.mjs` — passed all 8 tests, including explicit reference/destination controls, Swap, Ask Dexter comparison context, and the absence of a Prepare DEV CTA.
+- `npm run build` — TypeScript and Vite production build passed.
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
+- Provider fixtures only; no live workspace credentials, records, or visual browser session were used.

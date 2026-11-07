@@ -155,25 +155,30 @@ def _field_signature(field_data: dict[str, Any]) -> tuple[Any, ...]:
 
 def compare_schemas(prod: dict[str, Any] | None, dev: dict[str, Any] | None) -> dict[str, Any]:
     """Produce a stable, non-prescriptive PROD-vs-DEV structural assessment."""
-    if prod is None or not prod.get("complete"):
+    if prod is None and dev is None:
         return {
             "state": "metadata_unavailable", "compatibility": "unknown",
             "summary": {}, "differences": [], "prod_schema": prod, "dev_schema": dev,
-            "message": "PROD schema metadata is unavailable or incomplete.",
+            "message": "Schema metadata is unavailable for both environments.",
         }
-    if dev is None:
-        return {
-            "state": "dev_table_not_found", "compatibility": "not_comparable",
-            "summary": {"prod_only": len(prod.get("fields", [])), "dev_only": 0, "type_changed": 0, "other_changed": 0, "matching": 0},
-            "differences": [{"name": item["name"], "status": "prod_only", "prod": item, "dev": None, "changes": []} for item in prod.get("fields", [])],
-            "prod_schema": prod, "dev_schema": None,
-            "message": "PROD schema is available. No corresponding table was found in DEV.",
-        }
-    if not dev.get("complete"):
+    if (prod is not None and not prod.get("complete")) or (dev is not None and not dev.get("complete")):
         return {
             "state": "metadata_unavailable", "compatibility": "unknown",
             "summary": {}, "differences": [], "prod_schema": prod, "dev_schema": dev,
             "message": "Schema metadata is incomplete for one or both environments.",
+        }
+    if dev is None:
+        return {
+            "state": "dev_table_not_found", "compatibility": "not_comparable",
+            "summary": {}, "differences": [],
+            "prod_schema": prod, "dev_schema": None,
+            "message": "No corresponding table was found in DEV. The PROD reference schema is available.",
+        }
+    if prod is None:
+        return {
+            "state": "prod_table_not_found", "compatibility": "not_comparable",
+            "summary": {}, "differences": [], "prod_schema": None, "dev_schema": dev,
+            "message": "No corresponding table was found in PROD. The DEV reference schema is available.",
         }
     prod_fields = {item["name"].casefold(): item for item in prod.get("fields", [])}
     dev_fields = {item["name"].casefold(): item for item in dev.get("fields", [])}

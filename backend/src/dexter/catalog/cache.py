@@ -29,6 +29,15 @@ class DiscoveryCache:
             return None
         return {"items": json.loads(row["payload_json"]), "fetched_at": row["fetched_at"], "expires_at": row["expires_at"], "stale": row["expires_at"] <= time.time(), "error": row["last_error"]}
 
+    def nodes(self, context: str) -> list[str]:
+        """Return cached page keys for one provider identity without loading payloads."""
+        db = connect(self.database)
+        try:
+            rows = db.execute("SELECT node_key FROM discovery_cache WHERE context_key=? ORDER BY node_key", (context,)).fetchall()
+        finally:
+            db.close()
+        return [str(row["node_key"]) for row in rows]
+
     def put(self, context: str, node: str, items: list[dict], ttl: int, error: str | None = None) -> dict:
         now = time.time()
         key = context_key(context, node)

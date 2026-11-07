@@ -47,6 +47,19 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(restored["items"], [{"name": "analytics_dev"}])
         self.assertFalse(restored["stale"])
 
+    def test_cached_listing_paths_are_scoped_to_selected_databricks_profiles(self):
+        repo = MagicMock()
+        repo.get.side_effect = lambda key: {"profile": "dexter-dev"} if key == "databricks.dev" else None
+        host = "https://dev.example"
+        cache_context = context_key("databricks", "dev", "dexter-dev", host)
+        cache = DiscoveryCache(self.paths.database)
+        cache.put(cache_context, "analytics", [], 86400)
+        cache.put(cache_context, "analytics/gold", [], 86400)
+        cache.put(context_key("databricks", "prod", "other-profile", "https://prod.example"), "private/sales", [], 86400)
+        service = DiscoverService(self.paths, repo, Settings())
+        with patch("dexter.adapters.databricks.safe_workspace_host", return_value=host):
+            self.assertEqual(service.cached_databricks_paths(), ["analytics", "analytics/gold"])
+
     def test_local_manifest_requires_existing_file_inside_dataset_directory(self):
         dataset = self.paths.datasets / "good"
         dataset.mkdir()

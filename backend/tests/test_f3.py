@@ -82,6 +82,13 @@ class SchemaProviderFixture(ProviderFixture):
                 "qualified_name": f"analytics{'_dev' if environment == 'dev' else ''}.gold.orders"}
 
 
+class SchemaDeniedProvider(SchemaProviderFixture):
+    def detail_for_compare(self, node_id, force=False):
+        if node_id.split(":")[1] == "dev":
+            return {"metadata_status": "access_denied", "metadata_message": "The current profile was denied access to this schema metadata."}
+        return self.detail(node_id, force)
+
+
 class CatalogCollisionProvider(ProviderFixture):
     def children(self, node_id, force=False):
         if node_id == "databricks:dev":
@@ -134,6 +141,21 @@ class UnifiedCatalogTests(unittest.TestCase):
             self.assertEqual(detail["workspace"], "https://dev.example")
             self.assertEqual(detail["qualified_name"], "aai_dev.core.events")
 
+    def test_cached_only_tree_restore_never_calls_remote_provider_or_purview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
+            paths.ensure(); migrate(paths.database)
+            provider = ProviderFixture()
+            service = UnifiedDiscoverService(provider, SettingsRepository(paths.database), LocalDataService(paths), paths)
+            catalog = next(item for item in service.catalogs()["items"] if item["name"] == "aai")
+            network_children = provider.children
+            provider.cached_children = network_children
+            provider.children = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("remote provider was called during cache restore"))
+            schemas = service.children(catalog["id"], cached_only=True)["items"]
+            core = next(item for item in schemas if item["name"] == "core")
+            tables = service.children(core["id"], cached_only=True)["items"]
+            self.assertEqual([table["name"] for table in tables], ["events"])
+
     def test_schema_comparison_resolves_real_physical_variants_and_is_metadata_only(self):
         with tempfile.TemporaryDirectory() as temp:
             paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
@@ -169,6 +191,23 @@ class UnifiedCatalogTests(unittest.TestCase):
             self.assertEqual(result["sides"]["dev"]["state"], "available")
             self.assertEqual(result["sides"]["dev"]["access"], "restricted")
 
+    def test_denied_schema_metadata_remains_distinct_from_unavailable_and_absent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
+            paths.ensure(); migrate(paths.database)
+            provider = SchemaDeniedProvider()
+            service = UnifiedDiscoverService(provider, SettingsRepository(paths.database), LocalDataService(paths), paths)
+            table = service._node("table", "orders", [
+                {"environment": "prod", "catalog": "analytics", "schema": "gold", "table": "orders", "node_id": "databricks:prod:analytics:gold:orders", "metastore_id": "m1", "access": "read"},
+                {"environment": "dev", "catalog": "analytics_dev", "logical_catalog": "analytics", "schema": "gold", "table": "orders", "node_id": "databricks:dev:analytics_dev:gold:orders", "metastore_id": "m1", "access": "restricted"},
+            ], {"local": "absent", "dev": "present", "prod": "present"})
+            result = service.compare_schemas(table["id"])
+            self.assertEqual(result["state"], "metadata_unavailable")
+            self.assertEqual(result["sides"]["dev"]["state"], "access_denied")
+            self.assertEqual(result["sides"]["prod"]["state"], "available")
+            self.assertIsNone(result["dev_schema"])
+            self.assertEqual(result["differences"], [])
+
     def test_unconfirmed_dev_metadata_is_not_reported_as_missing_table(self):
         with tempfile.TemporaryDirectory() as temp:
             paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
@@ -196,6 +235,25 @@ class UnifiedCatalogTests(unittest.TestCase):
             self.assertEqual(result["state"], "dev_table_not_found")
             self.assertIsNone(result["dev_schema"])
             self.assertEqual(result["sides"]["dev"]["state"], "absent")
+            self.assertEqual(result["differences"], [])
+            self.assertEqual(result["summary"], {})
+            self.assertEqual(result["compatibility"], "not_comparable")
+
+    def test_schema_comparison_with_only_dev_identifies_missing_prod_without_fake_diffs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = DexterPaths.from_env({"DEXTER_HOME": f"{temp}/data", "DEXTER_CONFIG_HOME": f"{temp}/config"})
+            paths.ensure(); migrate(paths.database)
+            provider = SchemaProviderFixture()
+            service = UnifiedDiscoverService(provider, SettingsRepository(paths.database), LocalDataService(paths), paths)
+            table = service._node("table", "orders", [
+                {"environment": "dev", "catalog": "analytics_dev", "logical_catalog": "analytics", "schema": "gold", "table": "orders", "node_id": "databricks:dev:analytics_dev:gold:orders", "metastore_id": "m1", "access": "read"},
+            ], {"local": "absent", "dev": "present", "prod": "absent"})
+            result = service.compare_schemas(table["id"])
+            self.assertEqual(result["state"], "prod_table_not_found")
+            self.assertIsNone(result["prod_schema"])
+            self.assertTrue(result["dev_schema"]["complete"])
+            self.assertEqual(result["differences"], [])
+            self.assertEqual(result["summary"], {})
 
     def test_same_name_with_different_metastore_is_not_merged(self):
         with tempfile.TemporaryDirectory() as temp:

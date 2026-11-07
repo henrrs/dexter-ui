@@ -127,9 +127,10 @@ class UnifiedDiscoverService:
                     node["availability"][env] = "present"
             node["id"] = _variants_id("catalog", node["variants"], node["availability"])
         nodes.sort(key=lambda node: node["name"].casefold())
-        return {"items": nodes, "fetched_at": None, "expires_at": None, "stale": bool(errors), "error": "; ".join(dict.fromkeys(errors)) or None}
+        cached_paths = getattr(self.provider, "cached_databricks_paths", lambda: [])()
+        return {"items": nodes, "cached_paths": cached_paths, "fetched_at": None, "expires_at": None, "stale": bool(errors), "error": "; ".join(dict.fromkeys(errors)) or None}
 
-    def children(self, node_id: str, force: bool = False) -> dict:
+    def children(self, node_id: str, force: bool = False, cached_only: bool = False) -> dict:
         try:
             kind, variants, parent_availability = _variants(node_id)
         except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError, TypeError, binascii.Error):
@@ -140,7 +141,7 @@ class UnifiedDiscoverService:
             page_errors = []
             for variant in variants:
                 if variant.get("environment") in {"dev", "prod"} and variant.get("node_id"):
-                    page = self._fetch_children(variant["node_id"], force)
+                    page = self._fetch_children(variant["node_id"], force, cached_only)
                     rows = page.get("items", []) if isinstance(page, dict) else page
                     if isinstance(page, dict) and page.get("error"):
                         page_errors.append(page["error"])
@@ -168,7 +169,7 @@ class UnifiedDiscoverService:
             schema_scopes: set[tuple[str, str, str, str]] = set()
             for variant in variants:
                 if variant.get("environment") in {"dev", "prod"} and variant.get("node_id"):
-                    page = self._fetch_children(variant["node_id"], force)
+                    page = self._fetch_children(variant["node_id"], force, cached_only)
                     rows = page.get("items", []) if isinstance(page, dict) else page
                     if isinstance(page, dict) and page.get("error"):
                         page_errors.append(page["error"])
@@ -187,7 +188,7 @@ class UnifiedDiscoverService:
                         schema_scopes.add((metastore_id, variant["catalog"], variant["schema"], variant.get("logical_catalog", variant["catalog"])))
                 elif variant.get("environment") == "local" and variant.get("node_id"):
                     groups.setdefault(variant["table"].casefold(), []).append({**variant, "kind": variant.get("kind", "table")})
-            for metastore_id, catalog, schema, logical_catalog in sorted(schema_scopes):
+            for metastore_id, catalog, schema, logical_catalog in (sorted(schema_scopes) if not cached_only else []):
                 try:
                     page = self.provider._purview_schema(metastore_id, catalog, schema, force)
                 except Exception as exc:
@@ -277,9 +278,14 @@ class UnifiedDiscoverService:
         dev_side = self._schema_side(dev_node_id or prod_node_id, "dev", force)
         prod_schema = prod_side.get("schema")
         dev_schema = dev_side.get("schema")
-        if prod_side["state"] != "available":
+        if prod_side["state"] == "absent" and dev_side["state"] == "available":
             result = compare_schemas(None, dev_schema)
-            result["message"] = prod_side.get("message") or "PROD schema metadata is unavailable."
+        elif prod_side["state"] != "available":
+            result = {
+                "state": "metadata_unavailable", "compatibility": "unknown", "summary": {},
+                "differences": [], "prod_schema": prod_schema, "dev_schema": dev_schema,
+                "message": prod_side.get("message") or "PROD schema metadata is unavailable.",
+            }
         elif dev_side["state"] == "absent":
             result = compare_schemas(prod_schema, None)
         elif dev_side["state"] != "available":
@@ -313,7 +319,15 @@ class UnifiedDiscoverService:
                            else f"Table availability in {environment.upper()} is not confirmed.",
             }
         physical_id = variant.get("node_id")
-        detail = self.provider.detail(physical_id, force=force)
+        detail_reader = getattr(self.provider, "detail_for_compare", self.provider.detail)
+        detail = detail_reader(physical_id, force=force)
+        if isinstance(detail, dict) and detail.get("metadata_status") in {"access_denied", "unavailable"}:
+            return {
+                "environment": environment, "state": detail["metadata_status"], "availability": "present",
+                "access": variant.get("access", "unknown"),
+                "qualified_name": ".".join(str(variant.get(key, "")) for key in ("catalog", "schema", "table")),
+                "message": detail.get("metadata_message"),
+            }
         if not detail:
             return {
                 "environment": environment, "state": "unavailable", "availability": "present",
@@ -375,9 +389,9 @@ class UnifiedDiscoverService:
             if env in result: result[env] = "present"
         return result
 
-    def _fetch_children(self, node_id: str, force: bool) -> dict:
+    def _fetch_children(self, node_id: str, force: bool, cached_only: bool = False) -> dict:
         try:
-            page = self.provider.children(node_id, force)
+            page = self.provider.cached_children(node_id) if cached_only else self.provider.children(node_id, force)
         except Exception as exc:
             logger.info("Catalog metadata unavailable for node (%s)", type(exc).__name__)
             return {"items": [], "stale": False, "error": "This catalog node could not be loaded; retry or inspect the provider connection."}

@@ -20,8 +20,8 @@ export const api = {
   connections: () => request<Connections>('/connections'),
   refreshConnections: () => request<Connections>('/connections/refresh', { method: 'POST' }),
   operations: () => request<Operation[]>('/operations?limit=12'),
-  discoverSources: (force = false) => request<{ items: DiscoverNode[] }>(`/discover/catalogs${force ? '?force=true' : ''}`),
-  discoverCatalogChildren: (nodeId: string, force = false) => request<DiscoverPage>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
+  discoverSources: (force = false) => request<{ items: DiscoverNode[]; cached_paths?: string[] }>(`/discover/catalogs${force ? '?force=true' : ''}`),
+  discoverCatalogChildren: (nodeId: string, force = false, cachedOnly = false) => request<DiscoverPage>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/children?${new URLSearchParams({ ...(force ? { force: 'true' } : {}), ...(cachedOnly ? { cached_only: 'true' } : {}) })}`),
   discoverCatalogDetail: (nodeId: string, environment?: string) => request<DiscoverNode>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}${environment ? `?environment=${environment}` : ''}`),
   discoverCatalogLineage: (nodeId: string) => request<{ available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }>(`/discover/catalog-nodes/${encodeURIComponent(nodeId)}/lineage`),
   discoverChildren: (nodeId: string, force = false) => request<DiscoverPage | DiscoverNode[]>(`/discover/nodes/${encodeURIComponent(nodeId)}/children${force ? '?force=true' : ''}`),
@@ -62,7 +62,7 @@ export type CanonicalSchemaField = {
 export type CanonicalSchema = { qualified_name: string; fields: CanonicalSchemaField[]; constraints: string[]; technology_properties: Record<string, unknown>; complete: boolean }
 export type SchemaCompareSide = { environment: 'prod' | 'dev'; state: string; availability?: string; access?: string; qualified_name?: string; message?: string | null; metadata_cache?: { state: 'cached' | 'refreshed' | 'stale'; fetched_at: number; message?: string } | null }
 export type SchemaCompareResult = {
-  state: 'matching' | 'different' | 'dev_table_not_found' | 'metadata_unavailable'
+  state: 'matching' | 'different' | 'dev_table_not_found' | 'prod_table_not_found' | 'metadata_unavailable'
   compatibility: 'structurally_equivalent' | 'structural_difference' | 'review_required' | 'not_comparable' | 'unknown'
   summary: Record<string, number>; schema_constraints_changed?: boolean; schema_changes?: string[]
   differences: Array<{ name: string; status: string; prod: CanonicalSchemaField | null; dev: CanonicalSchemaField | null; changes: string[] }>

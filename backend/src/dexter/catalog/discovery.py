@@ -69,6 +69,25 @@ class DiscoverService:
         result.append({"id": "purview", "name": "Microsoft Purview", "source": "purview", "environment": "governance", "kind": "source", "status": check["status"] if check else ("configured" if config else "unavailable"), "detail": check["detail"] if check else "Discover a Purview account through the current Azure CLI session in Settings.", "children": None})
         return result
 
+    def cached_databricks_paths(self) -> list[str]:
+        """List cached catalog/schema pages for the configured profiles without remote calls."""
+        paths: set[str] = set()
+        for env in ("dev", "prod"):
+            config = self.settings_repo.get(f"databricks.{env}")
+            if not config:
+                continue
+            try:
+                from dexter.adapters.databricks import safe_workspace_host
+                host = safe_workspace_host(config["profile"])
+                if not host:
+                    continue
+                context = context_key("databricks", env, config["profile"], host)
+                paths.update(node for node in self.cache.nodes(context) if node != "catalogs")
+            except Exception as exc:
+                # Cache discovery is local-only and must not require a successful profile login.
+                logger.debug("Could not inspect cached Databricks page keys (%s)", type(exc).__name__)
+        return sorted(paths, key=str.casefold)
+
     def children(self, node_id: str, force: bool = False):
         if node_id == "local":
             return self._local_root()
@@ -79,7 +98,32 @@ class DiscoverService:
             return self._purview(force)
         return []
 
+    def cached_children(self, node_id: str):
+        """Read one cached Databricks listing page without creating a client or probing a workspace."""
+        if not node_id.startswith("databricks:"):
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "No cached provider page is available."}
+        _, env, *path = node_id.split(":")
+        config = self.settings_repo.get(f"databricks.{env}") if env in {"dev", "prod"} else None
+        if not config:
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "No cached provider page is available."}
+        from dexter.adapters.databricks import safe_workspace_host
+        host = safe_workspace_host(config["profile"])
+        if not host:
+            return {"items": [], "fetched_at": None, "expires_at": None, "stale": False, "error": "No cached provider page is available."}
+        context = context_key("databricks", env, config["profile"], host)
+        return self.cache.get(context, "/".join(path) or "catalogs") or {
+            "items": [], "fetched_at": None, "expires_at": None, "stale": False,
+            "error": "This page is not present in the local metadata cache.",
+        }
+
     def detail(self, node_id: str, force: bool = False):
+        return self._detail(node_id, force, diagnostic=False)
+
+    def detail_for_compare(self, node_id: str, force: bool = False):
+        """Return safe failure categories to schema comparison without changing detail API behavior."""
+        return self._detail(node_id, force, diagnostic=True)
+
+    def _detail(self, node_id: str, force: bool = False, diagnostic: bool = False):
         if node_id.startswith("local:table:"):
             dataset_id = node_id.removeprefix("local:table:")
             path = self.paths.datasets / dataset_id / "manifest.json"
@@ -158,6 +202,15 @@ class DiscoverService:
                     return {**cached["items"][0], "workspace": workspace_host, "profile": config["profile"],
                             "metadata_cache": {"state": "stale", "fetched_at": cached["fetched_at"],
                                                "message": "Schema refresh failed; showing the last cached metadata."}}
+                if diagnostic:
+                    response = getattr(exc, "response", None)
+                    status_code = getattr(exc, "status_code", None) or getattr(response, "status_code", None) or getattr(exc, "code", None)
+                    denied = status_code == 403 or any(term in str(exc).casefold() for term in ("permission denied", "forbidden", "not authorized"))
+                    return {
+                        "metadata_status": "access_denied" if denied else "unavailable",
+                        "metadata_message": "The current profile was denied access to this schema metadata." if denied
+                            else "Schema metadata could not be read from the selected Databricks profile.",
+                    }
                 return None
         return None
 
