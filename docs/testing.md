@@ -142,3 +142,24 @@ Validation on 2026-11-08:
 - `node --test scripts/ui-contract.test.mjs` — ten contracts passed. `npm run build`, Python compilation and `git diff --check` passed.
 - Safe structured state evidence is generated at `.run/schema-evolution-evidence/state-snapshots.json`; browser evidence lives in `.run/workflow-evidence/`. The workflow browser harness owns Vite directly so repeated runs cannot reuse a process connected to an expired fixture server.
 - Tests use disposable local DEV metadata/SQL fixtures. No real Databricks DDL or shared-table mutation was performed; live grants/runtime/ADD COLUMN certification remains external. See the [targeted correction report](schema-evolution-state-fix.md).
+
+## F4.3 Schema Evolution and Delta capability refinement
+
+Validation on 2026-11-08:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — **176 tests passed**. New cases cover physical schema comparison independent from draft edits, parameterized/complex type normalization, explicit Column Mapping and Type Widening choices, compute/grant/protocol checks, expected intermediate capability changes, lost activation responses, concurrent drift, partial execution, retained drafts and reconciliation requirements.
+- `npm run test:ui` — **8 browser tests passed** in headless Firefox with controlled local HTTP fixtures. Coverage includes the shared native type selector, physical comparison after import, opt-in feature review and confirmation, preserving state across workspace tabs, and reopening a closed workflow in Edit while ignoring stale responses.
+- `node --test scripts/ui-contract.test.mjs` — **10 tests passed**.
+- `npm run build` — TypeScript and Vite production build passed.
+- Python `compileall` and `git diff --check` — passed.
+- These tests use local fixtures and fake Databricks SQL/SDK responses. They certify implementation behavior locally, not a live workspace. No real DEV DDL, Delta feature activation, table rewrite, or production operation was performed. See the [refinement report](schema-evolution-delta-refinement.md) and [ADR 0013](decisions/0013-dev-schema-evolution.md).
+
+## F4.3 schema evolution UX, type changes, and explicit table recreation
+
+Validation on 2026-11-08:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts:backend/tests ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 183 tests passed, including direct Delta changes, opt-in feature checks, explicit empty-table recreation, lost/uncertain DDL responses, table identity changes, cache invalidation, and reconciliation.
+- `node --test --test-concurrency=1 scripts/workflow-navigation.test.mjs` — all 7 real headless Firefox journeys passed with local controlled HTTP fixtures, including type selection, Delta capability review, explicit destructive recreation review/confirmation, and validation of the recreated table's new physical identity and final schema.
+- `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed. `npm run build` — TypeScript and Vite production build passed.
+- `python3 -m compileall -q backend/src backend/tests scripts` and `git diff --check` — passed.
+- Tests use disposable local metadata/SQL fixtures and fake Databricks SDK responses. No live Databricks DDL, table recreation, Delta feature activation, or PROD operation was performed; the implementation is locally certified, not live-workspace certified. See [ADR 0013](decisions/0013-dev-schema-evolution.md) and the [Delta refinement report](schema-evolution-delta-refinement.md).

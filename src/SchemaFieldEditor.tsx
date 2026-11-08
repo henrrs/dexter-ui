@@ -9,16 +9,25 @@ type Props = {
   onChange: (changes: Changes) => void; onRemove: () => void; onRestore?: () => void
 }
 
-const databricksTypes = ['ARRAY<STRING>', 'BINARY', 'BOOLEAN', 'BYTE', 'CHAR(10)', 'DATE', 'DECIMAL(18,2)', 'DOUBLE', 'FLOAT', 'GEOGRAPHY', 'GEOMETRY', 'INT', 'LONG', 'MAP<STRING,STRING>', 'SMALLINT', 'STRING', 'STRUCT<field:STRING>', 'TIME', 'TIMESTAMP', 'TIMESTAMP_NTZ', 'TINYINT', 'VARIANT', 'VARCHAR(255)']
+const databricksTypes = ['ARRAY<STRING>', 'BINARY', 'BOOLEAN', 'CHAR(10)', 'DATE', 'DECIMAL(18,2)', 'DOUBLE', 'FLOAT', 'GEOGRAPHY', 'GEOMETRY', 'INTEGER', 'BIGINT', 'MAP<STRING,STRING>', 'SMALLINT', 'STRING', 'STRUCT<field:STRING>', 'TIME', 'TIMESTAMP', 'TIMESTAMP_NTZ', 'TINYINT', 'VARIANT', 'VARCHAR(255)']
+const typeAliases: Record<string, string> = { BYTE: 'TINYINT', SHORT: 'SMALLINT', INT: 'INTEGER', LONG: 'BIGINT', REAL: 'FLOAT', NUMERIC: 'DECIMAL' }
 
 export function DatabricksTypeSelector({ fieldName, value, disabled, loading = false, onChange }: { fieldName: string; value: string; disabled?: boolean; loading?: boolean; onChange: (value: string) => void }) {
   const decimal = /^\s*(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*$/i.exec(value)
   const family = value.split(/[<(]/)[0].trim().toUpperCase()
-  const known = databricksTypes.find(type => type.split(/[<(]/)[0] === family)
+  const normalizedFamily = typeAliases[family] ?? family
+  const known = databricksTypes.find(type => {
+    const optionFamily = type.split(/[<(]/)[0]
+    if (['ARRAY', 'MAP', 'STRUCT', 'CHAR', 'VARCHAR'].includes(optionFamily)) return type.toUpperCase() === value.trim().toUpperCase()
+    return optionFamily === normalizedFamily
+  })
   const [custom, setCustom] = useState(!known && !decimal)
   const [precision, setPrecision] = useState(decimal?.[1] ?? '18')
   const [scale, setScale] = useState(decimal?.[2] ?? '2')
-  useEffect(() => { if (decimal) { setPrecision(decimal[1]); setScale(decimal[2]) } }, [value])
+  useEffect(() => {
+    if (decimal) { setPrecision(decimal[1]); setScale(decimal[2]) }
+    setCustom(!known && !decimal)
+  }, [value, known, decimal?.[1], decimal?.[2]])
   const validDecimal = Number(precision) >= 1 && Number(precision) <= 38 && scale !== '' && Number(scale) >= 0 && Number(scale) <= Number(precision)
   const updateDecimal = (p: string, s: string) => { setPrecision(p); setScale(s); if (p && s && Number(p) >= 1 && Number(p) <= 38 && Number(s) >= 0 && Number(s) <= Number(p)) onChange(`DECIMAL(${p},${s})`) }
   return <div className="databricks-type-selector">
@@ -27,7 +36,7 @@ export function DatabricksTypeSelector({ fieldName, value, disabled, loading = f
       <option value="custom">Custom / existing type</option>
     </select>
     {decimal && !custom ? <div className="type-parameters"><label>Precision<input type="number" aria-label={`Precision for ${fieldName}`} min={1} max={38} disabled={disabled} value={precision} onChange={event => updateDecimal(event.target.value, scale)} /></label><label>Scale<input type="number" aria-label={`Scale for ${fieldName}`} min={0} max={Number(precision)} disabled={disabled} value={scale} onChange={event => updateDecimal(precision, event.target.value)} /></label>{!validDecimal && <small role="alert">Precision must be 1–38; scale must be 0–precision.</small>}</div>
-      : (custom || /[<(]/.test(value)) && <input aria-label={`Type declaration for ${fieldName}`} value={value} disabled={disabled} onChange={event => onChange(event.target.value)} />}
+      : custom && <input aria-label={`Type declaration for ${fieldName}`} value={value} disabled={disabled} onChange={event => onChange(event.target.value)} />}
   </div>
 }
 

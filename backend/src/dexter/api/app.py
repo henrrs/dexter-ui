@@ -131,6 +131,8 @@ class SchemaReviewRequest(BaseModel):
     reference_prod_schema: dict | None = None
     warehouse_id: str | None = Field(default=None, min_length=1, max_length=160)
     enable_features: list[Literal["column_mapping", "type_widening"]] = Field(default_factory=list)
+    execution_strategy: Literal["apply", "recreate"] = "apply"
+    external_location_name: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class SchemaApplyRequest(BaseModel):
@@ -139,6 +141,8 @@ class SchemaApplyRequest(BaseModel):
     plan_id: str = Field(min_length=64, max_length=64)
     warehouse_id: str = Field(min_length=1, max_length=160)
     confirm_drop: bool = False
+    confirm_recreate: bool = False
+    execution_strategy: Literal["apply", "recreate"] = "apply"
     enable_features: list[Literal["column_mapping", "type_widening"]] = Field(default_factory=list)
 
 
@@ -451,18 +455,30 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         identity, schema, detail, _workspace, key = _schema_evolution_context(node_id)
         repository = SchemaEvolutionRepository(paths.database)
         draft = repository.get_draft(key)
+        pending = repository.pending_reconciliation(identity)
+        if draft is None and pending and pending.get("execution_strategy") == "recreate":
+            import hashlib as _hashlib
+            import json as _json
+            previous_identity = pending.get("identity") or {}
+            previous_key = _hashlib.sha256(_json.dumps(previous_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            draft = repository.get_draft(previous_key)
+            if draft is not None:
+                key = previous_key
         if draft is None:
+            if detail.get("target_absent"):
+                raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "The DEV table is absent after a recreation attempt. Inspect the saved operation and reconcile the remote state before continuing."})
             draft = SchemaDraft.from_schema(identity, schema).to_dict()
             repository.save_draft(key, identity, draft)
         else:
             # Upgrade the fingerprint representation without changing the physical snapshot or edits.
             normalized = SchemaDraft.from_dict(draft).to_dict()
             if draft.get("baseline_fingerprint") != normalized["baseline_fingerprint"]:
-                repository.save_draft(key, identity, normalized)
+                repository.save_draft(key, normalized["identity"], normalized)
             draft = normalized
         return {"identity": identity, "schema": schema, "draft": draft,
                 "drift": not schemas_equivalent(draft["baseline"], schema),
-                "reconciliation_required": repository.pending_reconciliation(identity) is not None,
+                "reconciliation_required": pending is not None,
+                "target_state": "absent" if detail.get("target_absent") else "present",
                 "metadata_cache": detail.get("metadata_cache"), "draft_key": key}
 
     @app.put("/api/schema-evolution/draft")
@@ -479,6 +495,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         import json as _json
         key = _hashlib.sha256(_json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         repository = SchemaEvolutionRepository(paths.database)
+        if repository.pending_reconciliation(identity):
+            raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "Reconcile the current physical table before editing or saving this draft."})
         current = repository.get_draft(key)
         if not current:
             raise HTTPException(409, detail="The draft session expired. Reload the DEV schema before editing.")
@@ -495,6 +513,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, schema, detail, _workspace, key = _schema_evolution_context(body.node_id)
         repository = SchemaEvolutionRepository(paths.database)
+        if repository.pending_reconciliation(identity):
+            raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "Reconcile the physical DEV table before resetting this draft."})
+        if detail.get("target_absent"):
+            raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "The DEV table is absent. Reset cannot mark a missing table as a new physical baseline."})
         repository.acknowledge_reconciliation(identity)
         repository.clear_draft(key)
         draft = SchemaDraft.from_schema(identity, schema).to_dict()
@@ -507,6 +529,77 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         from dexter.domain.schema_evolution import SchemaDraft, reconcile_draft
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, schema, detail, _workspace, key = _schema_evolution_context(body.node_id)
+        repository = SchemaEvolutionRepository(paths.database)
+        previous = repository.pending_reconciliation(identity)
+        if previous and previous.get("execution_strategy") == "recreate":
+            old_identity = previous.get("identity") or {}
+            old_key = __import__("hashlib").sha256(__import__("json").dumps(
+                old_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            raw = repository.get_draft(old_key)
+            if not raw:
+                raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "The saved schema draft could not be recovered. No table action was repeated."})
+            lock_key = "|".join((old_identity.get("workspace", "").casefold(), old_identity.get("profile", "").casefold(), old_identity.get("table_id", "").casefold()))
+            with schema_evolution_target_lock:
+                if lock_key in schema_evolution_active_targets:
+                    raise HTTPException(409, detail="Wait for the active DEV operation before reconciling")
+            if detail.get("target_absent"):
+                observation = {"state": "target_absent", "message": "The DEV table is confirmed absent after the recreation attempt. Dexter did not retry DROP or CREATE."}
+                _record_recreation_reconciliation(previous, observation)
+                return {**observation, "identity": old_identity, "schema": None, "draft": raw,
+                        "reconciliation_required": True, "draft_key": old_key}
+            # A replacement table necessarily has a new physical table_id.
+            # Inspect it without the normal editor guard that requires the old
+            # reviewed identity, then prove it matches the approved empty result.
+            from dexter.adapters.databricks_schema_evolution import inspect_table
+            target, capabilities = inspect_table(_workspace, identity)
+            from dexter.domain.schema import canonical_schema
+            actual_schema = canonical_schema(list(getattr(target, "columns", None) or []),
+                ".".join(identity[k] for k in ("catalog", "schema", "table")),
+                constraints=getattr(target, "table_constraints", None) or getattr(target, "constraints", None),
+                technology_properties={"table_id": str(getattr(target, "table_id", "") or "")},
+                complete=bool(getattr(target, "columns", None)))
+            if str(capabilities.get("table_id") or "") == str(old_identity.get("table_id") or ""):
+                draft = reconcile_draft(SchemaDraft.from_dict(raw), actual_schema, previous).to_dict()
+                repository.save_draft(old_key, old_identity, draft)
+                repository.acknowledge_reconciliation(identity)
+                observation = {"state": "original_table_present", "message": "The original DEV table is still present. Review the observed table before any new operation."}
+                _record_recreation_reconciliation(previous, observation)
+                return {**observation, "identity": old_identity, "schema": actual_schema, "draft": draft,
+                        "reconciliation_required": False, "draft_key": old_key}
+            plan_recreation = previous.get("recreation") or {}
+            expected = previous.get("proposed_dev_schema") or {}
+            from dexter.domain.schema_evolution import schemas_equivalent
+            new_location = (plan_recreation.get("assessment") or {}).get("new_location")
+            storage_matches = capabilities.get("table_type") == plan_recreation.get("storage_type")
+            location_matches = (plan_recreation.get("storage_type") != "EXTERNAL" or
+                                str(capabilities.get("storage_location") or "").rstrip("/") == str(new_location or "").rstrip("/"))
+            try:
+                from dexter.adapters.databricks_schema_evolution import quote_qualified
+                from dexter.adapters.databricks_sql import execute_statement
+                count_result = execute_statement(_workspace, str(previous.get("warehouse_id") or ""),
+                    f"SELECT COUNT(*) FROM {quote_qualified(identity)}", phase="schema-recreate-reconcile")
+                row_count = int(((count_result.get("result") or {}).get("data_array") or [[None]])[0][0])
+            except Exception:
+                row_count = None
+            if schemas_equivalent(expected, actual_schema) and storage_matches and location_matches and row_count == 0:
+                new_identity = {**old_identity, "table_id": str(capabilities["table_id"])}
+                from dexter.domain.schema_evolution import SchemaDraft
+                new_draft = SchemaDraft.from_schema(new_identity, actual_schema).to_dict()
+                import hashlib as _hashlib
+                import json as _json
+                new_key = _hashlib.sha256(_json.dumps(new_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                repository.save_draft(new_key, new_identity, new_draft)
+                repository.clear_draft(old_key)
+                repository.acknowledge_reconciliation(identity)
+                observation = {"state": "recreated_verified", "message": "The replacement DEV table is present, empty, and matches the approved schema."}
+                _record_recreation_reconciliation(previous, {**observation, "table_id": new_identity["table_id"], "row_count": 0})
+                _invalidate_schema_metadata(identity, table_listing=True)
+                return {**observation, "identity": new_identity, "schema": actual_schema, "draft": new_draft,
+                        "reconciliation_required": False, "draft_key": new_key, "target_state": "present"}
+            observation = {"state": "table_present_unexpected", "message": "A table is present, but its schema, storage, identity, location, or row count does not prove the reviewed empty recreation. No table action was repeated."}
+            _record_recreation_reconciliation(previous, {**observation, "observed_table_id": capabilities.get("table_id"), "row_count": row_count})
+            return {**observation, "identity": identity, "schema": actual_schema, "draft": raw,
+                    "reconciliation_required": True, "draft_key": old_key}
         target, _capabilities = _schema_capabilities(_workspace, identity)
         schema = _schema_table_schema(target, identity)
         lock_key = "|".join((identity["workspace"].casefold(), identity["profile"].casefold(), identity["table_id"].casefold()))
@@ -524,10 +617,17 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         return {"identity": identity, "schema": schema, "draft": draft, "drift": False,
                 "reconciliation_required": False, "metadata_cache": detail.get("metadata_cache"), "draft_key": key}
 
+    def _record_recreation_reconciliation(plan: dict, observation: dict) -> None:
+        for item in operations.list(200):
+            if item.get("kind") == "schema-evolution" and (item.get("details") or {}).get("plan_id") == plan.get("plan_id"):
+                operations.update_details(item["id"], reconciliation_observation=observation,
+                    reconciliation_required=observation["state"] in {"target_absent", "table_present_unexpected", "unknown"})
+                break
+
     @app.post("/api/schema-evolution/review")
     def review_schema_evolution(body: SchemaReviewRequest):
         from dexter.adapters.databricks_schema_evolution import sql_for_operation, quote_qualified, feature_sql, inspect_execution_support
-        from dexter.domain.schema_evolution import SchemaDraft, schemas_equivalent, plan_schema_change, reviewed_state
+        from dexter.domain.schema_evolution import SchemaDraft, SchemaStateError, schemas_equivalent, plan_schema_change, reviewed_state
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, current_schema, _detail, workspace, key = _schema_evolution_context(body.node_id)
         repository = SchemaEvolutionRepository(paths.database)
@@ -542,15 +642,72 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         _target, capabilities = _schema_capabilities(workspace, identity)
         current_schema = _schema_table_schema(_target, identity)
         execution_evidence = None
+        capability_check = {"state": "not_required", "message": None}
+        warehouse = None
         if body.warehouse_id:
-            if not any(getattr(item, "id", None) == body.warehouse_id for item in workspace.warehouses.list()):
-                raise HTTPException(403, detail="Select a SQL warehouse accessible to the configured DEV profile")
             try:
-                execution_evidence = inspect_execution_support(workspace, body.warehouse_id, identity)
+                warehouse = next((item for item in workspace.warehouses.list()
+                                  if str(getattr(item, "id", "")) == body.warehouse_id), None)
             except Exception as exc:
-                raise _remote_failure(exc) from None
-        plan = plan_schema_change(identity, draft, capabilities, tuple(sorted(set(body.enable_features))), execution_evidence)
+                from dexter.adapters.databricks_diagnostics import classify_failure
+                diagnosis = classify_failure(exc)
+                capability_check = {"state": diagnosis["code"], "message": diagnosis["message"]}
+            if warehouse is None and capability_check["state"] == "not_required":
+                raise HTTPException(403, detail="Select a SQL warehouse accessible to the configured DEV profile")
+        selected_features = () if body.execution_strategy == "recreate" else tuple(sorted(set(body.enable_features)))
+        plan = plan_schema_change(identity, draft, capabilities, selected_features, None,
+                                  execution_strategy=body.execution_strategy)
+        structural = any(item["kind"] in {"drop", "rename", "type"} for item in plan["operations"])
+        if body.execution_strategy == "apply" and structural:
+            if not body.warehouse_id:
+                capability_check = {"state": "warehouse_required", "message": "Select a DEV SQL warehouse. Delta capabilities are checked automatically during Review."}
+            elif warehouse is not None:
+                try:
+                    execution_evidence = inspect_execution_support(workspace, body.warehouse_id, identity)
+                    capability_check = {"state": "verified", "message": "DEV compute, permissions, and Delta protocol were verified."}
+                except Exception as exc:
+                    from dexter.adapters.databricks_diagnostics import classify_failure
+                    diagnosis = classify_failure(exc)
+                    capability_check = {"state": diagnosis["code"], "message": diagnosis["message"]}
+                    execution_evidence = {"verified": False}
+            plan = plan_schema_change(identity, draft, capabilities, selected_features, execution_evidence,
+                                      execution_strategy="apply")
+            if capability_check["state"] != "verified":
+                plan["blockers"].append(capability_check["message"] or "Select a DEV SQL warehouse to verify this structural change.")
+            else:
+                try:
+                    from dexter.domain.schema_evolution import validate_execution_evidence
+                    validate_execution_evidence(plan, execution_evidence, capabilities, activating=True)
+                except SchemaStateError as exc:
+                    plan["blockers"].append(str(exc))
         plan["warehouse_id"] = body.warehouse_id
+        plan["capability_check"] = capability_check
+        plan["execution_strategy"] = body.execution_strategy
+        plan["external_location_name"] = body.external_location_name
+        if body.execution_strategy == "recreate":
+            from dexter.domain.schema_evolution import validate_recreation_schema
+            reasons = validate_recreation_schema(plan["proposed_dev_schema"])
+            if not warehouse:
+                reasons.append("Select a DEV SQL warehouse to review and execute table recreation.")
+            recreation = {"status": "blocked", "storage_type": capabilities.get("table_type"),
+                          "assessment": None, "external_location": None, "external_locations": [],
+                          "block_reasons": []}
+            if capabilities.get("iceberg_compatible"):
+                reasons.append("This Delta table has Iceberg compatibility enabled; recreation cannot preserve that reader contract safely.")
+            if warehouse:
+                plan["core_plan_id"] = plan["plan_id"]
+                plan["plan_id"], recreation = _schema_recreation_review(workspace, identity, plan,
+                    body.warehouse_id, body.external_location_name, recreation, reasons)
+            else:
+                reasons.extend(recreation.get("block_reasons", []))
+                recreation["block_reasons"] = sorted(set(reasons))
+            plan["recreation"] = recreation
+            plan["blockers"].extend(recreation.get("block_reasons", []))
+            plan["recreate_summary"] = {"action": "Recreate DEV table", "target": plan["target"],
+                "storage_type": recreation.get("storage_type"), "final_schema": plan["proposed_dev_schema"],
+                "records_discarded": "all existing records", "new_table_empty": True,
+                "external_old_files_preserved": recreation.get("storage_type") == "EXTERNAL",
+                "identity_and_history_preserved": False}
         # Advisory reference only: never part of DEV concurrency or capability fingerprints.
         plan["reference_prod_schema"] = body.reference_prod_schema
         if capabilities.get("blocker"):
@@ -559,14 +716,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if plan["drift"]:
             plan["blockers"].append("The DEV schema changed while this draft was open. Reload the schema, then review your changes again.")
         plan["sql_statements"] = [feature_sql(quote_qualified(identity), feature) for feature in plan["enabled_features"]]
-        if capabilities["delta"] and capabilities["table_type"] in {"MANAGED", "EXTERNAL"}:
+        if body.execution_strategy == "apply" and capabilities["delta"] and capabilities["table_type"] in {"MANAGED", "EXTERNAL"}:
             for operation in plan["operations"]:
                 try:
                     plan["sql_statements"].append(sql_for_operation(quote_qualified(identity), operation))
                 except ValueError as exc:
                     plan["blockers"].append(str(exc))
         plan["blockers"] = sorted(set(plan["blockers"]))
-        plan["can_apply"] = bool(plan["operations"]) and not plan["blockers"]
+        plan["can_apply"] = (bool(plan["operations"]) and not plan["blockers"] if body.execution_strategy == "apply"
+                              else plan.get("recreation", {}).get("status") == "ready_for_confirmation" and not plan["blockers"])
         plan["identity"] = identity
         try:
             plan["state_snapshot"] = reviewed_state(plan, current_schema, capabilities, draft)
@@ -574,6 +732,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             plan["state_snapshot"] = getattr(exc, "evidence", {})
             if plan["drift"]:
                 plan["blockers"] = sorted(set([*plan["blockers"], str(exc)]))
+        plan["blockers"] = sorted(set(plan["blockers"]))
+        plan["can_apply"] = (bool(plan["operations"]) and not plan["blockers"] if body.execution_strategy == "apply"
+                              else plan.get("recreation", {}).get("status") == "ready_for_confirmation" and not plan["blockers"] and not plan["drift"])
         repository.save_plan(plan, state="reviewed")
         return plan
 
@@ -606,12 +767,32 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(422, detail="Confirm exactly the Delta feature choices in the reviewed plan")
         if saved_plan.get("enabled_features") and saved_plan.get("warehouse_id") != body.warehouse_id:
             raise HTTPException(409, detail="Verify and review Delta features using the selected DEV warehouse before applying")
-        fresh = plan_schema_change(identity, draft, capabilities, tuple(saved_plan.get("enabled_features", [])), saved_plan.get("execution_evidence"))
-        if fresh["plan_id"] != body.plan_id:
+        strategy = saved_plan.get("execution_strategy", "apply")
+        if body.execution_strategy != strategy:
+            raise HTTPException(409, detail="The selected execution strategy does not match the reviewed plan. Review the current strategy again.")
+        if strategy == "recreate" and not body.confirm_recreate:
+            raise HTTPException(422, detail="Confirm that the existing DEV table will be dropped and recreated empty")
+        if strategy == "recreate" and saved_plan.get("warehouse_id") != body.warehouse_id:
+            raise HTTPException(409, detail="Review table recreation again with the selected DEV warehouse")
+        fresh = plan_schema_change(identity, draft, capabilities, tuple(saved_plan.get("enabled_features", [])),
+            saved_plan.get("execution_evidence"), execution_strategy=strategy)
+        if strategy == "recreate":
+            if fresh["plan_id"] != saved_plan.get("core_plan_id"):
+                raise HTTPException(409, detail={"code": "DRAFT_CHANGED", "message": "The reviewed schema draft changed. Review the recreation plan again."})
+            import hashlib as _hashlib
+            import json as _json
+            expected_plan_id = _hashlib.sha256(_json.dumps({
+                "reviewed_plan_id": fresh["plan_id"], "execution_strategy": "recreate",
+                "warehouse_id": saved_plan.get("warehouse_id"),
+                "external_location_name": saved_plan.get("external_location_name"),
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        else:
+            expected_plan_id = fresh["plan_id"]
+        if expected_plan_id != body.plan_id:
             raise HTTPException(409, detail={"code": "DRAFT_CHANGED", "message": "The reviewed edit plan changed. Review the current draft again."})
         if saved_plan.get("blockers") or saved_plan.get("drift") or not saved_plan.get("can_apply"):
             raise HTTPException(409, detail="Resolve the blocked schema changes and review them again before applying")
-        if fresh.get("confirmation_required") and not body.confirm_drop:
+        if strategy == "apply" and fresh.get("confirmation_required") and not body.confirm_drop:
             raise HTTPException(422, detail="Confirm the listed column deletion before applying")
         if not capabilities.get("delta") or capabilities.get("table_type") not in {"MANAGED", "EXTERNAL"}:
             raise HTTPException(403, detail="Schema Evolution is restricted to managed or external Delta tables")
@@ -632,8 +813,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         repository.save_plan(saved_plan, operation["id"], "queued")
         operations.update_details(operation["id"], phase="queued", environment="dev", qualified_name=saved_plan["target"],
                                   node_id=identity["node_id"], plan_id=body.plan_id,
-                                  planned_operations=len(saved_plan["operations"]), completed_operations=0,
-                                  applied_operations=[], confirmation_drop=body.confirm_drop)
+                                  planned_operations=2 if strategy == "recreate" else len(saved_plan["operations"]), completed_operations=0,
+                                  applied_operations=[], confirmation_drop=body.confirm_drop,
+                                  confirmation_recreate=body.confirm_recreate, execution_strategy=strategy,
+                                  destructive_started=False, retry_available=True, reconciliation_required=False)
         operations.update_details(operation["id"], state_snapshot=evidence, ddl_started=False)
         try:
             future = schema_evolution_workers.submit(_schema_evolution_worker, operation["id"], identity, saved_plan, body.warehouse_id, key)
@@ -769,6 +952,37 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if force and detail and (detail.get("metadata_cache") or {}).get("state") == "stale":
             raise HTTPException(503, detail={"code": "METADATA_UNAVAILABLE", "message": "The physical DEV schema refresh failed. Cached metadata cannot authorize schema changes; retry without resetting your draft."})
         if not detail or detail.get("access") != "read" or detail.get("kind") != "table":
+            from dexter.services.schema_evolution import SchemaEvolutionRepository
+            repository = SchemaEvolutionRepository(paths.database)
+            pending = repository.pending_reconciliation_for_node(physical_id)
+            previous_identity = (pending or {}).get("identity") or {}
+            if pending and pending.get("execution_strategy") == "recreate" and previous_identity.get("table_id"):
+                config = settings_repo.get("databricks.dev")
+                if not config or not config.get("profile") or previous_identity.get("profile") != config.get("profile"):
+                    raise HTTPException(403, detail="The saved recreation belongs to a different DEV profile")
+                try:
+                    from databricks.sdk import WorkspaceClient
+                    workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
+                    principal = workspace.current_user.me()
+                    principal_id = str(getattr(principal, "id", None) or getattr(principal, "user_name", None) or "unknown")
+                    host = safe_workspace_host(config["profile"])
+                    if (principal_id != previous_identity.get("principal") or host != previous_identity.get("workspace")
+                            or previous_identity.get("node_id") != physical_id):
+                        raise HTTPException(403, detail="The saved recreation belongs to a different DEV identity")
+                    workspace.tables.get(full_name=".".join(parts[2:]))
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    from dexter.adapters.databricks_diagnostics import classify_failure
+                    diagnosis = classify_failure(exc)
+                    if diagnosis["code"] != "destination_not_found":
+                        raise _remote_failure(exc) from None
+                    previous_key = __import__("hashlib").sha256(__import__("json").dumps(
+                        previous_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                    if not repository.get_draft(previous_key):
+                        raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "The DEV table is absent after recreation and its saved draft could not be recovered."})
+                    return previous_identity, pending.get("physical_dev_baseline") or {}, {
+                        "target_absent": True, "metadata_cache": {"state": "refreshed"}}, workspace, previous_key
             raise HTTPException(409, detail={"code": "metadata_unavailable", "message": "Metadata unavailable. The physical DEV table schema could not be verified."})
         config = settings_repo.get("databricks.dev")
         if not config or not config.get("profile"):
@@ -816,6 +1030,91 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             capabilities["blocker"] = "This Unity Catalog object is not a supported managed or external table."
         return target, capabilities
 
+    def _schema_recreation_review(workspace, identity, plan, warehouse_id, external_location_name,
+                                  recreation, reasons):
+        """Read-only recreation assessment shared with F4.2's destructive safety checks."""
+        import hashlib as _hashlib
+        import json as _json
+        from dexter.adapters.databricks_schema_evolution import create_empty_delta_table_sql, quote_qualified
+        from dexter.adapters.databricks_synthetic_publisher import (
+            _privileges, assess_drop_recreate, external_uri_is_safe, inspect_drop_recreate_history,
+            preflight_permissions, verify_external_path_empty,
+        )
+        storage_type = str((plan.get("required_capabilities") or {}).get("table_type") or "").upper()
+        recreation["storage_type"] = storage_type
+        external_locations: list[dict[str, Any]] = []
+        selected_external = None
+        if storage_type == "EXTERNAL":
+            try:
+                principal = workspace.current_user.me()
+                principal_name = str(getattr(principal, "user_name", None) or getattr(principal, "display_name", None) or "")
+                for location in workspace.external_locations.list():
+                    name = str(getattr(location, "name", "") or "")
+                    url = str(getattr(location, "url", "") or "")
+                    read_only = bool(getattr(location, "read_only", False))
+                    authorized = None
+                    if principal_name and name:
+                        try:
+                            grants = workspace.grants.get_effective(securable_type="EXTERNAL_LOCATION", full_name=name, principal=principal_name)
+                            authorized = {"CREATE_EXTERNAL_TABLE", "EXTERNAL_USE_LOCATION"}.issubset(_privileges(grants))
+                        except Exception:
+                            authorized = None
+                    external_locations.append({"name": name, "url": url if external_uri_is_safe(url) else "<redacted>",
+                        "read_only": read_only, "authorized": authorized})
+            except Exception as exc:
+                from dexter.adapters.databricks_diagnostics import classify_failure
+                diagnosis = classify_failure(exc)
+                reasons.append("External Location access could not be verified: " + diagnosis["message"])
+            if not external_location_name:
+                reasons.append("Select a writable, authorized DEV External Location for the new empty table path.")
+            else:
+                selected_external = next((item for item in external_locations if item["name"] == external_location_name), None)
+                if not selected_external or selected_external["authorized"] is not True or selected_external["read_only"] or selected_external["url"] == "<redacted>":
+                    reasons.append("The selected External Location is unavailable, read-only, or lacks verified creation privileges.")
+        elif external_location_name:
+            reasons.append("An External Location can only be selected when recreating an External table.")
+        plan["plan_id"] = _hashlib.sha256(_json.dumps({
+            "reviewed_plan_id": plan["plan_id"], "execution_strategy": "recreate",
+            "warehouse_id": warehouse_id, "external_location_name": external_location_name,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        recreation["external_locations"] = external_locations
+        recreation["external_location"] = selected_external
+        if reasons:
+            recreation.update(status="blocked", block_reasons=sorted(set(reasons)))
+            return plan["plan_id"], recreation
+        try:
+            destination = {**identity, "environment": "dev"}
+            assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
+                proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
+                external_location=selected_external, plan_id=plan["plan_id"],
+                new_location_prefix="dexter-schema-recreated")
+            if assessment.get("status") != "ready_for_confirmation":
+                reasons.extend(assessment.get("block_reasons") or ["The current DEV table is not eligible for safe recreation."])
+            if not reasons:
+                preflight_permissions(workspace, identity["catalog"], identity["schema"], storage_type.casefold(),
+                    "drop_recreate", True, str((selected_external or {}).get("name") or "") or None)
+                history = inspect_drop_recreate_history(workspace, warehouse_id,
+                    {**destination, "storage_type": storage_type.casefold()})
+                if storage_type == "EXTERNAL":
+                    verify_external_path_empty(workspace, warehouse_id, str(assessment.get("new_location") or ""))
+                retention = {key: str(value) for key, value in (assessment.get("target", {}).get("properties") or {}).items()
+                    if key in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"}}
+                create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
+                    storage_type=storage_type, external_location=assessment.get("new_location"), properties=retention)
+                assessment["ddl"] = {"drop": f"DROP TABLE {quote_qualified(identity)}", "create": create_sql}
+                assessment["history_evidence"] = history
+                recreation.update(status="ready_for_confirmation", assessment=assessment,
+                    external_location=selected_external, external_locations=external_locations,
+                    block_reasons=[], storage_type=storage_type)
+        except Exception as exc:
+            from dexter.adapters.databricks_diagnostics import classify_failure
+            diagnosis = classify_failure(exc)
+            reasons.append(diagnosis["message"])
+        if reasons:
+            recreation.update(status="blocked", block_reasons=sorted(set(reasons)),
+                external_location=selected_external, external_locations=external_locations)
+        return plan["plan_id"], recreation
+
     def _schema_table_schema(target, identity):
         """Schema and capabilities share one fresh Unity Catalog observation."""
         from dexter.adapters.databricks_schema_evolution import field
@@ -829,8 +1128,12 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                 constraints=field(target, "table_constraints") or field(target, "constraints"),
                                 technology_properties={"table_id": identity["table_id"]})
 
-    def _invalidate_schema_metadata(identity):
-        discover.cache.invalidate_node("detail:" + ".".join(identity[key] for key in ("catalog", "schema", "table")))
+    def _invalidate_schema_metadata(identity, *, table_listing: bool = False):
+        from dexter.catalog.cache import context_key
+        context = context_key("databricks", "dev", identity["profile"], identity["workspace"])
+        discover.cache.invalidate(context, "detail:" + ".".join(identity[key] for key in ("catalog", "schema", "table")))
+        if table_listing:
+            discover.cache.invalidate(context, f"{identity['catalog']}/{identity['schema']}")
 
     def _schema_evolution_worker(operation_id: str, identity: dict, plan: dict, warehouse_id: str, key: str) -> None:
         from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file, safe_workspace_host
@@ -857,6 +1160,78 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             operations.update_details(operation_id, phase="preflight", state_snapshot=evidence)
             logger.info("Schema Apply preflight snapshot=%s", evidence)
             ensure_sql_warehouse_running(workspace, warehouse_id)
+            if plan.get("execution_strategy") == "recreate":
+                from dexter.adapters.databricks_schema_evolution import execute_empty_recreation
+                # Warehouse startup may take time. Recheck the reviewed physical
+                # identity and draft immediately before destructive preflight.
+                current_target, current_caps = inspect_table(workspace, identity)
+                current_raw = SchemaEvolutionRepository(paths.database).get_draft(key)
+                if not current_raw:
+                    raise SchemaStateError("DRAFT_UNAVAILABLE", "The saved DEV draft is unavailable. Reopen the table before recreating it.")
+                evidence = reviewed_state(plan, _schema_table_schema(current_target, identity), current_caps,
+                                          SchemaDraft.from_dict(current_raw))
+                operations.update_details(operation_id, state_snapshot=evidence, phase="destructive_preflight")
+                if (operations.get(operation_id) or {}).get("cancel_requested"):
+                    raise RuntimeError("Stopped before table recreation began; the existing DEV table was kept.")
+
+                def recreation_checkpoint(state: str, details: dict) -> None:
+                    phase = str(details.get("phase") or state.casefold())
+                    destructive = state in {"DROP_SUBMITTING", "DROPPED", "CREATED"}
+                    operations.update_details(operation_id, phase=phase, destructive_started=destructive,
+                        retry_available=False if destructive else True,
+                        reconciliation_required=state != "CREATED",
+                        current_operation={"kind": state.casefold(), "target": plan["target"]},
+                        recreation_checkpoint=state, recreation_evidence=details,
+                        planned_operations=2, completed_operations=1 if state in {"DROPPED", "CREATED"} else 0,
+                        applied_operations=([{"kind": "drop_table", "state": "succeeded"}] if state in {"DROPPED", "CREATED"} else []))
+                    # Durable partial state prevents a second destructive run
+                    # even if this process exits after sending the DROP.
+                    SchemaEvolutionRepository(paths.database).save_plan(plan, operation_id, "partial")
+
+                def recreation_progress(message: str, details: dict) -> None:
+                    phase = str(details.get("phase") or "recreation")
+                    if message:
+                        operations.transition(operation_id, "running", progress=35 if phase == "drop" else 70 if phase == "create" else 92,
+                                              message=message)
+                    operations.update_details(operation_id, phase=phase, progress_detail=details)
+
+                operations.update_details(operation_id, phase="destructive_preflight", qualified_name=plan["target"],
+                    planned_operations=2, completed_operations=0, applied_operations=[], destructive_started=False,
+                    retry_available=True, reconciliation_required=False, ddl_started=False)
+                recreated = execute_empty_recreation(workspace, warehouse_id, identity, plan,
+                    checkpoint=recreation_checkpoint, progress=recreation_progress)
+                new_identity = {**identity, "table_id": recreated["table_id"]}
+                from dexter.domain.schema_evolution import SchemaDraft as _SchemaDraft
+                from dexter.domain.schema_evolution import fingerprint as _fingerprint, schemas_equivalent as _schemas_equivalent
+                final_schema = recreated["schema"]
+                verified = (recreated.get("row_count") == 0 and _schemas_equivalent(plan["proposed_dev_schema"], final_schema)
+                            and recreated.get("storage_type") == plan.get("recreation", {}).get("storage_type"))
+                if not verified:
+                    raise RuntimeError("The recreated DEV table did not pass final schema, storage, and empty-table validation")
+                import hashlib as _hashlib
+                import json as _json
+                new_key = _hashlib.sha256(_json.dumps(new_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                repository = SchemaEvolutionRepository(paths.database)
+                repository.save_draft(new_key, new_identity, _SchemaDraft.from_schema(new_identity, final_schema).to_dict())
+                repository.clear_draft(key)
+                repository.save_plan(plan, operation_id, "succeeded")
+                _invalidate_schema_metadata(identity, table_listing=True)
+                _invalidate_schema_metadata(new_identity, table_listing=True)
+                validation = {"state": "matching", "actual_fingerprint": _fingerprint(final_schema),
+                              "proposed_fingerprint": plan["proposed_fingerprint"], "row_count": 0,
+                              "new_table_id": new_identity["table_id"]}
+                operations.update_details(operation_id, phase="validate", completed_operations=2,
+                    applied_operations=[{"kind": "drop_table", "state": "succeeded"},
+                                        {"kind": "create_empty_table", "state": "succeeded"}],
+                    current_operation=None, final_schema=final_schema, new_identity=new_identity,
+                    new_location=recreated.get("location") if plan["recreation"].get("storage_type") == "EXTERNAL" else None,
+                    row_count=0, validation=validation, validated=True, partial_completion=False,
+                    reconciliation_required=False, retry_available=False, destructive_started=True,
+                    drop_response_lost=recreated.get("drop_response_lost", False),
+                    create_response_lost=recreated.get("create_response_lost", False))
+                operations.transition(operation_id, "succeeded", progress=100,
+                    message="DEV table recreated empty and verified against the approved schema")
+                return
             structural = any(item["kind"] in {"drop", "rename", "type"} for item in plan["operations"])
             support = inspect_execution_support(workspace, warehouse_id, identity) if structural else None
             if structural:
@@ -962,17 +1337,33 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 applied = (current.get("details") or {}).get("applied_operations", [])
                 applied_features = (current.get("details") or {}).get("applied_features", [])
                 uncertain = (current.get("details") or {}).get("current_operation")
-                changed = bool(applied or applied_features or uncertain)
+                destructive_started = bool((current.get("details") or {}).get("destructive_started"))
+                changed = bool(applied or applied_features or uncertain or destructive_started)
                 reconciled_schema = None
                 reconciled_capabilities = None
+                reconciliation_observation = None
                 if changed:
-                    _invalidate_schema_metadata(identity)
+                    _invalidate_schema_metadata(identity,
+                        table_listing=plan.get("execution_strategy") == "recreate" and destructive_started)
                     try:
-                        current_target, _current_caps = inspect_table(workspace, identity)
-                        reconciled_schema = _schema_table_schema(current_target, identity)
-                        reconciled_capabilities = {key: _current_caps.get(key) for key in plan["required_capabilities"]}
+                        from dexter.adapters.databricks_synthetic_publisher import _read_table
+                        from dexter.domain.schema import canonical_schema
+                        full_name = ".".join(identity[name] for name in ("catalog", "schema", "table"))
+                        current_target, exists = _read_table(workspace, full_name)
+                        if exists:
+                            current_table_id = str(getattr(current_target, "table_id", "") or "")
+                            reconciled_schema = canonical_schema(list(getattr(current_target, "columns", None) or []), full_name,
+                                constraints=getattr(current_target, "table_constraints", None) or getattr(current_target, "constraints", None),
+                                technology_properties={"table_id": current_table_id},
+                                complete=bool(getattr(current_target, "columns", None)))
+                            from dexter.adapters.databricks_schema_evolution import inspect_table
+                            _observed_table, reconciled_capabilities = inspect_table(workspace, identity)
+                            reconciliation_observation = {"state": "table_present", "table_id": current_table_id,
+                                "row_count": None, "schema_fingerprint": __import__("dexter.domain.schema_evolution", fromlist=["fingerprint"]).fingerprint(reconciled_schema)}
+                        else:
+                            reconciliation_observation = {"state": "target_absent"}
                     except Exception:
-                        pass
+                        reconciliation_observation = {"state": "unknown"}
                 from dexter.adapters.databricks_diagnostics import classify_failure
                 diagnosis = classify_failure(exc)
                 if isinstance(exc, HTTPException):
@@ -981,6 +1372,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 operations.update_details(operation_id, phase="reconcile" if changed else "preflight", partial_completion=changed, applied_operations=applied,
                                           failure_type=type(exc).__name__, reconciled_schema=reconciled_schema,
                                           reconciled_capabilities=reconciled_capabilities, reconciliation_required=changed,
+                                          retry_available=not destructive_started,
+                                          **({"reconciliation_observation": reconciliation_observation} if reconciliation_observation else {}),
                                           **({"state_snapshot": exc.evidence} if isinstance(exc, SchemaStateError) else {}))
                 friendly = str(exc) if isinstance(exc, (RuntimeError, PermissionError)) else diagnosis["message"]
                 cancelled = bool((current or {}).get("cancel_requested"))
@@ -1881,6 +2274,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     @app.post("/api/operations/{operation_id}/cancel")
     def cancel_operation(operation_id: str):
         try:
+            current = operations.get(operation_id)
+            if current and current.get("kind") == "schema-evolution" and (current.get("details") or {}).get("destructive_started"):
+                raise ValueError("Cancellation is disabled after table recreation begins; let the operation finish or reconcile its remote state")
             operation = operations.request_cancel(operation_id)
             if operation.get("kind") == "synthetic-data" and operation.get("details", {}).get("worker_unit"):
                 # The worker polls the durable cancellation flag between chunks and SQL

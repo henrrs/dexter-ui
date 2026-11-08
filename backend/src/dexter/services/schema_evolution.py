@@ -41,11 +41,42 @@ class SchemaEvolutionRepository:
 
     def pending_reconciliation(self, identity: dict[str, str]) -> dict[str, Any] | None:
         with transaction(self.db_path) as conn:
-            row = conn.execute("SELECT plan_json FROM schema_evolution_plans WHERE identity_json=? AND state='partial' ORDER BY updated_at DESC LIMIT 1",
-                               (json.dumps(identity, sort_keys=True),)).fetchone()
-            return json.loads(row[0]) if row else None
+            rows = conn.execute("SELECT plan_json FROM schema_evolution_plans WHERE state='partial' ORDER BY updated_at DESC").fetchall()
+            for row in rows:
+                plan = json.loads(row[0])
+                if self._same_physical_name(plan.get("identity") or {}, identity):
+                    return plan
+            return None
+
+    def pending_reconciliation_for_node(self, node_id: str) -> dict[str, Any] | None:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT plan_json FROM schema_evolution_plans WHERE state='partial' ORDER BY updated_at DESC").fetchall()
+            for row in rows:
+                plan = json.loads(row[0])
+                if (plan.get("identity") or {}).get("node_id") == node_id:
+                    return plan
+            return None
+
+    def draft_for_node(self, node_id: str) -> tuple[dict[str, Any], dict[str, str]] | None:
+        with transaction(self.db_path) as conn:
+            rows = conn.execute("SELECT identity_json,draft_json FROM schema_evolution_drafts ORDER BY updated_at DESC").fetchall()
+            for row in rows:
+                identity = json.loads(row[0])
+                if identity.get("node_id") == node_id:
+                    return json.loads(row[1]), identity
+            return None
 
     def acknowledge_reconciliation(self, identity: dict[str, str]) -> None:
         with transaction(self.db_path) as conn:
-            conn.execute("UPDATE schema_evolution_plans SET state='reconciled',updated_at=? WHERE identity_json=? AND state='partial'",
-                         (_now(), json.dumps(identity, sort_keys=True)))
+            rows = conn.execute("SELECT plan_id,identity_json FROM schema_evolution_plans WHERE state='partial'").fetchall()
+            now = _now()
+            for row in rows:
+                previous = json.loads(row[1])
+                if self._same_physical_name(previous, identity):
+                    conn.execute("UPDATE schema_evolution_plans SET state='reconciled',updated_at=? WHERE plan_id=?",
+                                 (now, row[0]))
+
+    @staticmethod
+    def _same_physical_name(left: dict[str, str], right: dict[str, str]) -> bool:
+        keys = ("node_id", "environment", "profile", "workspace", "principal", "catalog", "schema", "table")
+        return all(left.get(key) == right.get(key) for key in keys)

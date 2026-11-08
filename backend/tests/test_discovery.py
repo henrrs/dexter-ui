@@ -41,6 +41,14 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(cache.get("user-a", "catalogs")["stale"])
         self.assertEqual(cache.get("user-b", "catalogs")["items"][0]["name"], "prod")
 
+    def test_targeted_invalidation_preserves_other_provider_contexts(self):
+        cache = DiscoveryCache(self.paths.database)
+        cache.put("dev-profile", "analytics/gold", [{"name": "old_table"}], 600)
+        cache.put("prod-profile", "analytics/gold", [{"name": "prod_table"}], 600)
+        cache.invalidate("dev-profile", "analytics/gold")
+        self.assertIsNone(cache.get("dev-profile", "analytics/gold"))
+        self.assertEqual(cache.get("prod-profile", "analytics/gold")["items"], [{"name": "prod_table"}])
+
     def test_persistent_discovery_cache_survives_service_reconstruction(self):
         DiscoveryCache(self.paths.database).put("dev-profile", "catalogs", [{"name": "analytics_dev"}], 86400)
         restored = DiscoveryCache(self.paths.database).get("dev-profile", "catalogs")

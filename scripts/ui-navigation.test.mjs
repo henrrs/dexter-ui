@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 
-const appPort = 4178
-const driverPort = 4448
+const appPort = Number(process.env.DEXTER_TEST_NAV_PORT || 4178)
+const driverPort = Number(process.env.DEXTER_TEST_DRIVER_PORT || 4448)
 const appUrl = `http://127.0.0.1:${appPort}`
 const driverUrl = `http://127.0.0.1:${driverPort}`
 

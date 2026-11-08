@@ -30,6 +30,7 @@ def qualified_name(catalog: str, schema: str, table: str) -> str:
 
 
 def schema_ddl(schema: dict[str, Any]) -> str:
+    from dexter.domain.schema_evolution import validate_type
     fields = schema.get("fields") if isinstance(schema, dict) else None
     if not isinstance(fields, list) or not fields:
         raise SyntheticPublishError("The approved schema has no fields", "SCHEMA_INVALID")
@@ -42,11 +43,17 @@ def schema_ddl(schema: dict[str, Any]) -> str:
         if not name or name.casefold() in seen:
             raise SyntheticPublishError("The approved schema contains duplicate or empty column names", "SCHEMA_INVALID")
         seen.add(name.casefold())
-        data_type = str(field.get("original_type") or field.get("canonical_type") or "").strip()
-        if not re.fullmatch(r"(?i)(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|FLOAT|REAL|DOUBLE|BOOLEAN|DATE|TIMESTAMP(?:_NTZ)?|STRING|VARCHAR|CHAR|DECIMAL|NUMERIC)(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?", data_type):
+        try:
+            data_type = validate_type(str(field.get("original_type") or field.get("canonical_type") or ""))
+        except ValueError:
             raise SyntheticPublishError(f"Column {name} uses an unsupported Databricks type", "SCHEMA_TYPE_UNSUPPORTED")
+        properties = field.get("technology_properties") or {}
+        if field.get("constraints") or any(properties.get(key) for key in ("default_value", "generated_expression", "identity_field", "mask")):
+            raise SyntheticPublishError(f"Column {name} has special properties that this table creator cannot preserve", "SCHEMA_METADATA_UNSUPPORTED")
         nullable = field.get("nullable")
-        rendered.append(f"{quote_ident(name)} {data_type.upper()}" + (" NOT NULL" if nullable is False else ""))
+        comment = properties.get("comment")
+        rendered.append(f"{quote_ident(name)} {data_type}" + (" NOT NULL" if nullable is False else "")
+                        + (f" COMMENT {_sql_string(str(comment))}" if comment else ""))
     return ", ".join(rendered)
 
 
@@ -56,17 +63,21 @@ def read_files_sql(schema: dict[str, Any], volume_path: str) -> str:
     return f"read_files({path}, format => 'parquet', schema => {_sql_string(ddl)})"
 
 
-def create_table_sql(catalog: str, schema_name: str, table: str, schema: dict[str, Any], run_id: str,
+def create_table_sql(catalog: str, schema_name: str, table: str, schema: dict[str, Any], run_id: str | None,
                      *, storage_type: str = "managed", external_location: str | None = None,
-                     operation_id: str | None = None, properties: dict[str, str] | None = None) -> str:
+                     operation_id: str | None = None, properties: dict[str, str] | None = None,
+                     synthetic_provenance: bool = True) -> str:
     if storage_type not in {"managed", "external"}:
         raise SyntheticPublishError("Choose Managed or External storage", "STORAGE_TYPE_INVALID")
     if storage_type == "external" and (not external_location or external_location.startswith("/Volumes/")):
         raise SyntheticPublishError("External tables need an authorized external location outside Dexter staging Volumes", "EXTERNAL_LOCATION_INVALID")
     location = f" LOCATION {_sql_string(external_location)}" if external_location else ""
     table_properties = dict(properties or {})
-    table_properties.update({"dexter.synthetic.created_by": "dexter", "dexter.synthetic.run_id": run_id})
-    if operation_id:
+    if synthetic_provenance:
+        if not run_id:
+            raise SyntheticPublishError("The synthetic run marker is required", "RUN_ID_MISSING")
+        table_properties.update({"dexter.synthetic.created_by": "dexter", "dexter.synthetic.run_id": run_id})
+    if operation_id and synthetic_provenance:
         table_properties["dexter.synthetic.operation_id"] = operation_id
     rendered_properties = ", ".join(f"{_sql_string(key)} = {_sql_string(str(value))}"
                                      for key, value in sorted(table_properties.items()))
@@ -93,7 +104,8 @@ def external_uri_is_safe(value: str) -> bool:
 def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict[str, Any],
                          proposed_schema: dict[str, Any], storage_type: str,
                          external_location: dict[str, Any] | None, plan_id: str,
-                         progress: Callable[[str, dict], None] | None = None) -> dict[str, Any]:
+                         progress: Callable[[str, dict], None] | None = None,
+                         new_location_prefix: str = "dexter-synthetic-recreated") -> dict[str, Any]:
     """Read-only preflight. It reports only lineage and grants visible to the selected identity."""
     if destination.get("environment") != "dev":
         raise SyntheticPublishError("Drop & Recreate is restricted to the configured DEV profile", "PROD_WRITE_BLOCKED")
@@ -163,7 +175,8 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
     external_url_safe = external_uri_is_safe(external_url)
     external_root = external_url.rstrip("/") if external_url_safe else ""
     table_key = hashlib.sha256(f"{full_name}\0{table_id}".encode()).hexdigest()[:20]
-    new_location = (f"{external_root}/dexter-synthetic-recreated/{table_key}/{plan_id}/{table}"
+    prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", new_location_prefix).strip("-") or "dexter-recreated"
+    new_location = (f"{external_root}/{prefix}/{table_key}/{plan_id}/{table}"
                     if original_storage == "external" and external_root else None)
     raw_properties = {str(key): str(value) for key, value in dict(properties).items()}
     property_map = {}

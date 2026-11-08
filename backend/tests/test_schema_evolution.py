@@ -1,9 +1,10 @@
 import unittest
 
-from dexter.adapters.databricks_schema_evolution import count_null_values, inspect_table, quote_identifier, quote_qualified, sql_for_operation
+from dexter.adapters.databricks_schema_evolution import count_null_values, create_empty_delta_table_sql, inspect_table, quote_identifier, quote_qualified, sql_for_operation
 from dexter.domain.schema import canonical_schema
-from dexter.domain.schema_evolution import SchemaDraft, fingerprint, plan_schema_change, sanitize_draft, validate_type
-from unittest.mock import patch
+from dexter.domain.schema_evolution import SchemaDraft, classify_type_change, fingerprint, plan_schema_change, sanitize_draft, validate_type
+from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 
 class SchemaEvolutionDomainTests(unittest.TestCase):
@@ -54,6 +55,45 @@ class SchemaEvolutionDomainTests(unittest.TestCase):
         blocked = plan_schema_change(self.identity, draft, {"delta": True, "table_type": "MANAGED", "type_widening": False})
         self.assertEqual([item["kind"] for item in enabled["operations"]], ["type"])
         self.assertTrue(blocked["blockers"])
+
+    def test_type_change_classification_normalizes_aliases_and_distinguishes_rewrites(self):
+        self.assertEqual(classify_type_change("INT", "INTEGER"), "SAME_TYPE")
+        self.assertEqual(classify_type_change("INT", "BIGINT", type_widening=True), "DIRECT_DDL")
+        self.assertEqual(classify_type_change("INT", "BIGINT", type_widening=False), "FEATURE_REQUIRED")
+        self.assertEqual(classify_type_change("STRING", "BIGINT"), "REWRITE_REQUIRED")
+        self.assertEqual(classify_type_change("DECIMAL(10,2)", "DECIMAL(12,2)", type_widening=True), "DIRECT_DDL")
+        self.assertEqual(classify_type_change("DECIMAL(10,2)", "DECIMAL(10,3)", type_widening=True), "REWRITE_REQUIRED")
+        self.assertEqual(classify_type_change("ARRAY<INT>", "ARRAY<BIGINT>"), "REWRITE_REQUIRED")
+
+    def test_recreate_plan_keeps_incompatible_type_as_requested_diff_not_direct_ddl(self):
+        draft = SchemaDraft.from_schema(self.identity, self.schema)
+        amount = next(item for item in draft.columns if item.field["name"] == "amount")
+        draft = draft.update(amount.column_id, data_type="STRING")
+        capabilities = {"delta": True, "table_type": "MANAGED", "table_id": "table-1", "type_widening": False}
+        direct = plan_schema_change(self.identity, draft, capabilities)
+        recreate = plan_schema_change(self.identity, draft, capabilities, execution_strategy="recreate")
+        self.assertEqual(direct["blocked_change_count"], 1)
+        self.assertEqual(direct["requested_changes"][0]["classification"], "REWRITE_REQUIRED")
+        self.assertEqual(direct["operations"], [])
+        self.assertEqual(recreate["operations"][0]["kind"], "recreate")
+        self.assertEqual(recreate["compatibility"], "Destructive recreation")
+        self.assertEqual(recreate["requested_change_count"], 1)
+        self.assertEqual(recreate["requested_changes"][0]["classification"], "REWRITE_REQUIRED")
+
+    def test_empty_recreation_sql_uses_defined_schema_without_synthetic_upload_markers(self):
+        identity = {"catalog": "tech_dev", "schema": "gold", "table": "ledger"}
+        schema = canonical_schema([
+            {"name": "id", "type_text": "BIGINT", "nullable": False, "comment": "primary key"},
+            {"name": "amount", "type_text": "DECIMAL(12,4)", "nullable": True},
+            {"name": "items", "type_text": "ARRAY<STRUCT<sku:STRING>>", "nullable": True},
+        ], "tech_dev.gold.ledger")
+        ddl = create_empty_delta_table_sql(identity, schema, storage_type="MANAGED", external_location=None)
+        self.assertEqual(ddl, "CREATE TABLE `tech_dev`.`gold`.`ledger` (`amount` DECIMAL(12,4), `id` BIGINT NOT NULL COMMENT 'primary key', `items` ARRAY<STRUCT<sku:STRING>>) USING DELTA")
+        self.assertNotIn("dexter.synthetic", ddl)
+        external = create_empty_delta_table_sql(identity, schema, storage_type="EXTERNAL", external_location="abfss://container@account.dfs.core.windows.net/new/path")
+        self.assertIn("LOCATION 'abfss://container@account.dfs.core.windows.net/new/path'", external)
+        with self.assertRaises(ValueError):
+            create_empty_delta_table_sql(identity, schema, storage_type="EXTERNAL", external_location="/Volumes/catalog/schema/volume/path")
 
     def test_draft_transport_cannot_forge_identity_constraints_or_sql_type(self):
         saved = SchemaDraft.from_schema(self.identity, self.schema).to_dict()

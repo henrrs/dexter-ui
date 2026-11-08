@@ -43,6 +43,11 @@ class DiscoveryCache:
         with transaction(self.database) as db:
             db.execute("DELETE FROM discovery_cache WHERE node_key=?", (node,))
 
+    def invalidate(self, context: str, node: str) -> None:
+        """Remove one cached node for one provider identity."""
+        with transaction(self.database) as db:
+            db.execute("DELETE FROM discovery_cache WHERE cache_key=?", (context_key(context, node),))
+
     def put(self, context: str, node: str, items: list[dict], ttl: int, error: str | None = None) -> dict:
         now = time.time()
         key = context_key(context, node)

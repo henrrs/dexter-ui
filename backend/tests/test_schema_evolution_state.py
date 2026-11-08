@@ -14,6 +14,8 @@ from dexter.domain.schema import canonical_schema
 from dexter.domain.schema_evolution import (
     SchemaDraft, SchemaStateError, fingerprint, plan_schema_change, reviewed_state, schemas_equivalent,
 )
+from dexter.services.operations import OperationsService
+from dexter.services.schema_evolution import SchemaEvolutionRepository
 
 
 class SchemaStateDomainTests(unittest.TestCase):
@@ -296,7 +298,7 @@ class SchemaStateApiTests(unittest.TestCase):
     def test_unknown_required_capability_does_not_claim_a_confirmed_change(self):
         draft = SchemaDraft.from_dict(self.context["draft"]).remove(self.context["draft"]["columns"][0]["column_id"])
         self.client.put("/api/schema-evolution/draft", json={"node_id": self.context["identity"]["node_id"], "identity": self.context["identity"], "draft": draft.to_dict()})
-        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id}).json()
+        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id, "warehouse_id": "wh"}).json()
         self.assertTrue(self.plan["can_apply"], self.plan)
         self.properties = None
         response = self.apply()
@@ -340,11 +342,39 @@ class SchemaStateApiTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "METADATA_UNAVAILABLE")
         self.assertEqual(self.ddl_calls, [])
 
+    def test_recreation_reconciliation_accepts_only_verified_new_empty_identity(self):
+        import hashlib
+        from dexter.domain.schema import canonical_schema
+        identity = self.context["identity"]
+        old_key = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        desired = canonical_schema([{"name": "new_id", "type_text": "INT", "nullable": False}], "tech_dev.gold.ledger")
+        repository = SchemaEvolutionRepository(self.paths.database)
+        old_draft = SchemaDraft.from_dict(self.context["draft"]).to_dict()
+        repository.save_draft(old_key, identity, old_draft)
+        plan = {"plan_id": "recreate-plan", "identity": identity, "execution_strategy": "recreate",
+            "warehouse_id": "wh", "physical_dev_baseline": self.context["schema"],
+            "proposed_dev_schema": desired, "recreation": {"storage_type": "MANAGED", "assessment": {}}}
+        operation_id = OperationsService(self.paths.database).create("schema-evolution")["id"]
+        repository.save_plan(plan, operation_id, "partial")
+        replacement = self.target()
+        replacement.columns = [{"name": "new_id", "type_text": "INT", "nullable": False}]
+        replacement.table_id = "table-2"
+        self.workspace.tables.get.side_effect = lambda **_: replacement
+        with patch("dexter.adapters.databricks_sql.execute_statement", return_value={"result": {"data_array": [[0]]}}):
+            response = self.client.post("/api/schema-evolution/reconcile", json={"node_id": self.node_id})
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["state"], "recreated_verified", result)
+        self.assertEqual(result["identity"]["table_id"], "table-2")
+        self.assertEqual(result["draft"]["baseline"]["fields"][0]["name"], "new_id")
+        self.assertFalse(result["reconciliation_required"])
+        self.assertIsNone(repository.get_draft(old_key))
+
     def test_g_uncertain_drop_is_observed_before_retry_and_never_repeated_blindly(self):
         draft = SchemaDraft.from_dict(self.context["draft"])
         draft = draft.remove(draft.columns[0].column_id).remove(draft.columns[1].column_id)
         self.client.put("/api/schema-evolution/draft", json={"node_id": self.context["identity"]["node_id"], "identity": self.context["identity"], "draft": draft.to_dict()})
-        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id}).json()
+        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id, "warehouse_id": "wh"}).json()
         self.snapshots.append({"case": self._testMethodName, "review": self.plan["state_snapshot"]})
         self.fail_after_ddl = 1
         failed = self.terminal(self.apply())
@@ -353,7 +383,7 @@ class SchemaStateApiTests(unittest.TestCase):
         self.assertEqual([field["name"] for field in failed["details"]["reconciled_schema"]["fields"]], ["B", "C"])
         self.assertEqual(self.apply().json()["error"]["code"], "RECONCILIATION_REQUIRED")
         self.assertEqual(self.client.post("/api/schema-evolution/reconcile", json={"node_id": self.node_id}).status_code, 200)
-        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id}).json()
+        self.plan = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id, "warehouse_id": "wh"}).json()
         self.assertEqual([(op["kind"], op["column"]) for op in self.plan["operations"]], [("drop", "B")])
         self.fail_after_ddl = 0
         self.assertEqual(self.terminal(self.apply())["state"], "succeeded")

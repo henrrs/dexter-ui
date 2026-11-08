@@ -216,17 +216,66 @@ def validate_type(value: str) -> str:
 
 
 def _supported_widening(old: str, new: str) -> bool:
-    a, b = old.strip().upper(), new.strip().upper()
-    simple = {"TINYINT": 0, "BYTE": 0, "SMALLINT": 1, "SHORT": 1, "INT": 2, "INTEGER": 2, "BIGINT": 3, "LONG": 3}
-    if a in simple and b in simple: return simple[a] < simple[b]
-    if a == "FLOAT" and b == "DOUBLE": return True
-    if a == "DATE" and b == "TIMESTAMP_NTZ": return True
-    old_decimal = re.fullmatch(r"(?:DECIMAL|NUMERIC)\((\d+),(\d+)\)", a)
-    new_decimal = re.fullmatch(r"(?:DECIMAL|NUMERIC)\((\d+),(\d+)\)", b)
-    if old_decimal and new_decimal:
-        op, os = map(int, old_decimal.groups()); np, ns = map(int, new_decimal.groups())
+    def normalized(value: str) -> tuple[str, int | None, int | None]:
+        parsed = canonical_field({"name": "_", "type_text": value})
+        return parsed.canonical_type, parsed.precision, parsed.scale
+    old_type, old_precision, old_scale = normalized(old)
+    new_type, new_precision, new_scale = normalized(new)
+    simple = {"tinyint": 0, "smallint": 1, "integer": 2, "bigint": 3}
+    if old_type in simple and new_type in simple: return simple[old_type] < simple[new_type]
+    if old_type == "float" and new_type == "double": return True
+    if old_type == "date" and new_type == "timestamp_ntz": return True
+    if old_type == new_type == "decimal" and None not in (old_precision, old_scale, new_precision, new_scale):
+        op, os, np, ns = old_precision, old_scale, new_precision, new_scale
         return ns >= os and np - ns >= op - os and (np, ns) != (op, os)
     return False
+
+
+def classify_type_change(old: str, new: str, *, type_widening: bool = False,
+                         iceberg_compatible: bool = False) -> str:
+    """Classify Delta ALTER support; a castable type pair is not assumed to be an ALTER."""
+    before = canonical_field({"name": "_", "type_text": old})
+    after = canonical_field({"name": "_", "type_text": new})
+    if (before.canonical_type, before.precision, before.scale, before.children) == (
+            after.canonical_type, after.precision, after.scale, after.children):
+        return "SAME_TYPE"
+    if not _supported_widening(old, new):
+        return "REWRITE_REQUIRED"
+    if iceberg_compatible and (before.scale != after.scale or before.canonical_type == "date"):
+        return "UNSUPPORTED"
+    return "DIRECT_DDL" if type_widening else "FEATURE_REQUIRED"
+
+
+def validate_recreation_schema(schema: dict[str, Any]) -> list[str]:
+    """Validate the defined empty-table schema without inventing data-migration semantics."""
+    reasons: list[str] = []
+    fields = schema.get("fields") if isinstance(schema, dict) else None
+    if not schema.get("complete") or not isinstance(fields, list) or not fields:
+        reasons.append("The recreation schema must be complete and contain at least one column.")
+        return reasons
+    names: set[str] = set()
+    for item in fields:
+        if not isinstance(item, dict):
+            reasons.append("The recreation schema contains an invalid column.")
+            continue
+        name = str(item.get("name") or "")
+        if not name or name.casefold() in names:
+            reasons.append("The recreation schema must have unique, non-empty column names.")
+        names.add(name.casefold())
+        try:
+            data_type = validate_type(str(item.get("original_type") or item.get("canonical_type") or ""))
+        except ValueError:
+            reasons.append(f"{name or 'A column'} has an unsupported Databricks type.")
+            continue
+        if _required_feature(data_type):
+            reasons.append(f"{name} uses {data_type}, which requires a Delta feature not activated by table recreation.")
+        properties = item.get("technology_properties") or {}
+        if item.get("constraints") or any(properties.get(key) for key in
+                ("default_value", "generated_expression", "identity_field", "mask")):
+            reasons.append(f"{name} has constraints or special column properties that this recreation cannot preserve.")
+    if schema.get("constraints"):
+        reasons.append("Table-level constraints cannot be recreated by this workflow.")
+    return sorted(set(reasons))
 
 
 def _required_feature(data_type: str) -> tuple[str, str] | None:
@@ -384,8 +433,11 @@ def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDr
 
 
 def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilities: dict[str, Any],
-                       enabled_features: tuple[str, ...] = (), execution_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+                       enabled_features: tuple[str, ...] = (), execution_evidence: dict[str, Any] | None = None,
+                       execution_strategy: str = "apply") -> dict[str, Any]:
     """Create a stable plan; unsupported operations are explicitly blocked."""
+    if execution_strategy not in {"apply", "recreate"}:
+        raise ValueError("The schema execution strategy is not supported")
     proposed = draft.proposed_schema()
     diff = compare_schemas(draft.baseline, proposed)
     before = {item["name"].casefold(): item for item in draft.baseline.get("fields", [])}
@@ -393,15 +445,21 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     blockers: list[str] = []
     needed: set[str] = set()
     unsupported: list[dict[str, str]] = []
+    type_classifications: list[dict[str, str]] = []
+    requested_changes: list[dict[str, Any]] = []
     for column in draft.columns:
         old = before.get((column.original_name or "").casefold())
         new = None if column.removed else column.field
         if old and new is None:
+            requested_changes.append({"kind": "remove", "column": old["name"], "classification": "DIRECT_DDL"})
+            if execution_strategy == "recreate":
+                continue
             properties = old.get("technology_properties") or {}
             restricted = [key for key in ("identity_field", "generated_expression", "mask") if properties.get(key)]
             if old.get("constraints"): restricted.append("constraints")
             if old["name"].casefold() in {str(item).casefold() for item in capabilities.get("partition_columns", [])}: restricted.append("partition key")
             if restricted:
+                requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"{old['name']} has {'/'.join(restricted)} metadata that Dexter cannot safely remove.")
             else:
                 if not capabilities.get("column_mapping"): needed.add("column_mapping")
@@ -415,40 +473,71 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                 restricted.append("partition key")
             type_changed = any(field_semantics(old)[key] != field_semantics(new)[key] for key in ("type", "precision", "scale", "children"))
             structural_change = old["name"] != new["name"] or type_changed or old.get("nullable") != new.get("nullable")
-            if restricted and structural_change:
+            field_modified = field_semantics(old) != field_semantics(new)
+            if field_modified:
+                requested_changes.append({"kind": "modify", "column": old["name"],
+                    **({"from": old["name"], "to": new["name"]} if old["name"] != new["name"] else {}),
+                    "classification": "DIRECT_DDL"})
+            if restricted and structural_change and execution_strategy == "apply":
+                if field_modified:
+                    requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"{old['name']} has {'/'.join(restricted)} metadata that Dexter cannot safely change.")
                 continue
             if old["name"] != new["name"]:
+                if execution_strategy == "recreate":
+                    continue
                 if new["name"].casefold() in before:
+                    if field_modified: requested_changes[-1]["classification"] = "UNSUPPORTED"
                     blockers.append(f"The rename target {new['name']} already exists in the DEV table; make this name available in a separate reviewed change first.")
                 else:
                     if not capabilities.get("column_mapping"): needed.add("column_mapping")
                     ops.append({"kind": "rename", "old": old, "new": new, "compatibility": "Breaking"})
             if type_changed:
+                classification = classify_type_change(str(old.get("original_type", "")), str(new.get("original_type", "")),
+                    type_widening=bool(capabilities.get("type_widening")), iceberg_compatible=bool(capabilities.get("iceberg_compatible")))
+                type_classifications.append({"column": old["name"], "from": str(old.get("original_type", "")),
+                    "to": str(new.get("original_type", "")), "classification": classification})
+                if classification != "SAME_TYPE":
+                    requested_changes[-1]["classification"] = classification
+                if execution_strategy == "recreate":
+                    if classification == "UNSUPPORTED":
+                        blockers.append(f"Changing {old['name']} is incompatible with this table's Iceberg reader requirements.")
+                    continue
                 feature = _required_feature(str(new.get("original_type", "")))
                 if feature and not capabilities.get(feature[0]):
                     blockers.append(f"Changing {old['name']} to {new.get('original_type')} is blocked. {feature[1]}")
-                elif _supported_widening(str(old.get("original_type", "")), str(new.get("original_type", ""))):
-                    if not capabilities.get("type_widening"): needed.add("type_widening")
-                    if capabilities.get("iceberg_compatible") and (new.get("scale") != old.get("scale") or str(old.get("original_type", "")).upper() == "DATE"):
-                        blockers.append(f"Changing {old['name']} is incompatible with the table's Iceberg reader requirements.")
-                    ops.append({"kind": "type", "old": old, "new": new, "compatibility": "Requires Validation"})
+                    type_classifications[-1]["classification"] = "UNSUPPORTED"
+                elif classification in {"DIRECT_DDL", "FEATURE_REQUIRED"}:
+                    if classification == "FEATURE_REQUIRED": needed.add("type_widening")
+                    ops.append({"kind": "type", "old": old, "new": new, "compatibility": "Requires Validation",
+                                "classification": classification})
+                elif classification == "UNSUPPORTED":
+                    blockers.append(f"Changing {old['name']} is incompatible with the table's Iceberg reader requirements.")
+                    unsupported.append({"column": old["name"], "classification": "UNSUPPORTED", "from": old["original_type"], "to": new["original_type"]})
                 else:
-                    blockers.append(f"Changing {old['name']} to {new.get('original_type')} requires a data rewrite or unsupported conversion; this executor never rewrites records.")
+                    blockers.append(f"Changing {old['name']} from {old.get('original_type')} to {new.get('original_type')} requires a data rewrite; direct Apply never rewrites records.")
                     unsupported.append({"column": old["name"], "classification": "REWRITE_REQUIRED", "from": old["original_type"], "to": new["original_type"]})
             if old.get("nullable") != new.get("nullable") and new.get("nullable") is not None:
-                ops.append({"kind": "nullability", "old": old, "new": new, "compatibility": "Requires Validation" if not new["nullable"] else "Compatible"})
+                if execution_strategy == "apply":
+                    ops.append({"kind": "nullability", "old": old, "new": new, "compatibility": "Requires Validation" if not new["nullable"] else "Compatible"})
             old_comment = (old.get("technology_properties") or {}).get("comment")
             new_comment = (new.get("technology_properties") or {}).get("comment")
-            if old_comment != new_comment: ops.append({"kind": "comment", "old": old, "new": new, "compatibility": "Compatible"})
+            if old_comment != new_comment and execution_strategy == "apply": ops.append({"kind": "comment", "old": old, "new": new, "compatibility": "Compatible"})
         elif new:
+            requested_changes.append({"kind": "add", "column": new["name"], "classification": "DIRECT_DDL"})
+            if execution_strategy == "recreate":
+                continue
             if new["name"].casefold() in before:
+                requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"The new column name {new['name']} already exists in the DEV baseline; drop it in a separate reviewed change before reusing that name.")
             elif new.get("nullable") is False:
+                requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"Adding {new['name']} as NOT NULL is blocked because a safe backfill strategy is not implemented.")
             elif (feature := _required_feature(str(new.get("original_type", "")))) and not capabilities.get(feature[0]):
+                requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"Adding {new['name']} is blocked. {feature[1]}")
             elif new.get("constraints") or any((new.get("technology_properties") or {}).get(key) for key in ("identity_field", "generated_expression", "mask", "default_value")):
+                requested_changes[-1]["classification"] = "UNSUPPORTED"
                 blockers.append(f"Adding {new['name']} with constraints, generated values, defaults, or masks requires an explicit supported migration plan.")
             else: ops.append({"kind": "add", "old": None, "new": new, "compatibility": "Compatible"})
     # Stable order respects rename-before-changes; destructive drops are last.
@@ -461,10 +550,30 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
         field = op.get("new") or op.get("old")
         canonical_ops.append({"kind": op["kind"], "column": field["name"], "from": (op.get("old") or {}).get("name"),
                              "to": (op.get("new") or {}).get("name"), "field": op.get("new") or op.get("old"),
-                             "compatibility": op["compatibility"]})
+                             "compatibility": op["compatibility"],
+                             "classification": op.get("classification", "DIRECT_DDL")})
+    for change in requested_changes:
+        if change["classification"] == "DIRECT_DDL":
+            if ((change["kind"] == "remove" or change["kind"] == "modify" and
+                 any(item["kind"] == "rename" for item in ops if item["old"]["name"].casefold() == change["column"].casefold()))
+                    and "column_mapping" in needed):
+                change["classification"] = "FEATURE_REQUIRED"
+            elif change["kind"] == "modify" and "type_widening" in needed and any(
+                    item["kind"] == "type" and item["old"]["name"].casefold() == change["column"].casefold() for item in ops):
+                change["classification"] = "FEATURE_REQUIRED"
+    recreation_reasons = validate_recreation_schema(proposed) if execution_strategy == "recreate" else []
+    if recreation_reasons:
+        blockers.extend(recreation_reasons)
+    if execution_strategy == "recreate":
+        canonical_ops = [{"kind": "recreate", "column": identity["table"], "from": identity["table"],
+                          "to": identity["table"], "field": {"name": identity["table"]}, "compatibility": "Destructive"}]
+    compatibility = ("Destructive recreation" if execution_strategy == "recreate" else
+        "Rewrite required" if unsupported else "Blocked" if blockers else
+        "Breaking" if any(o["compatibility"] == "Breaking" for o in ops) else
+        "Requires Validation" if any(o["compatibility"] == "Requires Validation" for o in ops) else "Compatible")
     body = {"identity": identity, "baseline_fingerprint": draft.baseline_fingerprint, "proposed_fingerprint": fingerprint(proposed),
-            "operations": canonical_ops, "blockers": sorted(set(blockers)), "compatibility": "Breaking" if any(o["compatibility"] == "Breaking" for o in ops) else "Requires Validation" if any(o["compatibility"] == "Requires Validation" for o in ops) else "Compatible",
-            "confirmation_required": any(o["kind"] == "drop" for o in ops), "diff": diff, "target": target,
+            "operations": canonical_ops, "blockers": sorted(set(blockers)), "compatibility": compatibility,
+            "confirmation_required": execution_strategy == "recreate" or any(o["kind"] == "drop" for o in ops), "diff": diff, "target": target,
             "capabilities": required_capabilities(canonical_ops, capabilities)}
     if draft.baseline.get("constraints") and any(operation["kind"] in {"drop", "rename", "type", "nullability"} for operation in ops):
         blockers.append("The table has constraints that may depend on the proposed column change; resolve them explicitly before continuing.")
@@ -510,12 +619,17 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
         body["blockers"].append("The requested feature choice is no longer needed. Review the current table again.")
     body.update(feature_requirements=features, enabled_features=sorted(enabled_features), execution_evidence=evidence,
                 existing_features=sorted(key for key in ("column_mapping", "type_widening") if capabilities.get(key)),
-                unsupported_changes=unsupported,
-                classification="REWRITE_REQUIRED" if unsupported else "UNSUPPORTED" if body["blockers"] and not needed else "FEATURE_REQUIRED" if needed else "DIRECT_DDL")
+                unsupported_changes=unsupported, type_classifications=type_classifications,
+                requested_changes=requested_changes,
+                requested_change_count=len(requested_changes), directly_executable_count=sum(item["classification"] in {"DIRECT_DDL", "FEATURE_REQUIRED"} for item in requested_changes) if execution_strategy == "apply" else 0,
+                blocked_change_count=sum(item["classification"] in {"REWRITE_REQUIRED", "UNSUPPORTED"} for item in requested_changes),
+                execution_strategy=execution_strategy,
+                classification=("RECREATE" if execution_strategy == "recreate" else "REWRITE_REQUIRED" if unsupported else "UNSUPPORTED" if body["blockers"] and not needed else "FEATURE_REQUIRED" if needed else "DIRECT_DDL" if ops else "SAME_TYPE"))
     body["blockers"] = sorted(set(body["blockers"]))
-    body["plan_id"] = _digest({"version": 2, "identity": identity, "baseline": fingerprint(draft.baseline),
+    body["plan_id"] = _digest({"version": 3, "identity": identity, "baseline": fingerprint(draft.baseline),
         "proposed": fingerprint(proposed), "capabilities": body["required_capabilities"], "blockers": body["blockers"],
-        "enabled_features": body["enabled_features"], "protocol": {key: evidence.get(key) for key in ("min_reader_version", "min_writer_version", "table_features")},
+        "enabled_features": body["enabled_features"], "execution_strategy": execution_strategy,
+        "protocol": {key: evidence.get(key) for key in ("min_reader_version", "min_writer_version", "table_features")},
         "operations": [{**{key: op[key] for key in ("kind", "column", "from", "to")}, "field": field_semantics(op["field"])} for op in canonical_ops]})
     return deepcopy(body)
 

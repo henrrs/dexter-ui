@@ -15,10 +15,11 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [] }
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1' }
+  const currentIdentity = () => ({ ...identity, table_id: state.currentTableId })
   const freshDraft = () => {
     const baseline = state.schemaPhysical ?? devSchema
-    return { identity, baseline, baseline_fingerprint: 'baseline', columns: baseline.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field, removed: false, origin: 'dev' })), version: 1 }
+    return { identity: currentIdentity(), baseline, baseline_fingerprint: 'baseline', columns: baseline.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field, removed: false, origin: 'dev' })), version: 1 }
   }
   state.draft = freshDraft()
   const operation = (kind) => ({ id: `operation-${kind}`, kind, state: 'running', progress: 10, message: 'Executing simulated DEV operation', details: { node_id: identity.node_id, phase: 'generation_upload', source: { qualified_name: prodSchema.qualified_name }, synthetic_run_id: 'fixture-run' }, error_message: null })
@@ -52,6 +53,7 @@ export function workflowFixture() {
       if (++state.polls > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000 }
       if (next.kind === 'schema-evolution' && next.state === 'succeeded') {
         state.schemaPhysical = { ...devSchema, fields: clone(state.draft.columns.filter(item => !item.removed).map(item => item.field)) }
+        if (state.currentOperation.details?.execution_strategy === 'recreate') { state.currentTableId = 'table-2'; next.details.destructive_started = true }
         state.draft = freshDraft()
         next.details.validated = true; next.details.ddl_started = true
       }
@@ -75,12 +77,12 @@ export function workflowFixture() {
     }
     if (path.startsWith('/api/discover/')) {
       const env = url.searchParams.get('environment') ?? 'dev', selected = env === 'prod' ? prodSchema : devSchema
-      return send({ ...table, environment: env, qualified_name: selected.qualified_name, columns: selected.fields.map((field) => ({ name: field.name, type_text: field.original_type, nullable: field.nullable })), technology_properties: { table_type: env === 'prod' ? 'EXTERNAL' : 'MANAGED', data_source_format: 'DELTA', table_id: 'table-1' } })
+      return send({ ...table, environment: env, qualified_name: selected.qualified_name, columns: selected.fields.map((field) => ({ name: field.name, type_text: field.original_type, nullable: field.nullable })), technology_properties: { table_type: env === 'prod' ? 'EXTERNAL' : 'MANAGED', data_source_format: 'DELTA', table_id: state.currentTableId } })
     }
     if (path === '/api/schema-evolution/context' || path === '/api/schema-evolution/reset') {
       if (fail()) return
       if (path.endsWith('/reset')) state.draft = freshDraft()
-      return send({ identity, schema: state.schemaPhysical ?? devSchema, draft: state.draft, draft_key: 'fixture-key', drift: false })
+      return send({ identity: currentIdentity(), schema: state.schemaPhysical ?? devSchema, draft: state.draft, draft_key: 'fixture-key', drift: false, target_state: 'present', reconciliation_required: false })
     }
     if (path === '/api/schema-evolution/draft') {
       if (body.node_id !== identity.node_id) return send({ error: { message: 'Draft save requires physical DEV node_id' } }, 403)
@@ -91,13 +93,32 @@ export function workflowFixture() {
     if (path === '/api/schema-evolution/review') {
       if (fail()) return
       await new Promise((resolve) => setTimeout(resolve, state.schemaReviewDelay))
-      const operations = state.draft.columns.flatMap(column => column.removed && column.original_name ? [{ kind: 'drop', column: column.original_name, field: column.field, compatibility: 'Breaking' }]
-        : column.original_name === null && !column.removed ? [{ kind: 'add', column: column.field.name, field: column.field, compatibility: 'Compatible' }] : [])
+      const operations = state.draft.columns.flatMap(column => {
+        if (column.removed && column.original_name) return [{ kind: 'drop', column: column.original_name, field: column.field, compatibility: 'Breaking' }]
+        if (column.original_name === null && !column.removed) return [{ kind: 'add', column: column.field.name, field: column.field, compatibility: 'Compatible' }]
+        const old = state.draft.baseline.fields.find(field => field.name === column.original_name)
+        if (old && old.name !== column.field.name) return [{ kind: 'rename', column: old.name, from: old.name, to: column.field.name, field: column.field, compatibility: 'Breaking' }]
+        if (old && old.original_type !== column.field.original_type) return [{ kind: 'type', column: old.name, from: old.original_type, to: column.field.original_type, field: column.field, compatibility: 'Requires Validation' }]
+        return []
+      })
+      const strategy = body.execution_strategy ?? 'apply'
+      const requestedChanges = operations.map((item) => ({ kind: item.kind === 'drop' ? 'remove' : item.kind === 'add' ? 'add' : 'modify', column: item.column,
+        ...(item.from && item.to ? { from: item.from, to: item.to } : {}),
+        classification: item.kind === 'type' && item.from === 'STRING' && item.to === 'BIGINT' ? 'REWRITE_REQUIRED' : 'DIRECT_DDL' }))
       const features = state.schemaRequireFeatures.map(feature => ({ feature, label: feature === 'column_mapping' ? 'Delta Column Mapping' : 'Delta Type Widening', can_enable: !!body.warehouse_id, reason: body.warehouse_id ? null : 'Select a DEV warehouse and verify capabilities.', selected: (body.enable_features ?? []).includes(feature), impact: 'Changes Delta compatibility requirements. Older readers and streaming consumers may be affected. No physical cleanup or data rewrite.' }))
-      const blockers = features.filter(feature => !feature.selected).map(feature => 'Explicit feature selection required: ' + feature.label)
-      return send({ plan_id: 'a'.repeat(64), identity, target: devSchema.qualified_name, baseline_fingerprint: 'baseline', proposed_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, operations, blockers, feature_requirements: features, enabled_features: body.enable_features ?? [], warehouse_id: body.warehouse_id, execution_evidence: { verified: !!body.warehouse_id }, risks: [], can_apply: operations.length > 0 && !blockers.length, drift: false, compatibility: 'Compatible', confirmation_required: operations.some(item => item.kind === 'drop'), sql_statements: operations.map((item) => `ALTER TABLE tech_dev.gold.ledger ADD COLUMNS (${item.column} STRING)`) })
+      const blockers = strategy === 'recreate' ? (state.schemaRecreationBlocked ? ['The target cannot be safely recreated in this fixture.'] : []) : [
+        ...features.filter(feature => !feature.selected).map(feature => 'Explicit feature selection required: ' + feature.label),
+        ...(requestedChanges.some(change => change.classification === 'REWRITE_REQUIRED') ? ['Changing this type requires recreating the table empty.'] : []),
+      ]
+      const directOperations = operations.filter((item) => !requestedChanges.some(change => change.column === item.column && change.classification === 'REWRITE_REQUIRED'))
+      const recreation = strategy === 'recreate' ? { status: blockers.length ? 'blocked' : 'ready_for_confirmation', storage_type: 'MANAGED', external_locations: [], block_reasons: blockers, assessment: { risks: ['Delta history and the old table identity are not preserved.'] } } : undefined
+      const requestedCount = requestedChanges.length
+      const blockedCount = requestedChanges.filter((item) => ['REWRITE_REQUIRED', 'UNSUPPORTED'].includes(item.classification)).length
+      const typeClassifications = operations.filter((item) => item.kind === 'type').map((item) => ({ column: item.column, from: item.from, to: item.to,
+        classification: item.from === 'STRING' && item.to === 'BIGINT' ? 'REWRITE_REQUIRED' : 'DIRECT_DDL' }))
+      return send({ plan_id: strategy === 'recreate' ? 'c'.repeat(64) : 'a'.repeat(64), core_plan_id: 'a'.repeat(64), identity: currentIdentity(), target: 'tech_dev.gold.ledger', baseline_fingerprint: 'baseline', proposed_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, operations: strategy === 'recreate' ? [{ kind: 'recreate', column: 'ledger', field: { name: 'ledger' }, compatibility: 'Destructive' }] : directOperations, requested_changes: requestedChanges, requested_change_count: requestedCount, directly_executable_count: requestedCount - blockedCount, blocked_change_count: blockedCount, type_classifications: typeClassifications, blockers, feature_requirements: features, enabled_features: body.enable_features ?? [], warehouse_id: body.warehouse_id, execution_evidence: { verified: !!body.warehouse_id }, risks: [], can_apply: strategy === 'recreate' ? blockers.length === 0 : directOperations.length > 0 && !blockers.length, drift: false, compatibility: strategy === 'recreate' ? 'Destructive recreation' : blockedCount ? 'Rewrite required' : 'Compatible', confirmation_required: strategy === 'recreate' || directOperations.some(item => item.kind === 'drop'), sql_statements: directOperations.map((item) => `ALTER TABLE tech_dev.gold.ledger ADD COLUMNS (${item.column} STRING)`), execution_strategy: strategy, recreation, recreate_summary: strategy === 'recreate' ? { action: 'Recreate DEV table', target: 'tech_dev.gold.ledger', storage_type: 'MANAGED', final_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, records_discarded: 'all existing records', new_table_empty: true, external_old_files_preserved: false, identity_and_history_preserved: false } : undefined })
     }
-    if (path === '/api/schema-evolution/apply') { if (state.schemaRequireFeatures.some(feature => !(body.enable_features ?? []).includes(feature))) return send({ error: { message: 'Explicit feature confirmation missing' } }, 422); state.currentOperation = operation('schema-evolution'); state.polls = 0; return send(state.currentOperation, 202) }
+    if (path === '/api/schema-evolution/apply') { if (body.execution_strategy === 'recreate' && !body.confirm_recreate) return send({ error: { message: 'Recreation confirmation missing' } }, 422); if (state.schemaRequireFeatures.some(feature => !(body.enable_features ?? []).includes(feature))) return send({ error: { message: 'Explicit feature confirmation missing' } }, 422); state.currentOperation = operation('schema-evolution'); state.currentOperation.details.execution_strategy = body.execution_strategy ?? 'apply'; state.currentOperation.details.planned_operations = body.execution_strategy === 'recreate' ? 2 : 1; state.polls = 0; return send(state.currentOperation, 202) }
     if (path === '/api/schema-evolution/validate') return send({ state: 'validated', schema: state.schemaPhysical ?? devSchema, assessment: { message: 'Simulated schema validated' } })
     if (path === '/api/synthetic/generators') return send({ items: [
       { id: 'sequence', types: ['BIGINT', 'INT'], provider: 'duckdb', unique: true }, { id: 'random_string', types: ['STRING'], provider: 'duckdb', unique: false },

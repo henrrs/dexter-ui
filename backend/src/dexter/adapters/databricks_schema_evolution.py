@@ -1,11 +1,13 @@
 """Databricks Delta schema DDL adapter; SQL is generated only from validated plans."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 import json
 import re
 
 from dexter.adapters.databricks_sql import execute_statement
+from dexter.domain.schema import canonical_schema
+from dexter.domain.schema_evolution import schemas_equivalent, validate_recreation_schema, validate_type
 
 
 def field(value: Any, name: str, default=None):
@@ -164,6 +166,154 @@ def sql_for_operation(target_sql: str, operation: dict[str, Any]) -> str:
 
 def _string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def create_empty_delta_table_sql(identity: dict[str, str], schema: dict[str, Any], *,
+                                 storage_type: str, external_location: str | None,
+                                 properties: dict[str, str] | None = None) -> str:
+    """Build a schema-only table DDL; it never reads or loads source records."""
+    if storage_type not in {"MANAGED", "EXTERNAL"}:
+        raise ValueError("Only Managed or External Delta tables can be recreated")
+    errors = validate_recreation_schema(schema)
+    if errors:
+        raise ValueError(" ".join(errors))
+    if storage_type == "EXTERNAL" and (not external_location or external_location.startswith("/Volumes/")):
+        raise ValueError("External recreation requires a new authorized path outside Databricks Volumes")
+    rendered = []
+    for item in schema["fields"]:
+        data_type = validate_type(str(item.get("original_type") or item.get("canonical_type") or ""))
+        definition = f"{quote_identifier(str(item['name']))} {data_type}"
+        if item.get("nullable") is False:
+            definition += " NOT NULL"
+        comment = (item.get("technology_properties") or {}).get("comment")
+        if comment:
+            definition += f" COMMENT {_string_literal(str(comment))}"
+        rendered.append(definition)
+    location = f" LOCATION {_string_literal(external_location)}" if external_location else ""
+    safe_properties = properties or {}
+    if any(key not in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"} for key in safe_properties):
+        raise ValueError("Only reviewed Delta retention properties may be retained")
+    property_sql = (" TBLPROPERTIES (" + ", ".join(
+        f"{_string_literal(key)} = {_string_literal(str(value))}" for key, value in sorted(safe_properties.items())) + ")") if safe_properties else ""
+    return f"CREATE TABLE {quote_qualified(identity)} ({', '.join(rendered)}) USING DELTA{location}{property_sql}"
+
+
+def _confirmed_empty_table(workspace: Any, warehouse_id: str, identity: dict[str, str],
+                           expected_schema: dict[str, Any], storage_type: str, old_table_id: str,
+                           external_location: str | None) -> dict[str, Any] | None:
+    try:
+        table = workspace.tables.get(full_name=".".join(identity[key] for key in ("catalog", "schema", "table")))
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        code = str(getattr(exc, "error_code", "")).upper()
+        if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST", "NOT_FOUND"}:
+            return None
+        raise
+    table_id = str(field(table, "table_id", "") or "")
+    actual_type = str(field(table, "table_type", "") or "").upper().split(".")[-1]
+    actual_format = str(field(table, "data_source_format", "") or "").upper().split(".")[-1]
+    actual_schema = canonical_schema(list(field(table, "columns", []) or []),
+        ".".join(identity[key] for key in ("catalog", "schema", "table")), complete=bool(field(table, "columns", [])))
+    if not table_id or table_id == old_table_id:
+        raise RuntimeError("The new physical table identity could not be distinguished from the old table")
+    if actual_type != storage_type or actual_format != "DELTA":
+        raise RuntimeError("The recreated DEV table has an unexpected storage type or format")
+    if not schemas_equivalent(expected_schema, actual_schema):
+        raise RuntimeError("The recreated DEV table does not match the approved schema")
+    location = str(field(table, "storage_location", "") or "")
+    if storage_type == "EXTERNAL" and location.rstrip("/") != str(external_location or "").rstrip("/"):
+        raise RuntimeError("The recreated External table does not use the approved new location")
+    result = execute_statement(workspace, warehouse_id,
+        f"SELECT COUNT(*) FROM {quote_qualified(identity)}", phase="schema-recreate-validation")
+    rows = field(field(result, "result", {}) or {}, "data_array") or []
+    try:
+        row_count = int(rows[0][0])
+    except (IndexError, TypeError, ValueError):
+        raise RuntimeError("The recreated table row count could not be verified") from None
+    if row_count != 0:
+        raise RuntimeError("The recreated DEV table is not empty; reconciliation is required")
+    return {"table": table, "table_id": table_id, "schema": actual_schema,
+            "storage_type": actual_type, "location": location, "row_count": row_count}
+
+
+def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[str, str],
+                             plan: dict[str, Any], *,
+                             checkpoint: Callable[[str, dict[str, Any]], None],
+                             progress: Callable[[str, dict[str, Any]], None]) -> dict[str, Any]:
+    """F4.3 empty-table recreation, reusing F4.2 destructive assessment and no-retry checks."""
+    from dexter.adapters.databricks_synthetic_publisher import (
+        _read_table, assess_drop_recreate, external_uri_is_safe,
+        inspect_drop_recreate_history, preflight_permissions, verify_external_path_empty,
+    )
+    if identity.get("environment") != "dev":
+        raise PermissionError("DEV table recreation is restricted to the configured DEV profile")
+    recreation = plan.get("recreation") or {}
+    storage_type = str(recreation.get("storage_type") or "").upper()
+    external = recreation.get("external_location")
+    external = external if isinstance(external, dict) else None
+    destination = {**identity, "environment": "dev"}
+    assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
+        proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
+        external_location=external, plan_id=plan["plan_id"], new_location_prefix="dexter-schema-recreated")
+    reviewed_assessment = recreation.get("assessment") or {}
+    if (assessment.get("status") != "ready_for_confirmation"
+            or assessment.get("target_fingerprint") != reviewed_assessment.get("target_fingerprint")):
+        raise RuntimeError("The destructive preflight or table identity changed after Review; the table was not dropped")
+    preflight_permissions(workspace, identity["catalog"], identity["schema"], storage_type.casefold(),
+        "drop_recreate", True, str((external or {}).get("name") or "") or None)
+    if storage_type == "EXTERNAL":
+        location = str(assessment.get("new_location") or "")
+        if not external or not external_uri_is_safe(str(external.get("url") or "")) or not location:
+            raise RuntimeError("A new authorized External Location could not be verified")
+        verify_external_path_empty(workspace, warehouse_id, location)
+    history = inspect_drop_recreate_history(workspace, warehouse_id, {
+        **destination, "storage_type": storage_type.casefold()})
+    old_table_id = str(identity["table_id"])
+    properties = {key: str(value) for key, value in
+        (assessment.get("target", {}).get("properties") or {}).items()
+        if key in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"}}
+    full_name = ".".join(identity[key] for key in ("catalog", "schema", "table"))
+    drop_sql = f"DROP TABLE {quote_qualified(identity)}"
+    create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
+        storage_type=storage_type, external_location=assessment.get("new_location"), properties=properties)
+
+    checkpoint("DROP_SUBMITTING", {"phase": "drop", "target": full_name, "old_table_id": old_table_id,
+        "new_location": assessment.get("new_location"), "history_evidence": history,
+        "retry_available": False, "reconciliation_required": True})
+    progress("Removing the reviewed DEV table", {"phase": "drop", "state": "submitting", "target": full_name})
+    drop_response_lost = False
+    try:
+        execute_statement(workspace, warehouse_id, drop_sql, phase="schema-recreate-drop")
+    except Exception:
+        _table, exists = _read_table(workspace, full_name)
+        if exists:
+            raise
+        # A lost response plus a fresh confirmed absence is enough to continue CREATE;
+        # the destructive DROP is never resubmitted.
+        drop_response_lost = True
+    _old_or_new, still_exists = _read_table(workspace, full_name)
+    if still_exists:
+        raise RuntimeError("DROP did not leave the target absent; no CREATE or automatic retry was attempted")
+    checkpoint("DROPPED", {"phase": "create", "target": full_name, "drop_response_lost": drop_response_lost,
+        "retry_available": False, "reconciliation_required": True})
+    progress("Creating an empty DEV table with the approved schema", {"phase": "create", "state": "submitting", "target": full_name})
+    create_response_lost = False
+    try:
+        execute_statement(workspace, warehouse_id, create_sql, phase="schema-recreate-create")
+    except Exception:
+        # Do not submit CREATE twice. Verify a possibly committed response directly.
+        create_response_lost = True
+    created = _confirmed_empty_table(workspace, warehouse_id, identity, plan["proposed_dev_schema"],
+        storage_type, old_table_id, assessment.get("new_location"))
+    if created is None:
+        raise RuntimeError("The old table was dropped, but the new table is absent; reconciliation is required")
+    checkpoint("CREATED", {"phase": "validate", "target": full_name, "table_id": created["table_id"],
+        "row_count": 0, "new_location": created["location"] if storage_type == "EXTERNAL" else None,
+        "drop_response_lost": drop_response_lost, "create_response_lost": create_response_lost,
+        "retry_available": False, "reconciliation_required": False})
+    progress("The empty DEV table matches the approved schema", {"phase": "validate", "state": "succeeded", "target": full_name})
+    return {**created, "assessment": assessment, "history_evidence": history,
+            "drop_response_lost": drop_response_lost, "create_response_lost": create_response_lost}
 
 
 def execute(workspace: Any, warehouse_id: str, target: dict[str, str], operation: dict[str, Any], **kwargs) -> dict:

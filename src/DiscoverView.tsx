@@ -900,7 +900,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
             void refreshOpenHierarchy(true)
             for (const item of workbenchTabs) {
               if (item.comparison && [item.comparison.referenceNodeId, item.comparison.compareNodeId].includes(tab.node.id)) void loadComparison(item.key, item.comparison, true)
-              if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current)))
+              if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current))).catch(() => undefined)
             }
           }} onCompare={openCompare} />
           : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => { const tableTab = workbenchTabs.find((item) => item.key === tab.node.id); if (tableTab) activateTab(tableTab); else void selectNode(tab.node) }} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}

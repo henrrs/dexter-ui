@@ -8,7 +8,7 @@ import test_schema_evolution_state as state_tests
 from dexter.adapters.databricks_schema_evolution import inspect_execution_support as real_support, feature_sql
 from dexter.domain.schema import canonical_schema, compare_schemas
 from dexter.domain.schema_evolution import SchemaDraft, plan_schema_change
-from dexter.catalog.cache import DiscoveryCache
+from dexter.catalog.cache import DiscoveryCache, context_key
 
 
 class DeltaCapabilityDomainTests(unittest.TestCase):
@@ -140,12 +140,13 @@ class DeltaCapabilityApiTests(unittest.TestCase):
         self.assertTrue(self.review(["column_mapping"])["can_apply"])
         self.assertEqual(self.apply().status_code, 422)
         cache = DiscoveryCache(self.paths.database)
-        cache.put("fixture-context", "detail:tech_dev.gold.ledger", [{"columns": "stale"}], 9999)
+        cache_context = context_key("databricks", "dev", self.context["identity"]["profile"], self.context["identity"]["workspace"])
+        cache.put(cache_context, "detail:tech_dev.gold.ledger", [{"columns": "stale"}], 9999)
         completed = self.terminal(self.apply(["column_mapping"]))
         self.assertEqual(completed["state"], "succeeded", completed)
         self.assertEqual(completed["details"]["applied_features"], ["column_mapping"])
         self.assertEqual([column["name"] for column in self.columns], ["B", "C"])
-        self.assertIsNone(cache.get("fixture-context", "detail:tech_dev.gold.ledger"))
+        self.assertIsNone(cache.get(cache_context, "detail:tech_dev.gold.ledger"))
 
     def test_mapping_then_rename_preserves_rows_and_physical_identity(self):
         self.prepare("rename"); self.review(["column_mapping"])
@@ -206,10 +207,10 @@ class DeltaCapabilityApiTests(unittest.TestCase):
 
     def test_property_alone_does_not_prove_delta_protocol_support(self):
         self.properties = {"delta.columnMapping.mode": "name"}
-        self.prepare(); self.review()
-        failed = self.terminal(self.apply())
-        self.assertEqual(failed["error_code"], "PROTOCOL_UNAVAILABLE", failed)
-        self.assertFalse(failed["details"]["ddl_started"])
+        self.prepare(); plan = self.review()
+        self.assertFalse(plan["can_apply"], plan)
+        self.assertTrue(any("protocol" in reason.casefold() for reason in plan["blockers"]))
+        self.assertEqual(self.apply().status_code, 409)
         self.assertFalse(self.ddl_calls)
 
     def test_concurrent_schema_change_after_feature_enable_blocks_structural_changes(self):

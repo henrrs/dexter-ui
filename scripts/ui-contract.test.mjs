@@ -117,6 +117,7 @@ test('Schema Evolution uses one DEV editor from Workbench and Compare Tables', (
   assert.match(api, /schema-evolution\/apply/)
   assert.match(api, /schema-evolution\/validate/)
   assert.match(schemaStudio, /Stop after current change/)
+  assert.match(schemaStudio, /Stop before table recreation/)
 })
 
 test('Explorer restores previously cached catalog and table pages after reload', () => {

@@ -63,6 +63,10 @@ class OperationsService:
                 details = json.loads(row["details_json"] or "{}")
                 if details.get("destructive_started"):
                     raise ValueError("Cancellation is disabled after Drop & Recreate begins; the publisher must finish or require reconciliation")
+            if row["kind"] == "schema-evolution":
+                details = json.loads(row["details_json"] or "{}")
+                if details.get("destructive_started"):
+                    raise ValueError("Cancellation is disabled after table recreation begins; the operation must finish or require reconciliation")
             if row["state"] == "queued":
                 stamp = now()
                 conn.execute("UPDATE operations SET state='cancelled',message='Cancelled before execution',updated_at=?,finished_at=? WHERE id=?", (stamp, stamp, operation_id))
