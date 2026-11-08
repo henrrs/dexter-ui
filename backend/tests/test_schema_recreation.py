@@ -24,10 +24,8 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
     def _preflight(self, properties=None):
         return patch("dexter.adapters.databricks_synthetic_publisher.assess_drop_recreate", return_value={
             "status": "ready_for_confirmation", "target_fingerprint": "approved-fingerprint",
-            "new_location": None, "target": {"properties": properties or {}}}), \
-            patch("dexter.adapters.databricks_synthetic_publisher.preflight_permissions"), \
-            patch("dexter.adapters.databricks_synthetic_publisher.inspect_drop_recreate_history", return_value={
-                "delta_history_latest": None}), \
+            "new_location": None, "target": {"table_id": "table-old", "storage_type": "managed",
+                "properties": properties or {}}}), \
             patch("dexter.adapters.databricks_synthetic_publisher._read_table", return_value=(None, False))
 
     def test_checkpoints_precede_drop_and_empty_schema_is_verified(self):
@@ -46,7 +44,7 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
             return {}
 
         preflight = self._preflight(properties)
-        with preflight[0], preflight[1], preflight[2], preflight[3], \
+        with preflight[0], preflight[1], \
              patch("dexter.adapters.databricks_schema_evolution.execute_statement", side_effect=execute):
             result = execute_empty_recreation(workspace, "wh-dev", self.identity, self.plan,
                 checkpoint=lambda state, details: checkpoints.append((state, details)),
@@ -76,7 +74,7 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
             return {}
 
         preflight = self._preflight()
-        with preflight[0], preflight[1], preflight[2], preflight[3], \
+        with preflight[0], preflight[1], \
              patch("dexter.adapters.databricks_schema_evolution._confirmed_empty_table", return_value=None), \
              patch("dexter.adapters.databricks_schema_evolution.execute_statement", side_effect=execute):
             with self.assertRaisesRegex(RuntimeError, "new table is absent"):

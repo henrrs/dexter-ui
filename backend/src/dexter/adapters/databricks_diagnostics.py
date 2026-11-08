@@ -24,8 +24,6 @@ def classify_failure(exc: Exception) -> dict[str, Any]:
         if isinstance(error, (ConnectionError, TimeoutError, OSError)) or any(word in type(error).__name__.casefold() for word in ("connection", "timeout", "connecterror")) or status in {502, 503, 504}:
             return {"code": "connection_unavailable", "message": "Connection unavailable. The DEV workspace could not be reached; retry without resetting your draft.", "status": 503}
     codes = {str(getattr(error, "error_code", None) or getattr(error, "code", "")).upper() for error in chain}
-    if "RECOVERY_POLICY_UNAVAILABLE" in codes:
-        return {"code": "recovery_policy_unavailable", "message": "The DEV table recovery window could not be verified. No table changes were made; retry after Databricks metadata is available.", "status": 409}
     if "PUBLISH_PERMISSION_CHECK_FAILED" in codes:
         return {"code": "permission_metadata_unavailable", "message": "The selected DEV identity's effective Unity Catalog grants could not be read. No table changes were made; retry when grant metadata is available.", "status": 503}
     statement_error = next((error for error in chain if type(error).__name__ == "StatementExecutionError"), None)

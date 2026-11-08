@@ -107,7 +107,7 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
                          external_location: dict[str, Any] | None, plan_id: str,
                          progress: Callable[[str, dict], None] | None = None,
                          new_location_prefix: str = "dexter-synthetic-recreated",
-                         property_policy: str = "strict") -> dict[str, Any]:
+                         property_policy: str = "strict", governance_checks: bool = True) -> dict[str, Any]:
     """Read-only preflight. It reports only lineage and grants visible to the selected identity."""
     if destination.get("environment") != "dev":
         raise SyntheticPublishError("Drop & Recreate is restricted to the configured DEV profile", "PROD_WRITE_BLOCKED")
@@ -137,26 +137,34 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
         reasons.append("Only Delta tables are supported by the synthetic publisher.")
     if storage_type != original_storage:
         reasons.append("The selected recreation storage type must match the current table storage type.")
-    if not owner:
+    if governance_checks and not owner:
         reasons.append("The current table owner could not be verified.")
     if isinstance(location, str) and location and not external_uri_is_safe(location):
         reasons.append("The current storage location contains credential-like URL components and cannot be reviewed safely.")
-    if schema.get("constraints") or table_constraints:
+    if governance_checks and (schema.get("constraints") or table_constraints):
         reasons.append("The current table has constraints that Dexter does not yet recreate.")
-    if row_filter or masked_columns:
+    if governance_checks and (row_filter or masked_columns):
         reasons.append("Row filters or column masks are configured and cannot be restored safely by the current publisher.")
-    direct_grants = _read_direct_table_grants(workspace, full_name)
-    if direct_grants is None:
-        reasons.append("Direct table grants could not be inspected for preservation.")
-        direct_grants = []
-    elif any(item.get("principal", "").casefold() != owner.casefold() for item in direct_grants):
-        reasons.append("The table has direct grants to other principals; Dexter cannot reapply them safely.")
-    lineage = _read_lineage(workspace, full_name)
-    if lineage is None:
-        reasons.append("Table lineage could not be inspected with the selected DEV identity.")
-        dependencies: list[dict[str, Any]] = []
+    if governance_checks:
+        direct_grants = _read_direct_table_grants(workspace, full_name)
+        if direct_grants is None:
+            reasons.append("Direct table grants could not be inspected for preservation.")
+            direct_grants = []
+        elif any(item.get("principal", "").casefold() != owner.casefold() for item in direct_grants):
+            reasons.append("The table has direct grants to other principals; Dexter cannot reapply them safely.")
+        lineage = _read_lineage(workspace, full_name)
+        if lineage is None:
+            reasons.append("Table lineage could not be inspected with the selected DEV identity.")
+            dependencies: list[dict[str, Any]] = []
+        else:
+            dependencies = lineage
+        table_permissions = _read_effective_table_privileges(workspace, full_name, owner)
+        if table_permissions is None:
+            reasons.append("DROP authorization could not be verified for the existing table.")
+        elif not table_permissions.get("drop_authorized"):
+            reasons.append("The selected DEV identity is not the table owner and has no verified MANAGE privilege.")
     else:
-        dependencies = lineage
+        direct_grants, dependencies, lineage, table_permissions = [], [], None, None
     if original_storage == "external":
         if not isinstance(location, str) or not location:
             reasons.append("The existing External table location could not be verified.")
@@ -166,12 +174,6 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
             reasons.append("The selected External Location is read-only or points inside a Volume.")
         elif not external_uri_is_safe(str(external_location["url"])):
             reasons.append("The External Location URL embeds credentials; use a Unity Catalog credential-backed location instead.")
-    table_permissions = _read_effective_table_privileges(workspace, full_name, owner)
-    if table_permissions is None:
-        reasons.append("DROP authorization could not be verified for the existing table.")
-    elif not table_permissions.get("drop_authorized"):
-        reasons.append("The selected DEV identity is not the table owner and has no verified MANAGE privilege.")
-
     plan_id = str(plan_id)
     external_url = str((external_location or {}).get("url") or "")
     external_url_safe = external_uri_is_safe(external_url)
@@ -208,11 +210,13 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
                         "data_source_format": data_format}
     fingerprint = hashlib.sha256(json.dumps(current_identity, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
     risks = ["The old table's grants are not copied. The recreated table receives current schema-level inherited privileges and a new owner.",
-             "Delta history and the old physical table identity are not preserved.",
-             "Lineage only includes dependencies visible to the selected DEV identity; unobserved consumers may still exist."]
-    if original_storage == "managed":
-        risks.append("Unity Catalog manages the dropped Managed data lifecycle; the default recovery window is 7 days and can be configured at catalog or schema scope.")
+             "Delta history and the old physical table identity are not preserved."]
+    if not governance_checks:
+        risks.append("Table grants, lineage, ownership, and recovery-window metadata are not preflighted in DEV; Databricks checks DDL permissions when the operation runs.")
+        risks.append("Downstream dependencies are not checked before recreation.")
     else:
+        risks.append("Lineage only includes dependencies visible to the selected DEV identity; unobserved consumers may still exist.")
+    if original_storage == "external":
         old_location = location if isinstance(location, str) and external_uri_is_safe(location) else "the existing location"
         risks.append(f"The old External files remain at {old_location}; the recreated table uses a separate new location.")
     if unclassified_property_count:
@@ -228,7 +232,7 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
     downstream = [item for item in dependencies if str(item.get("direction", "")).casefold() == "downstream"]
     if downstream:
         risks.append("Visible downstream consumers may become invalid: " + ", ".join(str(item.get("table_name") or item.get("entity_type") or "unknown") for item in downstream))
-    if not table_permissions or not table_permissions.get("drop_authorized"):
+    if governance_checks and (not table_permissions or not table_permissions.get("drop_authorized")):
         reasons.append("Required table DROP/MANAGE privilege is missing or unknown.")
     status = "ready_for_confirmation"
     if reasons:
@@ -249,11 +253,12 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
             "detected_dependencies": dependencies,
             "required_privileges": ["USE_CATALOG", "USE_SCHEMA", "CREATE_TABLE", "table owner or MANAGE"],
             "validation": {"physical_identity": bool(table_id), "storage": original_storage != "unsupported" and data_format == "DELTA",
-                           "lineage": lineage is not None, "grants": table_permissions is not None,
+                           "lineage": lineage is not None if governance_checks else "not_checked",
+                           "grants": table_permissions is not None if governance_checks else "not_checked",
                            "external_location": original_storage != "external" or bool(new_location),
                            "external_path_empty": "checked_after_upload_before_drop" if original_storage == "external" else "not_applicable",
-                           "delta_history": "captured_after_upload_before_drop",
-                           "managed_recovery_policy": "captured_after_upload_before_drop" if original_storage == "managed" else "not_applicable"},
+                           "delta_history": "not_checked",
+                           "managed_recovery_policy": "not_checked" if original_storage == "managed" else "not_applicable"},
             "impacts": {"removed": full_name, "recreated": full_name,
                         "preserved": ["DEV schema-level inherited privileges", "old External files" if original_storage == "external" else "old managed files follow Unity Catalog retention"],
                         "not_preserved": ["table owner", "direct grants", "Delta history", "physical table ID",
@@ -317,53 +322,6 @@ def verify_external_path_empty(workspace: Any, warehouse_id: str, path: str) -> 
     rows = _field(_field(result, "result") or {}, "data_array") or []
     if rows:
         raise SyntheticPublishError("The new External table location already contains files; choose a fresh review plan", "EXTERNAL_LOCATION_CONFLICT")
-
-
-def inspect_drop_recreate_history(workspace: Any, warehouse_id: str, destination: dict[str, Any]) -> dict[str, Any]:
-    """Capture Delta history and the effective Unity Catalog managed recovery policy before DROP."""
-    catalog, schema_name, table = (str(destination.get(key) or "") for key in ("catalog", "schema", "table"))
-    full_name = qualified_name(catalog, schema_name, table)
-    history_result = execute_statement(workspace, warehouse_id, f"DESCRIBE HISTORY {full_name} LIMIT 1", phase="preflight")
-    history_rows = _field(_field(history_result, "result") or {}, "data_array") or []
-    history = history_rows[0] if history_rows else None
-    if isinstance(history, list):
-        history_columns = _result_columns(history_result)
-        history = {history_columns[index]: value for index, value in enumerate(history) if index < len(history_columns)} if history_columns else {"latest_row": history}
-    evidence: dict[str, Any] = {"delta_history_latest": history}
-    # External tables keep the old data files; no managed-table recovery policy applies.
-    if not destination.get("storage_type") == "managed":
-        return evidence
-    catalog_result = execute_statement(workspace, warehouse_id,
-        f"DESCRIBE CATALOG EXTENDED {quote_ident(catalog)}", phase="preflight")
-    schema_result = execute_statement(workspace, warehouse_id,
-        f"DESCRIBE SCHEMA EXTENDED {quote_ident(catalog)}.{quote_ident(schema_name)}", phase="preflight")
-    catalog_hours = _recovery_hours(catalog_result)
-    schema_hours = _recovery_hours(schema_result)
-    effective = schema_hours if schema_hours is not None else catalog_hours
-    if effective is None:
-        raise SyntheticPublishError("Unity Catalog managed-table recovery retention could not be verified; no table was dropped", "RECOVERY_POLICY_UNAVAILABLE")
-    evidence["managed_recovery_policy"] = {"catalog_hours": catalog_hours,
-        "schema_hours": schema_hours, "effective_hours": effective,
-        "source": "schema" if schema_hours is not None else "catalog"}
-    return evidence
-
-
-def _result_columns(result: dict[str, Any]) -> list[str]:
-    manifest = _field(result, "manifest") or {}
-    schema = _field(manifest, "schema") or {}
-    return [str(_field(item, "name") or "") for item in (_field(schema, "columns") or [])]
-
-
-def _recovery_hours(result: dict[str, Any]) -> int | None:
-    for row in (_field(_field(result, "result") or {}, "data_array") or []):
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        if "recovery period hours" in str(row[0]).casefold():
-            try:
-                return int(row[-1])
-            except (TypeError, ValueError):
-                return None
-    return None
 
 
 def copy_into_sql(catalog: str, schema_name: str, table: str, volume_path: str) -> str:
@@ -503,13 +461,11 @@ def publish_verified_run(workspace: Any, *, warehouse_id: str, destination: dict
             cancelled=cancel_requested, progress=progress, phase="preflight")
         if _first_integer(data_preview) != expected_rows:
             raise SyntheticPublishError("Verified staging row count does not match the generation manifest", "STAGING_ROW_COUNT_MISMATCH")
-        destructive_evidence = inspect_drop_recreate_history(workspace, warehouse_id, destination)
         if cancel_requested():
             raise SyntheticPublishError("The operation was cancelled before its destructive step; the existing table was kept", "CANCELLED")
         checkpoint = persist_destructive_state or (lambda _state, _details: None)
         checkpoint("DROP_SUBMITTING", {"phase": "drop", "target": full_name,
                     "target_fingerprint": expected_fingerprint, "new_location": final_location,
-                    "impact_evidence": destructive_evidence,
                     "retry_available": False, "reconciliation_required": True})
         progress("", {"phase": "drop", "state": "SUBMITTING", "target": full_name})
         # Once the durable checkpoint is saved, cancellation and automatic retries are disabled.

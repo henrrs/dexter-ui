@@ -249,7 +249,6 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
     """F4.3 empty-table recreation, reusing F4.2 destructive assessment and no-retry checks."""
     from dexter.adapters.databricks_synthetic_publisher import (
         _read_table, assess_drop_recreate, external_uri_is_safe,
-        inspect_drop_recreate_history, preflight_permissions, verify_external_path_empty,
     )
     if identity.get("environment") != "dev":
         raise PermissionError("DEV table recreation is restricted to the configured DEV profile")
@@ -261,20 +260,15 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
     assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
         proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
         external_location=external, plan_id=plan["plan_id"], new_location_prefix="dexter-schema-recreated",
-        property_policy="best_effort")
+        property_policy="best_effort", governance_checks=False)
     reviewed_assessment = recreation.get("assessment") or {}
+    reviewed_target = reviewed_assessment.get("target") or {}
+    current_target = assessment.get("target") or {}
     if (assessment.get("status") != "ready_for_confirmation"
-            or assessment.get("target_fingerprint") != reviewed_assessment.get("target_fingerprint")):
-        raise RuntimeError("The destructive preflight or table identity changed after Review; the table was not dropped")
-    preflight_permissions(workspace, identity["catalog"], identity["schema"], storage_type.casefold(),
-        "drop_recreate", True, str((external or {}).get("name") or "") or None)
-    if storage_type == "EXTERNAL":
-        location = str(assessment.get("new_location") or "")
-        if not external or not external_uri_is_safe(str(external.get("url") or "")) or not location:
-            raise RuntimeError("A new authorized External Location could not be verified")
-        verify_external_path_empty(workspace, warehouse_id, location)
-    history = inspect_drop_recreate_history(workspace, warehouse_id, {
-        **destination, "storage_type": storage_type.casefold()})
+            or current_target.get("table_id") != identity.get("table_id")
+            or reviewed_target.get("table_id") != identity.get("table_id")
+            or current_target.get("storage_type") != reviewed_target.get("storage_type")):
+        raise RuntimeError("The reviewed DEV table identity or storage type changed; the table was not dropped")
     old_table_id = str(identity["table_id"])
     properties = {key: str(value) for key, value in
         (assessment.get("target", {}).get("properties") or {}).items()}
@@ -284,7 +278,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         storage_type=storage_type, external_location=assessment.get("new_location"), properties=properties)
 
     checkpoint("DROP_SUBMITTING", {"phase": "drop", "target": full_name, "old_table_id": old_table_id,
-        "new_location": assessment.get("new_location"), "history_evidence": history,
+        "new_location": assessment.get("new_location"),
         "retry_available": False, "reconciliation_required": True})
     progress("Removing the reviewed DEV table", {"phase": "drop", "state": "submitting", "target": full_name})
     drop_response_lost = False
@@ -318,7 +312,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         "drop_response_lost": drop_response_lost, "create_response_lost": create_response_lost,
         "retry_available": False, "reconciliation_required": False})
     progress("The empty DEV table matches the approved schema", {"phase": "validate", "state": "succeeded", "target": full_name})
-    return {**created, "assessment": assessment, "history_evidence": history,
+    return {**created, "assessment": assessment,
             "reapplied_properties": sorted(properties),
             "drop_response_lost": drop_response_lost, "create_response_lost": create_response_lost}
 

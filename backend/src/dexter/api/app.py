@@ -1035,8 +1035,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         import json as _json
         from dexter.adapters.databricks_schema_evolution import create_empty_delta_table_sql, quote_qualified
         from dexter.adapters.databricks_synthetic_publisher import (
-            _privileges, assess_drop_recreate, external_uri_is_safe, inspect_drop_recreate_history,
-            preflight_permissions, verify_external_path_empty,
+            assess_drop_recreate, external_uri_is_safe,
         )
         storage_type = str((plan.get("required_capabilities") or {}).get("table_type") or "").upper()
         recreation["storage_type"] = storage_type
@@ -1044,19 +1043,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         selected_external = None
         if storage_type == "EXTERNAL":
             try:
-                principal = workspace.current_user.me()
-                principal_name = str(getattr(principal, "user_name", None) or getattr(principal, "display_name", None) or "")
                 for location in workspace.external_locations.list():
                     name = str(getattr(location, "name", "") or "")
                     url = str(getattr(location, "url", "") or "")
                     read_only = bool(getattr(location, "read_only", False))
-                    authorized = None
-                    if principal_name and name:
-                        try:
-                            grants = workspace.grants.get_effective(securable_type="EXTERNAL_LOCATION", full_name=name, principal=principal_name)
-                            authorized = {"CREATE_EXTERNAL_TABLE", "EXTERNAL_USE_LOCATION"}.issubset(_privileges(grants))
-                        except Exception:
-                            authorized = None
+                    authorized = None  # DDL authorization is checked by Databricks when the user confirms.
                     external_locations.append({"name": name, "url": url if external_uri_is_safe(url) else "<redacted>",
                         "read_only": read_only, "authorized": authorized})
             except Exception as exc:
@@ -1064,11 +1055,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 diagnosis = classify_failure(exc)
                 reasons.append("External Location access could not be verified: " + diagnosis["message"])
             if not external_location_name:
-                reasons.append("Select a writable, authorized DEV External Location for the new empty table path.")
+                reasons.append("Select a writable DEV External Location for the new empty table path.")
             else:
                 selected_external = next((item for item in external_locations if item["name"] == external_location_name), None)
-                if not selected_external or selected_external["authorized"] is not True or selected_external["read_only"] or selected_external["url"] == "<redacted>":
-                    reasons.append("The selected External Location is unavailable, read-only, or lacks verified creation privileges.")
+                if not selected_external or selected_external["read_only"] or selected_external["url"] == "<redacted>":
+                    reasons.append("Select an available writable DEV External Location with a credential-backed URL.")
         elif external_location_name:
             reasons.append("An External Location can only be selected when recreating an External table.")
         plan["plan_id"] = _hashlib.sha256(_json.dumps({
@@ -1085,22 +1076,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
                 proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
                 external_location=selected_external, plan_id=plan["plan_id"],
-                new_location_prefix="dexter-schema-recreated", property_policy="best_effort")
+                new_location_prefix="dexter-schema-recreated", property_policy="best_effort",
+                governance_checks=False)
             if assessment.get("status") != "ready_for_confirmation":
                 reasons.extend(assessment.get("block_reasons") or ["The current DEV table is not eligible for safe recreation."])
             if not reasons:
-                preflight_permissions(workspace, identity["catalog"], identity["schema"], storage_type.casefold(),
-                    "drop_recreate", True, str((selected_external or {}).get("name") or "") or None)
-                # Review captures Delta history and the managed-table recovery
-                # window through SQL. These read-only checks require a running
-                # warehouse, so start the explicitly selected DEV warehouse here
-                # instead of misreporting a stopped warehouse as missing metadata.
-                from dexter.adapters.databricks import ensure_sql_warehouse_running
-                ensure_sql_warehouse_running(workspace, warehouse_id)
-                history = inspect_drop_recreate_history(workspace, warehouse_id,
-                    {**destination, "storage_type": storage_type.casefold()})
-                if storage_type == "EXTERNAL":
-                    verify_external_path_empty(workspace, warehouse_id, str(assessment.get("new_location") or ""))
                 table_properties = {key: str(value) for key, value in
                     (assessment.get("target", {}).get("properties") or {}).items()}
                 create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
@@ -1109,7 +1089,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 if capabilities.get("iceberg_compatible"):
                     assessment.setdefault("risks", []).append(
                         "Iceberg compatibility may not be preserved on the empty replacement; external Iceberg readers may need reconfiguration.")
-                assessment["history_evidence"] = history
                 recreation.update(status="ready_for_confirmation", assessment=assessment,
                     external_location=selected_external, external_locations=external_locations,
                     block_reasons=[], storage_type=storage_type)
