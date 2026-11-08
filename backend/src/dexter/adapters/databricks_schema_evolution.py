@@ -22,23 +22,28 @@ def quote_qualified(identity: dict[str, str]) -> str:
 
 def inspect_table(workspace: Any, identity: dict[str, str]) -> tuple[Any, dict[str, Any]]:
     target = workspace.tables.get(full_name=".".join(identity[key] for key in ("catalog", "schema", "table")))
-    props = field(target, "properties", {}) or {}
-    table_type = str(field(target, "table_type", "")).upper().split(".")[-1]
-    fmt = str(field(target, "data_source_format", "")).upper().split(".")[-1]
+    observed_props = field(target, "properties")
+    props = observed_props or {}
+    table_type = str(field(target, "table_type", "") or "").upper().split(".")[-1]
+    fmt = str(field(target, "data_source_format", "") or "").upper().split(".")[-1]
+    columns = field(target, "columns", []) or []
+    partitions = field(target, "partition_columns")
+    if partitions is None:
+        partitions = [field(column, "name") for column in columns if field(column, "partition_index") is not None]
     capabilities = {
-        "delta": fmt == "DELTA",
-        "table_type": table_type,
-        "column_mapping": str(props.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"},
-        "type_widening": str(props.get("delta.enableTypeWidening", "false")).casefold() == "true",
+        "delta": fmt == "DELTA" if fmt else None,
+        "table_type": table_type or None,
+        "column_mapping": str(props.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"} if observed_props is not None else None,
+        "type_widening": str(props.get("delta.enableTypeWidening", "false")).casefold() == "true" if observed_props is not None else None,
         # Feature flags are observations only. Dexter never enables protocol features.
-        "time_type": str(props.get("delta.feature.timeType", "")).casefold() in {"supported", "enabled"},
-        "variant_type": str(props.get("delta.feature.variantType", "")).casefold() in {"supported", "enabled"},
-        "timestamp_ntz": str(props.get("delta.feature.timestampNtz", "")).casefold() in {"supported", "enabled"},
+        "time_type": str(props.get("delta.feature.timeType", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
+        "variant_type": str(props.get("delta.feature.variantType", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
+        "timestamp_ntz": str(props.get("delta.feature.timestampNtz", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
         "table_id": str(field(target, "table_id", "") or ""),
         "has_table_constraints": bool(field(target, "table_constraints", None) or field(target, "constraints", None)),
         "row_filter": bool(field(target, "row_filter", None)),
-        "has_column_masks": bool(field(target, "masked_columns", None)),
-        "partition_columns": list(field(target, "partition_columns", None) or []),
+        "has_column_masks": bool(field(target, "masked_columns", None) or any(field(column, "mask") for column in columns)),
+        "partition_columns": list(partitions),
         "storage_location": field(target, "storage_location"),
     }
     return target, capabilities

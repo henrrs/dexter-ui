@@ -127,6 +127,7 @@ class SchemaDraftSaveRequest(BaseModel):
 class SchemaReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     node_id: str = Field(min_length=1, max_length=100_000)
+    reference_prod_schema: dict | None = None
 
 
 class SchemaApplyRequest(BaseModel):
@@ -441,7 +442,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     @app.get("/api/schema-evolution/context")
     def schema_evolution_context(node_id: str):
-        from dexter.domain.schema_evolution import SchemaDraft, fingerprint
+        from dexter.domain.schema_evolution import SchemaDraft, schemas_equivalent
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, schema, detail, _workspace, key = _schema_evolution_context(node_id)
         repository = SchemaEvolutionRepository(paths.database)
@@ -449,8 +450,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if draft is None:
             draft = SchemaDraft.from_schema(identity, schema).to_dict()
             repository.save_draft(key, identity, draft)
+        else:
+            # Upgrade the fingerprint representation without changing the physical snapshot or edits.
+            normalized = SchemaDraft.from_dict(draft).to_dict()
+            if draft.get("baseline_fingerprint") != normalized["baseline_fingerprint"]:
+                repository.save_draft(key, identity, normalized)
+            draft = normalized
         return {"identity": identity, "schema": schema, "draft": draft,
-                "drift": draft.get("baseline_fingerprint") != fingerprint(schema),
+                "drift": not schemas_equivalent(draft["baseline"], schema),
+                "reconciliation_required": repository.pending_reconciliation(identity) is not None,
                 "metadata_cache": detail.get("metadata_cache"), "draft_key": key}
 
     @app.put("/api/schema-evolution/draft")
@@ -483,19 +491,44 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, schema, detail, _workspace, key = _schema_evolution_context(body.node_id)
         repository = SchemaEvolutionRepository(paths.database)
+        repository.acknowledge_reconciliation(identity)
         repository.clear_draft(key)
         draft = SchemaDraft.from_schema(identity, schema).to_dict()
         repository.save_draft(key, identity, draft)
         return {"identity": identity, "schema": schema, "draft": draft, "drift": False,
                 "metadata_cache": detail.get("metadata_cache"), "draft_key": key}
 
+    @app.post("/api/schema-evolution/reconcile")
+    def reconcile_schema_evolution(body: SchemaReviewRequest):
+        from dexter.domain.schema_evolution import SchemaDraft, reconcile_draft
+        from dexter.services.schema_evolution import SchemaEvolutionRepository
+        identity, schema, detail, _workspace, key = _schema_evolution_context(body.node_id)
+        target, _capabilities = _schema_capabilities(_workspace, identity)
+        schema = _schema_table_schema(target, identity)
+        lock_key = "|".join((identity["workspace"].casefold(), identity["profile"].casefold(), identity["table_id"].casefold()))
+        with schema_evolution_target_lock:
+            if lock_key in schema_evolution_active_targets:
+                raise HTTPException(409, detail="Wait for the active DEV operation before reconciling its schema")
+            repository = SchemaEvolutionRepository(paths.database)
+            raw = repository.get_draft(key)
+            if not raw:
+                raise HTTPException(409, detail="Load the saved draft before reconciling")
+            previous = repository.pending_reconciliation(identity) or {"operations": []}
+            draft = reconcile_draft(SchemaDraft.from_dict(raw), schema, previous).to_dict()
+            repository.save_draft(key, identity, draft)
+            repository.acknowledge_reconciliation(identity)
+        return {"identity": identity, "schema": schema, "draft": draft, "drift": False,
+                "reconciliation_required": False, "metadata_cache": detail.get("metadata_cache"), "draft_key": key}
+
     @app.post("/api/schema-evolution/review")
     def review_schema_evolution(body: SchemaReviewRequest):
         from dexter.adapters.databricks_schema_evolution import sql_for_operation, quote_qualified
-        from dexter.domain.schema_evolution import SchemaDraft, fingerprint, plan_schema_change
+        from dexter.domain.schema_evolution import SchemaDraft, schemas_equivalent, plan_schema_change, reviewed_state
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         identity, current_schema, _detail, workspace, key = _schema_evolution_context(body.node_id)
         repository = SchemaEvolutionRepository(paths.database)
+        if repository.pending_reconciliation(identity):
+            raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "Some DEV changes may already exist. Reconcile the physical DEV schema before reviewing remaining edits."})
         raw_draft = repository.get_draft(key)
         if not raw_draft:
             raise HTTPException(409, detail="The schema draft is unavailable. Reload the DEV table before reviewing changes.")
@@ -503,11 +536,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if draft.identity != identity:
             raise HTTPException(409, detail="The draft physical table identity changed. Reload the table schema.")
         _target, capabilities = _schema_capabilities(workspace, identity)
+        current_schema = _schema_table_schema(_target, identity)
         plan = plan_schema_change(identity, draft, capabilities)
-        plan["proposed_schema"] = draft.proposed_schema()
+        # Advisory reference only: never part of DEV concurrency or capability fingerprints.
+        plan["reference_prod_schema"] = body.reference_prod_schema
         if capabilities.get("blocker"):
             plan["blockers"].append(capabilities["blocker"])
-        plan["drift"] = fingerprint(current_schema) != plan["baseline_fingerprint"]
+        plan["drift"] = not schemas_equivalent(current_schema, plan["physical_dev_baseline"])
         if plan["drift"]:
             plan["blockers"].append("The DEV schema changed while this draft was open. Reload the schema, then review your changes again.")
         plan["sql_statements"] = []
@@ -520,12 +555,18 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         plan["blockers"] = sorted(set(plan["blockers"]))
         plan["can_apply"] = bool(plan["operations"]) and not plan["blockers"]
         plan["identity"] = identity
+        try:
+            plan["state_snapshot"] = reviewed_state(plan, current_schema, capabilities, draft)
+        except RuntimeError as exc:
+            plan["state_snapshot"] = getattr(exc, "evidence", {})
+            if plan["drift"]:
+                plan["blockers"] = sorted(set([*plan["blockers"], str(exc)]))
         repository.save_plan(plan, state="reviewed")
         return plan
 
     @app.post("/api/schema-evolution/apply", status_code=202)
     def apply_schema_evolution(body: SchemaApplyRequest):
-        from dexter.domain.schema_evolution import SchemaDraft, fingerprint, plan_schema_change
+        from dexter.domain.schema_evolution import SchemaDraft, SchemaStateError, plan_schema_change, reviewed_state
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         repository = SchemaEvolutionRepository(paths.database)
         saved_plan = repository.get_plan(body.plan_id)
@@ -534,14 +575,23 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         identity, live_schema, _detail, workspace, key = _schema_evolution_context(body.node_id)
         if saved_plan.get("identity") != identity:
             raise HTTPException(403, detail="The reviewed plan does not target the configured DEV table")
+        if repository.pending_reconciliation(identity):
+            raise HTTPException(409, detail={"code": "RECONCILIATION_REQUIRED", "message": "Reconcile the physical DEV schema and review remaining changes before applying again."})
         _target, capabilities = _schema_capabilities(workspace, identity)
+        live_schema = _schema_table_schema(_target, identity)
         raw_draft = repository.get_draft(key)
         if not raw_draft:
             raise HTTPException(409, detail="The schema draft is unavailable")
         draft = SchemaDraft.from_dict(raw_draft)
+        try:
+            evidence = reviewed_state(saved_plan, live_schema, capabilities, draft)
+        except SchemaStateError as exc:
+            logger.info("Schema Apply blocked: %s snapshot=%s", exc.code, exc.evidence)
+            raise HTTPException(409 if exc.code not in {"METADATA_UNAVAILABLE", "CAPABILITIES_UNAVAILABLE"} else 503,
+                                detail={"code": exc.code, "message": str(exc), "state_snapshot": exc.evidence}) from None
         fresh = plan_schema_change(identity, draft, capabilities)
-        if fresh["plan_id"] != body.plan_id or fingerprint(live_schema) != fresh["baseline_fingerprint"]:
-            raise HTTPException(409, detail="The DEV table or its capabilities changed after review. Review the current schema again.")
+        if fresh["plan_id"] != body.plan_id:
+            raise HTTPException(409, detail={"code": "DRAFT_CHANGED", "message": "The reviewed edit plan changed. Review the current draft again."})
         if saved_plan.get("blockers") or saved_plan.get("drift") or not saved_plan.get("can_apply"):
             raise HTTPException(409, detail="Resolve the blocked schema changes and review them again before applying")
         if fresh.get("confirmation_required") and not body.confirm_drop:
@@ -567,6 +617,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                   node_id=identity["node_id"], plan_id=body.plan_id,
                                   planned_operations=len(saved_plan["operations"]), completed_operations=0,
                                   applied_operations=[], confirmation_drop=body.confirm_drop)
+        operations.update_details(operation["id"], state_snapshot=evidence, ddl_started=False)
         try:
             future = schema_evolution_workers.submit(_schema_evolution_worker, operation["id"], identity, saved_plan, body.warehouse_id, key)
             def release_schema_slot(_future):
@@ -587,7 +638,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def validate_schema_evolution(body: SchemaReviewRequest):
         from dexter.domain.schema_evolution import SchemaDraft, fingerprint, schemas_equivalent
         from dexter.services.schema_evolution import SchemaEvolutionRepository
-        identity, actual, detail, _workspace, key = _schema_evolution_context(body.node_id)
+        identity, actual, detail, workspace, key = _schema_evolution_context(body.node_id)
+        target, _capabilities = _schema_capabilities(workspace, identity)
+        actual = _schema_table_schema(target, identity)
         raw = SchemaEvolutionRepository(paths.database).get_draft(key)
         if not raw:
             return {"state": "no_draft", "schema": actual, "message": "Load the DEV schema to begin editing."}
@@ -597,7 +650,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         return {"state": "validated" if equivalent else "different",
                 "identity": identity, "schema": actual, "desired_schema": desired,
                 "baseline_fingerprint": draft.baseline_fingerprint, "actual_fingerprint": fingerprint(actual),
-                "metadata_cache": detail.get("metadata_cache"), "assessment": {"state": "matching" if equivalent else "different"}}
+                "metadata_cache": detail.get("metadata_cache"), "assessment": {"state": "matching" if equivalent else "different"},
+                "baseline_unchanged": schemas_equivalent(draft.baseline, actual),
+                "reconciliation_required": SchemaEvolutionRepository(paths.database).pending_reconciliation(identity) is not None}
 
     @app.post("/api/synthetic/preview")
     def synthetic_preview(body: SyntheticPreviewRequest):
@@ -684,6 +739,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if len(parts) != 5 or parts[0] != "databricks" or parts[1] != "dev":
             raise HTTPException(403, detail="Schema Evolution is restricted to the configured Databricks DEV profile")
         detail = discover.detail(physical_id, force=force)
+        if force and detail and (detail.get("metadata_cache") or {}).get("state") == "stale":
+            raise HTTPException(503, detail={"code": "METADATA_UNAVAILABLE", "message": "The physical DEV schema refresh failed. Cached metadata cannot authorize schema changes; retry without resetting your draft."})
         if not detail or detail.get("access") != "read" or detail.get("kind") != "table":
             raise HTTPException(409, detail={"code": "metadata_unavailable", "message": "Metadata unavailable. The physical DEV table schema could not be verified."})
         config = settings_repo.get("databricks.dev")
@@ -722,17 +779,33 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             target, capabilities = inspect_table(workspace, identity)
         except Exception as exc:
             raise _remote_failure(exc) from None
+        if capabilities["delta"] is None or capabilities["table_type"] is None:
+            raise HTTPException(503, detail={"code": "CAPABILITIES_UNAVAILABLE", "message": "Required DEV table format or type metadata is unavailable. Retry without resetting your draft."})
+        if not capabilities.get("table_id") or capabilities["table_id"] != identity["table_id"]:
+            raise HTTPException(409, detail={"code": "TABLE_IDENTITY_CHANGED", "message": "The physical DEV table identity changed. Reload it before reviewing again."})
         if not capabilities["delta"]:
             capabilities["blocker"] = "Schema Evolution currently supports Delta tables only."
         if capabilities["table_type"] not in {"MANAGED", "EXTERNAL"}:
             capabilities["blocker"] = "This Unity Catalog object is not a supported managed or external table."
-        capabilities["storage_location"] = bool(capabilities.get("storage_location"))
         return target, capabilities
 
+    def _schema_table_schema(target, identity):
+        """Schema and capabilities share one fresh Unity Catalog observation."""
+        from dexter.adapters.databricks_schema_evolution import field
+        from dexter.domain.schema import canonical_schema
+        if str(field(target, "table_id", "") or "") != identity["table_id"]:
+            raise HTTPException(409, detail={"code": "TABLE_IDENTITY_CHANGED", "message": "The physical DEV table was replaced. Reload its current identity before reviewing again."})
+        columns = field(target, "columns")
+        if not columns:
+            raise HTTPException(503, detail={"code": "METADATA_UNAVAILABLE", "message": "The complete physical DEV schema could not be verified. Retry without resetting your draft."})
+        return canonical_schema(columns, ".".join(identity[k] for k in ("catalog", "schema", "table")),
+                                constraints=field(target, "table_constraints") or field(target, "constraints"),
+                                technology_properties={"table_id": identity["table_id"]})
+
     def _schema_evolution_worker(operation_id: str, identity: dict, plan: dict, warehouse_id: str, key: str) -> None:
-        from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
+        from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file, safe_workspace_host
         from dexter.adapters.databricks_schema_evolution import count_null_values, describe_delta_detail, execute as execute_ddl, inspect_table
-        from dexter.domain.schema_evolution import SchemaDraft, fingerprint, plan_schema_change, schemas_equivalent
+        from dexter.domain.schema_evolution import SchemaDraft, SchemaStateError, fingerprint, reviewed_state, schemas_equivalent, schema_changes
         from dexter.services.schema_evolution import SchemaEvolutionRepository
         try:
             operations.transition(operation_id, "running", progress=1, message="Applying reviewed DEV schema changes")
@@ -741,20 +814,18 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 raise RuntimeError("The configured DEV profile changed after review")
             from databricks.sdk import WorkspaceClient
             workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-            live = discover.detail(identity["node_id"], force=True)
-            if not live or live.get("workspace") != identity["workspace"] or live.get("profile") != identity["profile"]:
-                raise RuntimeError("The DEV table identity could not be revalidated")
-            live_schema = _schema_evolution_canonical(live, ".".join(identity[k] for k in ("catalog", "schema", "table")))
-            if fingerprint(live_schema) != plan["baseline_fingerprint"]:
-                raise RuntimeError("The DEV table schema changed after review. Refresh the schema and review the changes again.")
+            principal = workspace.current_user.me()
+            principal_id = str(getattr(principal, "id", None) or getattr(principal, "user_name", None) or "unknown")
+            if safe_workspace_host(config["profile"]) != identity["workspace"] or principal_id != identity["principal"]:
+                raise SchemaStateError("TABLE_IDENTITY_CHANGED", "The authenticated DEV workspace or principal changed. Reload the table before applying.")
             target, capabilities = inspect_table(workspace, identity)
-            if str(getattr(target, "table_id", "") or "") != identity.get("table_id", ""):
-                raise RuntimeError("The physical DEV table was replaced after review. Load its current schema and review again.")
-            if not capabilities["delta"] or capabilities["table_type"] not in {"MANAGED", "EXTERNAL"}:
-                raise RuntimeError("The DEV destination is no longer a supported managed or external Delta table")
+            live_schema = _schema_table_schema(target, identity)
             raw_draft = SchemaEvolutionRepository(paths.database).get_draft(key)
-            if not raw_draft or plan_schema_change(identity, SchemaDraft.from_dict(raw_draft), capabilities)["plan_id"] != plan["plan_id"]:
-                raise RuntimeError("DEV table capabilities changed after review. Review the current schema changes again.")
+            if not raw_draft:
+                raise SchemaStateError("DRAFT_UNAVAILABLE", "The saved DEV draft is unavailable. Reload it before applying.")
+            evidence = reviewed_state(plan, live_schema, capabilities, SchemaDraft.from_dict(raw_draft))
+            operations.update_details(operation_id, phase="preflight", state_snapshot=evidence)
+            logger.info("Schema Apply preflight snapshot=%s", evidence)
             ensure_sql_warehouse_running(workspace, warehouse_id)
             if any(item["kind"] == "nullability" and item.get("field", {}).get("nullable") is False for item in plan["operations"]):
                 detail_evidence = describe_delta_detail(workspace, warehouse_id, identity)
@@ -772,13 +843,20 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     if null_count:
                         raise RuntimeError(f"Cannot set {source_column} to NOT NULL: DEV contains {null_count} NULL values. No schema changes were run.")
             completed = []
+            # Warehouse startup and NULL checks can take time; recheck physical state immediately before DDL.
+            target, capabilities = inspect_table(workspace, identity)
+            current_draft = SchemaEvolutionRepository(paths.database).get_draft(key)
+            if not current_draft:
+                raise SchemaStateError("DRAFT_UNAVAILABLE", "The saved DEV draft is unavailable. Reload it before applying.")
+            evidence = reviewed_state(plan, _schema_table_schema(target, identity), capabilities, SchemaDraft.from_dict(current_draft))
+            operations.update_details(operation_id, state_snapshot=evidence)
             operations.update_details(operation_id, phase="ddl", environment="dev", qualified_name=plan["target"],
                                       planned_operations=len(plan["operations"]), completed_operations=0,
                                       applied_operations=[], baseline_fingerprint=plan["baseline_fingerprint"], plan_id=plan["plan_id"])
             for index, item in enumerate(plan["operations"], start=1):
                 if (operations.get(operation_id) or {}).get("cancel_requested"):
                     raise RuntimeError("Schema Evolution was stopped between DDL commands; completed changes remain applied and must be reviewed")
-                operations.update_details(operation_id, current_operation={"kind": item["kind"], "column": item["column"], "index": index})
+                operations.update_details(operation_id, ddl_started=True, current_operation={"kind": item["kind"], "column": item["column"], "index": index})
                 operations.log(operation_id, f"Applying schema change {index} of {len(plan['operations'])}")
                 execute_ddl(workspace, warehouse_id, identity,
                             {**item, "field": item.get("field") or {}},
@@ -787,50 +865,59 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 operations.update_details(operation_id, completed_operations=len(completed), applied_operations=completed, current_operation=None)
                 operations.transition(operation_id, "running", progress=min(90, int(5 + 80 * len(completed) / max(1, len(plan["operations"])))),
                                       message=f"Applied change {len(completed)} of {len(plan['operations'])}")
-            final_detail = discover.detail(identity["node_id"], force=True)
-            final_schema = _schema_evolution_canonical(final_detail, ".".join(identity[k] for k in ("catalog", "schema", "table")))
-            verified = schemas_equivalent(plan["proposed_schema"], final_schema)
-            verification = {"state": "matching" if verified else "different"}
+            final_target, _final_caps = inspect_table(workspace, identity)
+            final_schema = _schema_table_schema(final_target, identity)
+            verified = schemas_equivalent(plan["proposed_dev_schema"], final_schema)
+            verification = {"state": "matching" if verified else "different", "actual_fingerprint": fingerprint(final_schema),
+                            "proposed_fingerprint": plan["proposed_fingerprint"],
+                            "proposed_to_current": schema_changes(plan["proposed_dev_schema"], final_schema)}
             state = "succeeded" if verified else "failed"
             message = "DEV schema changes applied and verified" if verified else "The operation completed, but the final DEV schema differs from the reviewed draft"
             operations.update_details(operation_id, phase="validate", completed_operations=len(completed), applied_operations=completed,
                                       final_schema=final_schema, validation=verification, validated=verified,
-                                      partial_completion=bool(completed) and not verified)
-            operations.transition(operation_id, state, progress=100 if verified else operations.get(operation_id)["progress"],
-                                  message=message, error_code=None if verified else "SCHEMA_VALIDATION_MISMATCH",
-                                  error_message=None if verified else message)
+                                      partial_completion=bool(completed) and not verified,
+                                      reconciliation_required=bool(completed) and not verified)
             repository = __import__("dexter.services.schema_evolution", fromlist=["SchemaEvolutionRepository"]).SchemaEvolutionRepository(paths.database)
             repository.save_plan(plan, operation_id, "succeeded" if verified else "partial")
             if verified:
                 from dexter.domain.schema_evolution import SchemaDraft
                 completed_draft = SchemaDraft.from_schema(identity, final_schema).to_dict()
                 repository.save_draft(key, identity, completed_draft)
+            operations.transition(operation_id, state, progress=100 if verified else operations.get(operation_id)["progress"],
+                                  message=message, error_code=None if verified else "SCHEMA_VALIDATION_MISMATCH",
+                                  error_message=None if verified else message)
         except Exception as exc:
             current = operations.get(operation_id)
             if current and current["state"] in {"queued", "running"}:
                 applied = (current.get("details") or {}).get("applied_operations", [])
                 uncertain = (current.get("details") or {}).get("current_operation")
                 reconciled_schema = None
-                try:
-                    current_detail = discover.detail(identity["node_id"], force=True)
-                    if current_detail and current_detail.get("columns"):
-                        reconciled_schema = _schema_evolution_canonical(current_detail, ".".join(identity[k] for k in ("catalog", "schema", "table")))
-                except Exception:
-                    pass
-                operations.update_details(operation_id, phase="reconcile", partial_completion=bool(applied) or bool(uncertain), applied_operations=applied,
+                if applied or uncertain:
+                    try:
+                        current_target, _current_caps = inspect_table(workspace, identity)
+                        reconciled_schema = _schema_table_schema(current_target, identity)
+                    except Exception:
+                        pass
+                from dexter.adapters.databricks_diagnostics import classify_failure
+                diagnosis = classify_failure(exc)
+                if isinstance(exc, HTTPException):
+                    diagnosis = exc.detail if isinstance(exc.detail, dict) else {"code": "METADATA_UNAVAILABLE", "message": str(exc.detail)}
+                failure_code = exc.code if isinstance(exc, SchemaStateError) else diagnosis["code"]
+                operations.update_details(operation_id, phase="reconcile" if applied or uncertain else "preflight", partial_completion=bool(applied) or bool(uncertain), applied_operations=applied,
                                           failure_type=type(exc).__name__, reconciled_schema=reconciled_schema,
-                                          reconciliation_required=bool(applied) or bool(uncertain))
-                friendly = str(exc) if isinstance(exc, (RuntimeError, PermissionError)) else "Databricks could not apply one of the reviewed schema changes. The current table schema was reloaded; review it before retrying."
+                                          reconciliation_required=bool(applied) or bool(uncertain),
+                                          **({"state_snapshot": exc.evidence} if isinstance(exc, SchemaStateError) else {}))
+                friendly = str(exc) if isinstance(exc, (RuntimeError, PermissionError)) else diagnosis["message"]
                 cancelled = bool((current or {}).get("cancel_requested"))
+                repository = SchemaEvolutionRepository(paths.database)
+                repository.save_plan(plan, operation_id, "partial" if applied or uncertain else "failed")
                 if cancelled and not applied and not uncertain:
                     operations.transition(operation_id, "cancelled", message="Stopped before any schema changes were applied",
                                           error_code=None, error_message=None)
                 else:
                     operations.transition(operation_id, "failed", message="Schema changes could not be fully applied",
-                                          error_code="SCHEMA_CHANGE_FAILED", error_message=friendly)
+                                          error_code=failure_code, error_message=friendly)
                 operations.log(operation_id, friendly, "error")
-                repository = __import__("dexter.services.schema_evolution", fromlist=["SchemaEvolutionRepository"]).SchemaEvolutionRepository(paths.database)
-                repository.save_plan(plan, operation_id, "partial" if applied else "failed")
 
     def _synthetic_schema_request(body: SyntheticReviewRequest):
         from dexter.catalog.unified import _variants

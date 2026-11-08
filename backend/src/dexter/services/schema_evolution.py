@@ -38,3 +38,14 @@ class SchemaEvolutionRepository:
         with transaction(self.db_path) as conn:
             row = conn.execute("SELECT plan_json FROM schema_evolution_plans WHERE plan_id=?", (plan_id,)).fetchone()
             return json.loads(row[0]) if row else None
+
+    def pending_reconciliation(self, identity: dict[str, str]) -> dict[str, Any] | None:
+        with transaction(self.db_path) as conn:
+            row = conn.execute("SELECT plan_json FROM schema_evolution_plans WHERE identity_json=? AND state='partial' ORDER BY updated_at DESC LIMIT 1",
+                               (json.dumps(identity, sort_keys=True),)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def acknowledge_reconciliation(self, identity: dict[str, str]) -> None:
+        with transaction(self.db_path) as conn:
+            conn.execute("UPDATE schema_evolution_plans SET state='reconciled',updated_at=? WHERE identity_json=? AND state='partial'",
+                         (_now(), json.dumps(identity, sort_keys=True)))

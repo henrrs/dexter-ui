@@ -6,7 +6,8 @@ import assert from 'node:assert/strict'
 export async function withBrowser(fixture, run) {
   await new Promise((resolve) => fixture.server.listen(0, '127.0.0.1', resolve))
   const appUrl = 'http://127.0.0.1:4179', driverUrl = 'http://127.0.0.1:4448'
-  const vite = spawn('npm', ['run', 'dev', '--', '--port', '4179', '--strictPort'], { env: { ...process.env, DEXTER_PORT: String(fixture.server.address().port) }, stdio: 'ignore' })
+  // Own Vite directly so cleanup cannot leave npm's child pointing to an expired fixture port.
+  const vite = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '4179', '--strictPort'], { env: { ...process.env, DEXTER_PORT: String(fixture.server.address().port) }, stdio: 'ignore' })
   let driver, sessionId
   const command = async (path, body, method = 'POST') => {
     const response = await fetch(driverUrl + path, { method, ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), signal: AbortSignal.timeout(20000) })
@@ -20,7 +21,9 @@ export async function withBrowser(fixture, run) {
   }
   try {
     try { await readyOnce(driverUrl + '/status') } catch { driver = spawn('geckodriver', ['--host', '127.0.0.1', '--port', '4448'], { stdio: 'ignore' }) }
-    await ready(appUrl); await ready(driverUrl + '/status')
+    await ready(appUrl)
+    if (vite.exitCode !== null) throw new Error(`Vite exited with status ${vite.exitCode}; the browser fixture must own its server`)
+    await ready(driverUrl + '/status')
     const session = await command('/session', { capabilities: { alwaysMatch: { browserName: 'firefox', 'moz:firefoxOptions': { args: ['-headless'] } } } })
     sessionId = session.sessionId
     const base = `/session/${sessionId}`

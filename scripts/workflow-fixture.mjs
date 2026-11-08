@@ -15,8 +15,11 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null }
-  const freshDraft = () => ({ identity, baseline: devSchema, baseline_fingerprint: 'baseline', columns: devSchema.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field, removed: false, origin: 'dev' })), version: 1 })
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null }
+  const freshDraft = () => {
+    const baseline = state.schemaPhysical ?? devSchema
+    return { identity, baseline, baseline_fingerprint: 'baseline', columns: baseline.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field, removed: false, origin: 'dev' })), version: 1 }
+  }
   state.draft = freshDraft()
   const operation = (kind) => ({ id: `operation-${kind}`, kind, state: 'running', progress: 10, message: 'Executing simulated DEV operation', details: { node_id: identity.node_id, phase: 'generation_upload', source: { qualified_name: prodSchema.qualified_name }, synthetic_run_id: 'fixture-run' }, error_message: null })
   const server = createServer(async (req, res) => {
@@ -39,7 +42,19 @@ export function workflowFixture() {
     if (path.endsWith('/logs')) return send({ items: [] })
     if (path.startsWith('/api/operations/')) {
       const next = clone(state.currentOperation ?? operation('synthetic-data'))
+      if (next.kind === 'schema-evolution' && state.schemaPreflightFailure) {
+        if (++state.polls > 1) {
+          next.state = 'failed'; next.error_code = 'connection_unavailable'; next.error_message = 'Connection unavailable. Retry without resetting your draft.'
+          next.details = { ...next.details, ddl_started: false, completed_operations: 0, reconciliation_required: false }
+        }
+        return send(next)
+      }
       if (++state.polls > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000 }
+      if (next.kind === 'schema-evolution' && next.state === 'succeeded') {
+        state.schemaPhysical = { ...devSchema, fields: clone(state.draft.columns.filter(item => !item.removed).map(item => item.field)) }
+        state.draft = freshDraft()
+        next.details.validated = true; next.details.ddl_started = true
+      }
       return send(next)
     }
     if (path === '/api/local-datasets') return send({ items: [] })
@@ -50,7 +65,7 @@ export function workflowFixture() {
       { name: 'id', status: 'matching', prod: prodSchema.fields[0], dev: devSchema.fields[1], changes: [] },
       { name: 'prod_note', status: 'prod_only', prod: prodSchema.fields[1], dev: null, changes: [] },
       { name: 'dev_note', status: 'dev_only', prod: null, dev: devSchema.fields[0], changes: [] },
-    ], summary: { matching: 1, prod_only: 1, dev_only: 1 }, prod_schema: prodSchema, dev_schema: devSchema,
+    ], summary: { matching: 1, prod_only: 1, dev_only: 1 }, prod_schema: state.schemaExtraProd ? { ...prodSchema, fields: [...prodSchema.fields, field('prod_amount', 'DECIMAL(18,2)')] } : prodSchema, dev_schema: devSchema,
       sides: { prod: { environment: 'prod', state: 'available', qualified_name: prodSchema.qualified_name, access: 'read' }, dev: { environment: 'dev', state: 'available', qualified_name: devSchema.qualified_name, access: 'read' } }, read_only: true, compute_started: false })
     if (path.startsWith('/api/discover/')) {
       const env = url.searchParams.get('environment') ?? 'dev', selected = env === 'prod' ? prodSchema : devSchema
@@ -59,11 +74,13 @@ export function workflowFixture() {
     if (path === '/api/schema-evolution/context' || path === '/api/schema-evolution/reset') {
       if (fail()) return
       if (path.endsWith('/reset')) state.draft = freshDraft()
-      return send({ identity, schema: devSchema, draft: state.draft, draft_key: 'fixture-key', drift: false })
+      return send({ identity, schema: state.schemaPhysical ?? devSchema, draft: state.draft, draft_key: 'fixture-key', drift: false })
     }
     if (path === '/api/schema-evolution/draft') {
       if (body.node_id !== identity.node_id) return send({ error: { message: 'Draft save requires physical DEV node_id' } }, 403)
-      state.draft = clone(body.draft); return send({ draft: state.draft, drift: false })
+      state.draft = clone(body.draft)
+      if (state.schemaNormalizeTransport) for (const column of state.draft.columns) column.field.technology_properties = { position: 99, comment: '', ...column.field.technology_properties }
+      return send({ draft: state.draft, drift: false })
     }
     if (path === '/api/schema-evolution/review') {
       if (fail()) return
@@ -72,7 +89,7 @@ export function workflowFixture() {
       return send({ plan_id: 'a'.repeat(64), identity, target: devSchema.qualified_name, baseline_fingerprint: 'baseline', proposed_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, operations, blockers: [], risks: [], can_apply: operations.length > 0, drift: false, compatibility: 'Compatible', confirmation_required: false, sql_statements: operations.map((item) => `ALTER TABLE tech_dev.gold.ledger ADD COLUMNS (${item.column} STRING)`) })
     }
     if (path === '/api/schema-evolution/apply') { state.currentOperation = operation('schema-evolution'); state.polls = 0; return send(state.currentOperation, 202) }
-    if (path === '/api/schema-evolution/validate') return send({ state: 'validated', schema: devSchema, assessment: { message: 'Simulated schema validated' } })
+    if (path === '/api/schema-evolution/validate') return send({ state: 'validated', schema: state.schemaPhysical ?? devSchema, assessment: { message: 'Simulated schema validated' } })
     if (path === '/api/synthetic/generators') return send({ items: [
       { id: 'sequence', types: ['BIGINT', 'INT'], provider: 'duckdb', unique: true }, { id: 'random_string', types: ['STRING'], provider: 'duckdb', unique: false },
     ] })

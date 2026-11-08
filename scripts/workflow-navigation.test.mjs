@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { withBrowser } from './browser-harness.mjs'
-import { workflowFixture } from './workflow-fixture.mjs'
+import { devSchema, workflowFixture } from './workflow-fixture.mjs'
 
 test('F4 workflows: real Firefox journeys with controlled remote responses', { timeout: 240000 }, async (t) => {
   const fixture = workflowFixture(), results = []
@@ -63,6 +63,46 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await wait(`return document.querySelector(arguments[0])?.textContent.includes('SCHEMA-EVOLUTION') || document.querySelector(arguments[0])?.textContent.includes('Schema Evolution · RUNNING') || document.querySelector(arguments[0])?.textContent.includes('DEV schema validated')`, evolution)
         assert.ok(fixture.state.requests.filter((request) => request.path === '/api/schema-evolution/draft').every((request) => request.body.node_id === 'databricks:dev:tech_dev:gold:ledger'))
         results.push({ journey: 'A', result: 'passed', evidence: 'schema-editor-origins, schema-review' })
+      })
+      await t.test('A2: blocked Apply preserves two PROD additions, manual origin, baseline and retry through both entry points', async () => {
+        const identity = fixture.state.draft.identity
+        fixture.state.schemaPhysical = null
+        fixture.state.draft = { identity, baseline: structuredClone(devSchema), baseline_fingerprint: 'baseline', version: 1,
+          columns: devSchema.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field: structuredClone(field), removed: false, origin: 'dev' })) }
+        fixture.state.schemaExtraProd = true; fixture.state.schemaNormalizeTransport = true
+        await openTable(); await card('Compare Tables'); await clickText('Edit DEV Schema')
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-add')`, evolution)
+        await clickText('Add Missing PROD Columns', evolution)
+        await set(`${evolution} .schema-evolution-add input[placeholder="column_name"]`, 'manual_retry'); await clickText('Add Column', evolution)
+        const originalDraft = await execute(`return [...document.querySelectorAll(arguments[0] + ' tr[data-origin]')].map(row => ({ origin: row.dataset.origin, name: row.querySelector('input').value, label: row.querySelector('.schema-draft-label').textContent }))`, evolution)
+        assert.equal(originalDraft.filter(row => row.label === 'Added from PROD').length, 2)
+        assert.equal(originalDraft.filter(row => row.label === 'Added manually').length, 1)
+        await clickText('Review Changes', `${evolution} footer`)
+        await wait(`return document.querySelector(arguments[0] + ' .schema-evolution-summary')?.textContent.includes('3 changes')`, evolution)
+        assert.equal(await execute(`return document.querySelector(arguments[0]).textContent.toLowerCase().includes('connection details')`, evolution), false)
+        const validationsBefore = fixture.state.requests.filter(item => item.path === '/api/schema-evolution/validate').length
+        fixture.state.schemaPreflightFailure = true
+        await set(`${evolution} .schema-evolution-warehouse select`, 'wh-stopped'); await clickText('Apply Changes', `${evolution} footer`)
+        await wait(`return document.querySelector(arguments[0]).textContent.includes('No schema changes were applied.') && !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution)
+        assert.equal(fixture.state.requests.filter(item => item.path === '/api/schema-evolution/validate').length, validationsBefore)
+        assert.equal(await execute(`return document.querySelector(arguments[0]).textContent.includes('differs from the reviewed draft')`, evolution), false)
+        await clickText('Edit Schema', `${evolution} footer`)
+        assert.deepEqual(await execute(`return [...document.querySelectorAll(arguments[0] + ' tr[data-origin]')].map(row => ({ origin: row.dataset.origin, name: row.querySelector('input').value, label: row.querySelector('.schema-draft-label').textContent }))`, evolution), originalDraft)
+        await screenshot('schema-blocked-apply-preserved-origins')
+        await clickText('ledger', '.workbench-tabs'); await clickText('Schema · ledger', '.workbench-tabs')
+        await wait(`return !!document.querySelector(arguments[0] + ' input[aria-label="Column name manual_retry"]')`, evolution)
+        await click('button[aria-label="Close Schema · ledger"]'); await clickText('ledger', '.workbench-tabs'); await card('Edit Schema')
+        await wait(`return document.querySelectorAll(arguments[0] + ' tr[data-origin="prod"]').length === 2`, evolution)
+        assert.equal(await execute(`return [...document.querySelectorAll(arguments[0] + ' tr[data-origin="dev"] .schema-draft-label')].every(label => label.textContent === 'Original DEV')`, evolution), true)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' tr[data-origin="manual"] .schema-draft-label').textContent`, evolution), 'Added manually')
+        fixture.state.schemaPreflightFailure = false
+        await clickText('Review Changes', `${evolution} footer`); await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution)
+        await set(`${evolution} .schema-evolution-warehouse select`, 'wh-stopped'); await clickText('Apply Changes', `${evolution} footer`)
+        await wait(`return document.querySelector(arguments[0]).textContent.includes('DEV schema validated')`, evolution)
+        await screenshot('schema-apply-retry-validated')
+        assert.ok(fixture.state.requests.filter(item => item.path === '/api/schema-evolution/apply').slice(-2).every(item => item.body.node_id === identity.node_id))
+        fixture.state.schemaExtraProd = false; fixture.state.schemaNormalizeTransport = false
+        results.push({ journey: 'A2', result: 'passed', evidence: 'schema-blocked-apply-preserved-origins, schema-apply-retry-validated; no post-failure draft validation before DDL' })
       })
       await t.test('B: existing DEV, all strategies, effective schema, preview, review, execution and preserved tabs', async () => {
         await openSynthetic(); await capture('synthetic-01-destination')

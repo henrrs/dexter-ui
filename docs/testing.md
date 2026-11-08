@@ -132,3 +132,13 @@ Validation on 2026-11-08 uses a real Firefox frontend plus controlled local HTTP
 `npm run test:ui` covers the five requested journeys: Schema Evolution from Compare and Workbench, existing DEV publication, isolated creation with both schema bases/storage options, classified remote failures and recovery, and the five-stage layout at FHD/4K. Additional assertions cover stale responses, in-flight draft edits, canceled review navigation, preview invalidation, timeout recovery and post-review drift. `node --test scripts/ui-contract.test.mjs`, production build, Python compilation and whitespace checks pass.
 
 The [stabilization report](workflow-stabilization.md) records root causes, corrections, evidence paths and the live Databricks certification boundary. Browser screenshots and results are generated under `.run/workflow-evidence/`; they are not committed.
+
+## F4.3 targeted schema state / Review / Apply correction
+
+Validation on 2026-11-08:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — 162 tests passed. The added domain/API/worker cases cover planned additions without drift, real concurrent `F`, drift during Warehouse startup, unavailable vs changed capabilities, storage path/boolean normalization, independent snapshots and legacy draft fingerprints, precision/scale/complex types, partition/mask guards, pre-DDL failure/retry and origins, successful remote-schema reread, partial execution and a DROP whose successful response is lost.
+- `npm run test:ui` — seven tests passed in real headless Firefox with local HTTP fixtures. Added journey A2 checks two imported PROD columns plus a manual column, blocked Apply without a false validation screen, restored origins after return/reopen, both Workbench/Compare entry points, unchanged physical identity across tabs, retry and Validate. Existing Synthetic Studio journeys remain regression coverage; its product component was not modified.
+- `node --test scripts/ui-contract.test.mjs` — ten contracts passed. `npm run build`, Python compilation and `git diff --check` passed.
+- Safe structured state evidence is generated at `.run/schema-evolution-evidence/state-snapshots.json`; browser evidence lives in `.run/workflow-evidence/`. The workflow browser harness owns Vite directly so repeated runs cannot reuse a process connected to an expired fixture server.
+- Tests use disposable local DEV metadata/SQL fixtures. No real Databricks DDL or shared-table mutation was performed; live grants/runtime/ADD COLUMN certification remains external. See the [targeted correction report](schema-evolution-state-fix.md).

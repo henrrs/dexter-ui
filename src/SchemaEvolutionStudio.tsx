@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Check, CircleAlert, LoaderCircle, Plus, RotateCcw } from 'lucide-react'
-import { api } from './api'
+import { api, ApiError } from './api'
 import type { CanonicalSchema, DiscoverNode, SchemaChangePlan, SchemaDraft, SchemaDraftColumn, SchemaEvolutionContext, SchemaValidation } from './api'
 import type { Operation } from './types'
 import { DatabricksTypeSelector, SchemaFieldEditor } from './SchemaFieldEditor'
@@ -8,6 +8,15 @@ import { DatabricksTypeSelector, SchemaFieldEditor } from './SchemaFieldEditor'
 type Props = { active?: boolean; node: DiscoverNode; referenceSchema?: CanonicalSchema | null; onValidated?: () => void; onCompare?: () => void }
 type Stage = 'edit' | 'review' | 'apply' | 'validate'
 const stages: Array<{ id: Stage; label: string }> = [{ id: 'edit', label: 'Edit Schema' }, { id: 'review', label: 'Review Changes' }, { id: 'apply', label: 'Apply Changes' }, { id: 'validate', label: 'Validate' }]
+
+// Compare edit semantics independently of API property order, positions and optional empty comments.
+function fieldSignature(field: SchemaDraftColumn['field']) {
+  const type = field.original_type.toLowerCase().replace(/\s+/g, '').replace(/\b(int|long|byte|real|numeric)\b/g,
+    (alias) => ({ int: 'integer', long: 'bigint', byte: 'tinyint', real: 'float', numeric: 'decimal' })[alias]!)
+  return JSON.stringify([field.name, type, field.nullable, [...field.constraints].sort(),
+    ...['comment', 'default_value', 'generated_expression', 'identity_field', 'mask'].map((key) => key === 'comment'
+      ? field.technology_properties[key] || null : field.technology_properties[key] ?? null)])
+}
 
 export function SchemaEvolutionStudio({ active = true, node, referenceSchema: providedReference, onValidated, onCompare }: Props) {
   const physicalNodeId = node.variants?.find((item) => item.environment === 'dev')?.node_id ?? node.id
@@ -38,6 +47,7 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
   const [newType, setNewType] = useState('STRING')
   const saveQueue = useRef<Promise<void>>(Promise.resolve())
   const saveTimer = useRef<number | null>(null)
+  const validationRequest = useRef(0)
 
   useEffect(() => {
     let active = true
@@ -108,7 +118,14 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
         setPollError('')
         setOperation(next)
         if (['succeeded', 'failed', 'interrupted', 'cancelled'].includes(next.state)) {
-          if (next.state === 'succeeded' || next.state === 'failed' || next.state === 'interrupted') { setStage('validate'); await runValidation() }
+          if (next.state === 'succeeded' || next.details?.ddl_started === true || next.details?.reconciliation_required === true) {
+            setStage('validate'); await runValidation(next)
+          } else {
+            setStage('review')
+            setNotice('No schema changes were applied. Your draft and column origins are preserved; retry when verification is available.')
+            setError(next.error_message ?? '')
+            if (next.error_code === 'SCHEMA_DRIFT') setContext((value) => value ? { ...value, drift: true } : value)
+          }
         }
       } catch (cause) { if (active) setPollError(cause instanceof Error ? cause.message : 'Operation status is temporarily unavailable. The saved operation is preserved.') }
       finally { polling = false }
@@ -126,12 +143,13 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
       if (column.removed) return column.original_name !== null
       if (column.original_name === null) return true
       const original = baseline.get(column.original_name.toLowerCase())
-      return !original || JSON.stringify(column.field) !== JSON.stringify(original)
+      return !original || fieldSignature(column.field) !== fieldSignature(original)
     }).length
   }, [draft])
 
   const save = async (next: SchemaDraft) => {
     if (!context) return
+    validationRequest.current += 1
     setHistory((items) => [...items.slice(-19), draft ?? next])
     setDraft(next); setPlan(null); setValidation(null); setError(''); setNotice('')
   }
@@ -170,6 +188,19 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Reset failed. Your draft is preserved.') }
     finally { setBusy(false) }
   }
+  const reconcile = async () => {
+    if (!context) return
+    setBusy(true); setError('')
+    validationRequest.current += 1
+    try {
+      if (saveTimer.current !== null) { window.clearTimeout(saveTimer.current); saveTimer.current = null }
+      await saveQueue.current.catch(() => undefined)
+      const fresh = await api.reconcileSchema(context.identity.node_id)
+      setContext(fresh); setDraft(fresh.draft); setPlan(null); setValidation(null); setOperation(null); setHistory([]); setStage('edit')
+      setNotice('The current physical DEV schema is now the baseline. Your remaining edits and column origins are preserved; review the new plan before applying.')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'The physical schema could not be reconciled. Your draft is preserved.') }
+    finally { setBusy(false) }
+  }
   const undo = async () => {
     const prior = history.at(-1)
     if (!prior) return
@@ -190,9 +221,10 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
         saveQueue.current = saveQueue.current.catch(() => undefined).then(() => api.saveSchemaDraft(context.identity.node_id, context.identity, draft)).then(() => undefined)
         await saveQueue.current
       }
-      const next = await api.reviewSchema(node.id)
+      const next = await api.reviewSchema(context?.identity.node_id ?? physicalNodeId, referenceSchema)
       if (JSON.stringify(draftRef.current) !== snapshot) { setError('The draft changed during review. Review the current edits again.'); return }
       setPlan(next); setStage('review'); setConfirmDrop(false)
+      if (next.drift) setContext((value) => value ? { ...value, drift: true } : value)
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Schema changes could not be reviewed.') }
     finally { setBusy(false) }
   }
@@ -203,13 +235,32 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
     if (plan.confirmation_required && !confirmDrop) { setError('Confirm the listed column deletion before applying.'); return }
     setBusy(true); setError('')
     try {
-      const started = await api.applySchema(node.id, plan.plan_id, warehouseId, confirmDrop)
+      const started = await api.applySchema(context?.identity.node_id ?? physicalNodeId, plan.plan_id, warehouseId, confirmDrop)
       setOperation(started); setStage('apply'); setNotice('Schema changes are running in DEV. Each completed change is recorded and the final schema will be checked.')
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Schema changes could not be started.') }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Schema changes could not be started.')
+      if (cause instanceof ApiError && cause.code === 'SCHEMA_DRIFT') setContext((value) => value ? { ...value, drift: true } : value)
+      if (cause instanceof ApiError && cause.code === 'RECONCILIATION_REQUIRED') setContext((value) => value ? { ...value, reconciliation_required: true } : value)
+    }
     finally { setBusy(false) }
   }
-  async function runValidation() {
-    try { const result = await api.validateSchema(node.id); setValidation(result); onValidated?.(); const fresh = await api.schemaEvolutionContext(node.id); setContext(fresh); setDraft(fresh.draft) }
+  async function runValidation(currentOperation: Operation | null = operation) {
+    const request = ++validationRequest.current
+    const snapshot = JSON.stringify(draftRef.current)
+    try {
+      const result = await api.validateSchema(context?.identity.node_id ?? physicalNodeId)
+      if (request !== validationRequest.current || snapshot !== JSON.stringify(draftRef.current)) return
+      setValidation(result)
+      // A blocked or partial execution never replaces the draft with observed physical fields.
+      if (currentOperation?.state === 'succeeded' && currentOperation.details?.validated === true) {
+        const fresh = await api.schemaEvolutionContext(context?.identity.node_id ?? physicalNodeId)
+        if (request !== validationRequest.current || snapshot !== JSON.stringify(draftRef.current)) return
+        setContext(fresh); setDraft(fresh.draft); setHistory([]); setNotice('DEV schema changes applied and verified.'); onValidated?.()
+      } else if (result.reconciliation_required) {
+        setContext((value) => value ? { ...value, reconciliation_required: true } : value)
+        setNotice('Some DEV changes may already exist. Reconcile the physical schema before reviewing the remaining edits.')
+      }
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'The final schema could not be validated.') }
   }
 
@@ -225,7 +276,7 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
     <nav className="schema-evolution-steps" aria-label="Schema change stages">{stages.map((item, index) => <button type="button" key={item.id} className={stage === item.id ? 'active' : stageIndex > index ? 'complete' : ''} onClick={() => goStage(item.id)} disabled={busy || (item.id === 'apply' && !operation && !plan) || (item.id === 'validate' && !['succeeded', 'failed', 'interrupted'].includes(operation?.state ?? '')) || (['queued', 'running'].includes(operation?.state ?? '') && item.id !== 'apply')}><span>{stageIndex > index ? <Check size={13} /> : index + 1}</span>{item.label}</button>)}</nav>
     {notice && <div className="compare-message" role="status">{notice}</div>}{error && <div className="compare-message error" role="alert"><CircleAlert size={14} />{error}{stage === 'review' && <button className="button secondary small" disabled={busy} onClick={() => void review()}>Retry review</button>}</div>}
     {pollError && <div className="compare-message warning" role="alert">{pollError}<button className="button secondary small" onClick={() => setPollRetry((value) => value + 1)}>Retry operation status</button></div>}
-    {context.drift && <div className="compare-message warning" role="alert">DEV schema changed after this draft was saved. Your edits are preserved; reset to the current schema before reviewing.</div>}
+    {(context.drift || context.reconciliation_required) && <div className="compare-message warning" role="alert">{context.reconciliation_required ? 'Some DEV changes may already exist. Reconcile the physical schema before reviewing remaining edits.' : 'The physical DEV schema changed after this draft was saved. Your edits are preserved.'}<button className="button secondary small" disabled={busy} onClick={() => void reconcile()}>Reconcile DEV schema</button></div>}
     {stage === 'edit' && <>
       <div className="schema-evolution-toolbar"><strong>{draft.baseline.fields.length} original columns · {changedCount} draft changes</strong><div>{referenceSchema && <button className="button secondary small" onClick={() => {
         let restored = 0
@@ -247,7 +298,7 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
         const differs = Boolean(referenceSchema && (!prod || prod.canonical_type !== field.canonical_type || prod.precision !== field.precision || prod.scale !== field.scale || prod.nullable !== field.nullable))
         const referenceStatus = !referenceSchema ? null : !prod ? 'DEV-only' : differs ? 'Differs from PROD' : 'Matches PROD'
         const original = draft.baseline.fields.find((item) => item.name === column.original_name)
-        const modified = Boolean(original && JSON.stringify(original) !== JSON.stringify(field))
+        const modified = Boolean(original && fieldSignature(original) !== fieldSignature(field))
         const status = column.original_name !== null && column.original_name !== field.name ? `Renamed from ${column.original_name}` : referenceStatus ?? undefined
         return <SchemaFieldEditor key={column.column_id} mode="evolution" field={field} status={status} origin={column.origin ?? (column.original_name === null ? 'manual' : 'dev')} modified={modified} removed={removed} complex={complex}
           onChange={(change) => updateOperationField(column, change.comment !== undefined
@@ -268,11 +319,10 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
       {plan.confirmation_required && <label className="schema-evolution-confirm"><input type="checkbox" checked={confirmDrop} onChange={(event) => setConfirmDrop(event.target.checked)} /> I understand that dropping the selected column can break downstream consumers.</label>}
       {warehouseError && <div className="compare-message warning" role="alert">{warehouseError}<button className="button secondary small" onClick={() => void api.warehouses(context.identity.node_id, 'dev').then((result) => { setWarehouses(result.items); setWarehouseError('') }).catch((cause) => setWarehouseError(cause.message))}>Retry warehouses</button></div>}
       <label className="schema-evolution-warehouse">DEV SQL Warehouse<select value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}><option value="">Select a warehouse</option>{warehouses.map((warehouse) => <option key={warehouse.id} value={warehouse.id}>{warehouse.name} · {warehouse.state}</option>)}</select></label>
-      <details className="schema-evolution-technical"><summary>Connection details</summary><code>{context.identity.workspace} · {context.identity.profile}</code></details>
       {!warehouseId && plan.can_apply && <p className="workflow-field-hint">Choose a DEV SQL warehouse to apply. A stopped warehouse will start when the operation runs.</p>}
       <footer className="schema-evolution-footer"><button className="button secondary" disabled={busy} onClick={() => setStage('edit')}><ArrowLeft size={14} /> Edit Schema</button><button className="button primary" onClick={() => void apply()} disabled={!plan.can_apply || busy || !warehouseId || (plan.confirmation_required && !confirmDrop)}>{busy ? <><LoaderCircle size={14} className="spin" /> Processing…</> : 'Apply Changes'} <ArrowRight size={14} /></button></footer>
     </>}
     {stage === 'apply' && <div className="schema-evolution-run"><h3>{operation ? `Schema Evolution · ${operation.state.toUpperCase()}` : 'Ready to apply'}</h3>{operation ? <><p>{operation.message}</p><div className="operation-progress-track"><span style={{ width: `${operation.progress}%` }} /></div><p>{Number(operation.details?.completed_operations ?? 0)} of {Number(operation.details?.planned_operations ?? plan?.operations.length ?? 0)} changes completed</p>{Boolean(operation.details?.partial_completion) && <div className="compare-message warning">Some changes were applied before the operation stopped. Review the current DEV schema before retrying.</div>}</> : <p>Review the draft before applying it.</p>}<div className="schema-evolution-footer"><button className="button secondary" onClick={() => setStage('review')} disabled={Boolean(operation && ['queued', 'running'].includes(operation.state))}>Back to Review</button>{operation && ['queued', 'running'].includes(operation.state) && <button className="button secondary" onClick={() => void api.cancelOperation(operation.id).then(setOperation).catch((cause) => setError(cause instanceof Error ? cause.message : 'The operation could not be stopped.'))}>Stop after current change</button>}{operation?.state === 'succeeded' && <button className="button primary" onClick={() => { setStage('validate'); void runValidation() }}>Validate <ArrowRight size={14} /></button>}</div></div>}
-    {stage === 'validate' && <div className="schema-evolution-run"><h3>{validation?.state === 'validated' ? 'DEV schema validated' : validation?.state === 'different' ? 'DEV schema differs from the reviewed draft' : 'Validation'}</h3>{validation?.assessment?.message && <p>{validation.assessment.message}</p>}{operation?.details?.validated === true && <p>The table now matches the reviewed schema.</p>}{operation && operation.state !== 'succeeded' && <p>Operation state: {operation.state}. {operation.error_message}</p>}<div className="schema-evolution-footer"><button className="button secondary" onClick={() => setStage('edit')}><ArrowLeft size={14} /> Back to Workbench</button>{validation?.state === 'validated' && onCompare && <button className="button secondary" onClick={onCompare}>Compare DEV × PROD</button>}<button className="button secondary" onClick={() => void runValidation()}>Refresh Validation</button></div></div>}
+    {stage === 'validate' && <div className="schema-evolution-run"><h3>{validation?.state === 'validated' ? 'DEV schema validated' : validation?.reconciliation_required ? 'DEV changes require reconciliation' : validation?.baseline_unchanged ? 'No physical schema changes detected' : validation?.state === 'different' ? 'DEV schema requires review' : 'Validation'}</h3>{validation?.assessment?.message && <p>{validation.assessment.message}</p>}{operation?.details?.validated === true && <p>The table now matches the reviewed schema.</p>}{operation && operation.state !== 'succeeded' && <p>Operation state: {operation.state}. {operation.error_message}</p>}<div className="schema-evolution-footer"><button className="button secondary" onClick={() => setStage('edit')}><ArrowLeft size={14} /> Back to Workbench</button>{validation?.state === 'validated' && onCompare && <button className="button secondary" onClick={onCompare}>Compare DEV × PROD</button>}<button className="button secondary" onClick={() => void runValidation()}>Refresh Validation</button></div></div>}
   </section>
 }

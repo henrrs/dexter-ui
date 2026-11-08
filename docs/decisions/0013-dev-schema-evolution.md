@@ -24,6 +24,14 @@ The UX can propose edits offline after opening real DEV metadata and stores the 
 
 The relevant Databricks behavior is documented in the primary sources: [column mapping for rename/drop](https://docs.databricks.com/aws/en/tables/features/column-mapping), [ALTER COLUMN syntax and type support](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-syntax-ddl-alter-table-manage-column), [NOT NULL constraints](https://docs.databricks.com/aws/en/tables/constraints), and [Delta type widening](https://docs.databricks.com/aws/en/tables/features/type-widening).
 
+## Review/Apply state contract correction
+
+The version 2 plan persists independent `physical_dev_baseline`, `proposed_dev_schema`, and advisory `reference_prod_schema` snapshots. Before DDL, the executor compares fresh physical DEV metadata to the reviewed physical baseline, then verifies the unchanged draft and only the capabilities required by its operations. The schema/capabilities observation comes from one fresh Unity Catalog table read. Schema semantics retain type aliases/precision/scale, identifiers, nullability, complex type ordering, constraints, defaults, generated/identity/mask metadata, partition indices and comments; top-level field order, transport positions and optional empty comments are normalized. Connection data, storage path representation and Warehouse state are excluded from capability fingerprints. Required unknown capability metadata blocks as unavailable, distinct from a confirmed change. Column mapping, widening, feature and NOT NULL protocol guards remain enforced.
+
+The original false capability drift was caused by hashing the whole capability payload: Review replaced `storage_location` with a boolean while the worker hashed its original path. A failed pre-DDL attempt also triggered proposed-vs-physical validation in the UI, incorrectly presenting pending changes as execution mismatch. Pre-DDL failure now leaves baseline, desired edits and origins intact, with retry available. Plans using the old fingerprint contract require fresh Review; existing drafts migrate fingerprints without replacing metadata or origins.
+
+After a completed or uncertain DDL, `/api/schema-evolution/reconcile` explicitly observes DEV and rebases remaining edits while preserving their provenance. Apply and Review remain blocked until reconciliation (or an explicit draft reset). The previous plan retains its original snapshots. A missing result from DROP/RENAME is never treated as proof of rollback or retried blindly. Schema Evolution still has per-process target serialization; it does not claim distributed DDL transactions or a lock against unrelated Databricks clients.
+
 ## Rejected alternatives
 
 - Recreate the table to simulate a rename or drop: rejected because it changes storage behavior and expands the destructive scope.

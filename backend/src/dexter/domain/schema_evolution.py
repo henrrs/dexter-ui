@@ -4,34 +4,111 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from dexter.domain.schema import canonical_field, compare_schemas
 
 
-def fingerprint(schema: dict[str, Any]) -> str:
-    payload = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _digest(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _constraints(values: Any) -> list[Any]:
+    return sorted(values or [], key=lambda value: json.dumps(value, sort_keys=True))
+
+
+def field_semantics(value: dict[str, Any]) -> dict[str, Any]:
+    """DDL semantics, independent of transport, original aliases and display metadata."""
+    field = asdict(canonical_field({"name": value.get("name"),
+        "type_text": value.get("original_type") or value.get("canonical_type"),
+        "nullable": value.get("nullable"), "precision": value.get("precision"), "scale": value.get("scale")}))
+    properties = value.get("technology_properties") or {}
+    return {"name": field["name"].casefold(), "type": field["canonical_type"],
+            "precision": field["precision"] if field["canonical_type"] == "decimal" else None,
+            "scale": field["scale"] if field["canonical_type"] == "decimal" else None, "nullable": field["nullable"],
+            "constraints": _constraints(value.get("constraints")),
+            # Child order within STRUCT is meaningful, unlike the top-level metadata list order.
+            "children": [field_semantics(child) for child in value.get("children") or []],
+            "properties": {key: (None if properties.get(key) in (None, "") else properties[key]) for key in
+                ("comment", "default_value", "generated_expression", "identity_field", "mask", "partition_index")}}
+
+
+def schema_semantics(schema: dict[str, Any]) -> dict[str, Any]:
+    return {"complete": bool(schema.get("complete")), "constraints": _constraints(schema.get("constraints")),
+            "fields": sorted((field_semantics(item) for item in schema.get("fields", [])), key=lambda item: item["name"])}
+
+
+def fingerprint(schema: dict[str, Any]) -> str:
+    return _digest(schema_semantics(schema))
+
+
 def schemas_equivalent(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
-    if not expected.get("complete") or not actual.get("complete"):
-        return False
-    left = {str(item.get("name", "")).casefold(): item for item in expected.get("fields", [])}
-    right = {str(item.get("name", "")).casefold(): item for item in actual.get("fields", [])}
-    if left.keys() != right.keys() or tuple(expected.get("constraints") or ()) != tuple(actual.get("constraints") or ()):
-        return False
-    for key in left:
-        a, b = left[key], right[key]
-        if (a.get("canonical_type"), a.get("precision"), a.get("scale"), a.get("nullable"),
-            tuple(a.get("constraints") or ())) != (b.get("canonical_type"), b.get("precision"), b.get("scale"),
-            b.get("nullable"), tuple(b.get("constraints") or ())):
-            return False
-        ac = (a.get("technology_properties") or {}).get("comment")
-        bc = (b.get("technology_properties") or {}).get("comment")
-        if (ac or None) != (bc or None): return False
-    return True
+    return bool(expected.get("complete") and actual.get("complete") and fingerprint(expected) == fingerprint(actual))
+
+
+def schema_changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Diagnostic names and changed properties only; never log comments or provider payloads."""
+    left = {item["name"]: item for item in schema_semantics(before)["fields"]}
+    right = {item["name"]: item for item in schema_semantics(after)["fields"]}
+    return {"added": sorted(right.keys() - left.keys()), "removed": sorted(left.keys() - right.keys()),
+            "modified": [{"name": name, "properties": sorted(key for key in left[name] if left[name][key] != right[name][key])}
+                         for name in sorted(left.keys() & right.keys()) if left[name] != right[name]],
+            "constraints_changed": _constraints(before.get("constraints")) != _constraints(after.get("constraints"))}
+
+
+def required_capabilities(operations: list[dict[str, Any]], capabilities: dict[str, Any]) -> dict[str, Any]:
+    keys = {"delta", "table_type", "table_id"}
+    kinds = {item["kind"] for item in operations}
+    if kinds & {"drop", "rename", "type", "nullability"}:
+        keys.update({"partition_columns", "has_table_constraints", "row_filter", "has_column_masks"})
+    if kinds & {"drop", "rename"}: keys.add("column_mapping")
+    if "type" in kinds: keys.add("type_widening")
+    for item in operations:
+        if item["kind"] in {"add", "type"} and (feature := _required_feature(str(item["field"].get("original_type", "")))):
+            keys.add(feature[0])
+    result = {key: deepcopy(capabilities.get(key)) for key in sorted(keys)}
+    if result.get("partition_columns") is not None:
+        result["partition_columns"] = sorted(str(name).casefold() for name in result["partition_columns"])
+    return result
+
+
+class SchemaStateError(RuntimeError):
+    def __init__(self, code: str, message: str, evidence: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code, self.evidence = code, evidence or {}
+
+
+def reviewed_state(plan: dict[str, Any], current: dict[str, Any], capabilities: dict[str, Any], draft: "SchemaDraft") -> dict[str, Any]:
+    if plan.get("contract_version") != 2:
+        raise SchemaStateError("REVIEW_REQUIRED", "Review this saved draft again to use the current schema validation contract.")
+    baseline, proposed = plan["physical_dev_baseline"], plan["proposed_dev_schema"]
+    observed = required_capabilities(plan["operations"], capabilities)
+    evidence = {"identity": {key: plan["identity"][key] for key in ("node_id", "environment", "table_id")},
+        "plan_id": plan["plan_id"], "baseline_fingerprint": fingerprint(baseline),
+        "draft_fingerprint": fingerprint(proposed), "current_fingerprint": fingerprint(current),
+        "capability_fingerprint": _digest(observed), "reviewed_capability_fingerprint": plan["capability_fingerprint"],
+        "baseline_to_current": schema_changes(baseline, current), "baseline_to_draft": schema_changes(baseline, proposed)}
+    if not current.get("complete"):
+        raise SchemaStateError("METADATA_UNAVAILABLE", "The complete physical DEV schema could not be verified. Retry without resetting your draft.", evidence)
+    if not schemas_equivalent(baseline, current):
+        changes = evidence["baseline_to_current"]
+        details = [f"{label}: {', '.join(names)}" for label, names in
+                   (("added", changes["added"]), ("removed", changes["removed"]),
+                    ("modified", [item["name"] for item in changes["modified"]])) if names]
+        if changes["constraints_changed"]: details.append("table constraints changed")
+        raise SchemaStateError("SCHEMA_DRIFT", "The physical DEV schema changed after review (" + "; ".join(details) + "). Your draft is preserved; reconcile the current schema before reviewing again.", evidence)
+    unknown = [key for key, value in observed.items() if value is None or (key == "table_id" and not value)]
+    if unknown:
+        raise SchemaStateError("CAPABILITIES_UNAVAILABLE", "Required DEV capabilities could not be verified: " + ", ".join(unknown) + ". Retry without resetting your draft.", evidence)
+    changed = [key for key in observed if observed[key] != plan["required_capabilities"].get(key)]
+    if changed:
+        raise SchemaStateError("CAPABILITY_DRIFT", "Required DEV table capabilities changed after review: " + ", ".join(changed) + ". Review the current changes again.", evidence)
+    if draft.identity != plan["identity"] or fingerprint(draft.baseline) != fingerprint(baseline) or fingerprint(draft.proposed_schema()) != fingerprint(proposed):
+        raise SchemaStateError("DRAFT_CHANGED", "The draft changed after review. Review the current edits again.", evidence)
+    return evidence
 
 
 def validate_identifier(value: str) -> str:
@@ -137,13 +214,13 @@ class SchemaDraft:
     @classmethod
     def from_schema(cls, identity: dict[str, str], schema: dict[str, Any]) -> "SchemaDraft":
         columns = tuple(DraftColumn(f"field-{index}-{hashlib.sha256(field['name'].encode()).hexdigest()[:10]}",
-                                    field["name"], dict(field))
+                                    field["name"], deepcopy(field))
                         for index, field in enumerate(schema.get("fields", [])))
-        return cls(dict(identity), schema, fingerprint(schema), columns)
+        return cls(dict(identity), deepcopy(schema), fingerprint(schema), columns)
 
     def proposed_schema(self) -> dict[str, Any]:
-        result = dict(self.baseline)
-        result["fields"] = [dict(item.field) for item in self.columns if not item.removed]
+        result = deepcopy(self.baseline)
+        result["fields"] = [deepcopy(item.field) for item in self.columns if not item.removed]
         return result
 
     def add(self, name: str, data_type: str, nullable: bool = True, comment: str | None = None) -> "SchemaDraft":
@@ -193,7 +270,8 @@ class SchemaDraft:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SchemaDraft":
-        return cls(raw["identity"], raw["baseline"], raw["baseline_fingerprint"],
+        raw = deepcopy(raw)
+        return cls(raw["identity"], raw["baseline"], fingerprint(raw["baseline"]),
                    tuple(DraftColumn(**{**item, "origin": item.get("origin", "dev" if item.get("original_name") is not None else "manual")}) for item in raw["columns"]), raw.get("version", 1))
 
 
@@ -286,7 +364,8 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                 restricted.append("constraints")
             if old["name"].casefold() in {str(item).casefold() for item in capabilities.get("partition_columns", [])}:
                 restricted.append("partition key")
-            structural_change = old["name"] != new["name"] or old.get("original_type") != new.get("original_type") or old.get("nullable") != new.get("nullable")
+            type_changed = any(field_semantics(old)[key] != field_semantics(new)[key] for key in ("type", "precision", "scale", "children"))
+            structural_change = old["name"] != new["name"] or type_changed or old.get("nullable") != new.get("nullable")
             if restricted and structural_change:
                 blockers.append(f"{old['name']} has {'/'.join(restricted)} metadata that Dexter cannot safely change.")
                 continue
@@ -296,7 +375,7 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                 elif not capabilities.get("column_mapping"):
                     blockers.append(f"RENAME COLUMN {old['name']} requires Delta column mapping; Dexter will not enable it automatically.")
                 else: ops.append({"kind": "rename", "old": old, "new": new, "compatibility": "Breaking"})
-            if old.get("original_type") != new.get("original_type"):
+            if type_changed:
                 feature = _required_feature(str(new.get("original_type", "")))
                 if feature and not capabilities.get(feature[0]):
                     blockers.append(f"Changing {old['name']} to {new.get('original_type')} is blocked. {feature[1]}")
@@ -332,7 +411,7 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     body = {"identity": identity, "baseline_fingerprint": draft.baseline_fingerprint, "proposed_fingerprint": fingerprint(proposed),
             "operations": canonical_ops, "blockers": sorted(set(blockers)), "compatibility": "Breaking" if any(o["compatibility"] == "Breaking" for o in ops) else "Requires Validation" if any(o["compatibility"] == "Requires Validation" for o in ops) else "Compatible",
             "confirmation_required": any(o["kind"] == "drop" for o in ops), "diff": diff, "target": target,
-            "capabilities": capabilities}
+            "capabilities": required_capabilities(canonical_ops, capabilities)}
     if draft.baseline.get("constraints") and any(operation["kind"] in {"drop", "rename", "type", "nullability"} for operation in ops):
         blockers.append("The table has constraints that may depend on the proposed column change; resolve them explicitly before continuing.")
         body["blockers"] = sorted(set(blockers))
@@ -343,5 +422,41 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     if any(operation["kind"] in {"drop", "rename", "type", "nullability"} for operation in ops) and (capabilities.get("has_table_constraints") or capabilities.get("row_filter") or capabilities.get("has_column_masks")):
         blockers.append("A table constraint, row filter, or column mask may depend on this field change; update it explicitly first.")
         body["blockers"] = sorted(set(blockers))
-    body["plan_id"] = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
-    return body
+    body.update(contract_version=2, physical_dev_baseline=deepcopy(draft.baseline), proposed_dev_schema=deepcopy(proposed),
+                proposed_schema=deepcopy(proposed), reference_prod_schema=None)
+    body["required_capabilities"] = required_capabilities(canonical_ops, capabilities)
+    unknown = [key for key, value in body["required_capabilities"].items() if value is None or (key == "table_id" and not value)]
+    if unknown:
+        body["blockers"] = sorted(set([*body["blockers"], "Required DEV capabilities are unavailable: " + ", ".join(unknown)]))
+    body["capability_fingerprint"] = _digest(body["required_capabilities"])
+    body["plan_id"] = _digest({"version": 2, "identity": identity, "baseline": fingerprint(draft.baseline),
+        "proposed": fingerprint(proposed), "capabilities": body["required_capabilities"], "blockers": body["blockers"],
+        "operations": [{**{key: op[key] for key in ("kind", "column", "from", "to")}, "field": field_semantics(op["field"])} for op in canonical_ops]})
+    return deepcopy(body)
+
+
+def reconcile_draft(draft: SchemaDraft, current: dict[str, Any], plan: dict[str, Any]) -> SchemaDraft:
+    """Explicitly rebase remaining edits after observing actual partial/concurrent changes."""
+    if not current.get("complete"):
+        raise ValueError("The complete physical DEV schema is required for reconciliation")
+    physical = {item["name"].casefold(): item for item in current["fields"]}
+    renames = {op["from"].casefold(): op["to"] for op in plan.get("operations", []) if op["kind"] == "rename"}
+    columns, represented = [], set()
+    for item in draft.columns:
+        original = item.original_name
+        name = original or item.field["name"]
+        if name.casefold() not in physical and original and original.casefold() in renames:
+            name = renames[original.casefold()]
+        actual = physical.get(name.casefold())
+        if item.removed and actual is None: continue
+        if actual is not None:
+            represented.add(name.casefold())
+            original = actual["name"]
+        else:
+            # A concurrent removal is made explicit as a remaining add, not assumed applied.
+            original = None
+        columns.append(DraftColumn(item.column_id, original, deepcopy(item.field), item.removed, item.origin))
+    for name in sorted(physical.keys() - represented):
+        field = physical[name]
+        columns.append(DraftColumn("observed-" + _digest(name)[:16], field["name"], deepcopy(field), origin="dev"))
+    return SchemaDraft(dict(draft.identity), deepcopy(current), fingerprint(current), tuple(columns), draft.version + 1)
