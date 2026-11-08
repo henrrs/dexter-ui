@@ -380,26 +380,37 @@ def replace_data_sql(catalog: str, schema_name: str, table: str, schema: dict[st
 def preflight_permissions(workspace: Any, catalog: str, schema_name: str,
                           storage_type: str, strategy: str, target_exists: bool,
                           external_location_name: str | None = None) -> None:
-    """Require effective grants before publication; never try a privileged identity."""
+    """Require effective grants at their Unity Catalog scopes before publication."""
     try:
         user = workspace.current_user.me()
         principal = getattr(user, "user_name", None) or getattr(user, "display_name", None)
         if not principal:
             raise SyntheticPublishError("Databricks did not identify the selected DEV profile", "DEV_IDENTITY_UNKNOWN")
+        # UC privileges are scoped: usage privileges belong to their respective
+        # parent objects, while CREATE_TABLE may be granted on either the schema
+        # or its catalog. Asking only for schema grants can therefore report a
+        # false denial even when the effective catalog grants authorize the DDL.
+        catalog_permissions = workspace.grants.get_effective(
+            securable_type="CATALOG", full_name=catalog, principal=principal,
+        )
         schema_permissions = workspace.grants.get_effective(
             securable_type="SCHEMA", full_name=f"{catalog}.{schema_name}", principal=principal,
         )
-        privileges = _privileges(schema_permissions)
-        required = {"USE_CATALOG", "USE_SCHEMA"}
+        catalog_privileges = _privileges(catalog_permissions)
+        schema_privileges = _privileges(schema_permissions)
+        required_catalog = {"USE_CATALOG"}
+        required_schema = {"USE_SCHEMA"}
         if not target_exists or strategy in {"create", "isolated", "drop_recreate"}:
-            required.add("CREATE_TABLE")
+            # Databricks allows CREATE_TABLE at either schema or catalog scope.
+            required_schema.add("CREATE_TABLE")
         elif strategy in {"append", "replace"}:
-            required.update({"MODIFY", "SELECT"})
+            required_schema.update({"MODIFY", "SELECT"})
         if storage_type == "external" and (not target_exists or strategy in {"create", "isolated", "drop_recreate"}):
-            required.add("EXTERNAL_USE_SCHEMA")
-        missing = required - privileges
+            required_schema.add("EXTERNAL_USE_SCHEMA")
+        missing = required_catalog - catalog_privileges
+        missing.update(required_schema - schema_privileges - catalog_privileges)
         if missing:
-            raise SyntheticPublishError(f"The selected DEV identity is missing required schema privileges: {', '.join(sorted(missing))}", "PUBLISH_PERMISSION_DENIED")
+            raise SyntheticPublishError(f"The selected DEV identity is missing required Unity Catalog privileges: {', '.join(sorted(missing))}", "PUBLISH_PERMISSION_DENIED")
         if storage_type == "external" and (not target_exists or strategy in {"create", "isolated", "drop_recreate"}):
             if not external_location_name:
                 raise SyntheticPublishError("Select an authorized DEV External Location", "EXTERNAL_LOCATION_REQUIRED")
@@ -659,6 +670,11 @@ def _privileges(response: Any) -> set[str]:
     for row in rows:
         privileges = _field(row, "privileges") or []
         result.update(str(_field(privilege, "privilege") or privilege).upper().split(".")[-1] for privilege in privileges)
+    # UC can return ALL_PRIVILEGES as a single grant rather than expanding its
+    # constituent privileges. It covers ordinary data privileges but excludes
+    # MANAGE and the explicit external access privileges.
+    if "ALL_PRIVILEGES" in result:
+        result.update({"USE_CATALOG", "USE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"})
     return result
 
 

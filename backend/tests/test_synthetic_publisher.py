@@ -6,7 +6,7 @@ import re
 from types import SimpleNamespace
 
 from dexter.adapters.databricks_synthetic_publisher import (SyntheticPublishError, assess_drop_recreate,
-    external_uri_is_safe, publish_verified_run)
+    external_uri_is_safe, preflight_permissions, publish_verified_run)
 
 
 class MissingTable(Exception):
@@ -102,6 +102,42 @@ def publish(workspace, strategy, storage="managed", external=None, baseline=None
 
 
 class SyntheticPublisherTests(unittest.TestCase):
+    def test_permission_preflight_reads_catalog_and_schema_grants_at_their_own_scopes(self):
+        calls = []
+
+        def grants(**kwargs):
+            calls.append(kwargs)
+            privileges = ["USE_CATALOG", "CREATE_TABLE"] if kwargs["securable_type"] == "CATALOG" else ["USE_SCHEMA"]
+            return {"privilege_assignments": [{"privileges": privileges}]}
+
+        workspace = SimpleNamespace(
+            current_user=SimpleNamespace(me=lambda: SimpleNamespace(user_name="dev@example.test")),
+            grants=SimpleNamespace(get_effective=grants),
+        )
+        preflight_permissions(workspace, "sandbox", "qa", "managed", "drop_recreate", True)
+        self.assertEqual([(call["securable_type"], call["full_name"]) for call in calls],
+                         [("CATALOG", "sandbox"), ("SCHEMA", "sandbox.qa")])
+
+    def test_permission_preflight_accepts_all_privileges_for_standard_schema_operations(self):
+        workspace = SimpleNamespace(
+            current_user=SimpleNamespace(me=lambda: SimpleNamespace(user_name="dev@example.test")),
+            grants=SimpleNamespace(get_effective=lambda **kwargs: {
+                "privilege_assignments": [{"privileges": ["ALL_PRIVILEGES"]}]
+            }),
+        )
+        preflight_permissions(workspace, "sandbox", "qa", "managed", "drop_recreate", True)
+
+    def test_permission_preflight_reports_only_privileges_missing_at_both_scopes(self):
+        workspace = SimpleNamespace(
+            current_user=SimpleNamespace(me=lambda: SimpleNamespace(user_name="dev@example.test")),
+            grants=SimpleNamespace(get_effective=lambda **kwargs: {
+                "privilege_assignments": [{"privileges": ["USE_CATALOG"]}]
+                if kwargs["securable_type"] == "CATALOG" else []
+            }),
+        )
+        with self.assertRaisesRegex(SyntheticPublishError, "CREATE_TABLE, USE_SCHEMA"):
+            preflight_permissions(workspace, "sandbox", "qa", "managed", "drop_recreate", True)
+
     def test_external_uri_rejects_sas_and_user_credentials_but_accepts_cloud_authority(self):
         self.assertFalse(external_uri_is_safe("https://account.blob.core.windows.net/container?sig=secret"))
         self.assertFalse(external_uri_is_safe("s3://user:password@bucket/path"))
