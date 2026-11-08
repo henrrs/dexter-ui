@@ -725,18 +725,28 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def _schema_evolution_context(node_id: str, *, force: bool = True):
         """Resolve a table's real physical DEV identity and schema; PROD is rejected here."""
         from dexter.adapters.databricks import profile_config_file, safe_workspace_host
-        try:
-            kind, variants, _availability = _variants(node_id)
-        except Exception:
-            raise HTTPException(422, detail="Select a table from Unified Discover") from None
-        if kind != "table":
-            raise HTTPException(422, detail="Schema Evolution is available for physical DEV tables only")
-        variant = next((item for item in variants if item.get("environment") == "dev"), None)
-        if not variant or not isinstance(variant.get("node_id"), str):
-            raise HTTPException(409, detail="This table does not exist in DEV. Use Prepare DEV to create it first.")
-        physical_id = variant["node_id"]
+        if node_id.startswith("databricks:"):
+            # Later editor stages use the physical identity returned by the initial context.
+            physical_id = node_id
+        elif node_id.startswith("local:"):
+            raise HTTPException(403, detail="Schema Evolution is restricted to the configured Databricks DEV profile")
+        else:
+            if not node_id.startswith("unified:"):
+                raise HTTPException(422, detail="Select a table from Unified Discover")
+            try:
+                kind, variants, _availability = _variants(node_id)
+            except Exception:
+                raise HTTPException(422, detail="Select a table from Unified Discover") from None
+            if kind != "table":
+                raise HTTPException(422, detail="Schema Evolution is available for physical DEV tables only")
+            variant = next((item for item in variants if item.get("environment") == "dev"), None)
+            if not variant or not isinstance(variant.get("node_id"), str):
+                raise HTTPException(409, detail="This table does not exist in DEV. Use Prepare DEV to create it first.")
+            physical_id = variant["node_id"]
         parts = physical_id.split(":")
-        if len(parts) != 5 or parts[0] != "databricks" or parts[1] != "dev":
+        if len(parts) != 5 or not all(parts):
+            raise HTTPException(422, detail="Schema Evolution requires a complete physical table identity")
+        if parts[0] != "databricks" or parts[1] != "dev":
             raise HTTPException(403, detail="Schema Evolution is restricted to the configured Databricks DEV profile")
         detail = discover.detail(physical_id, force=force)
         if force and detail and (detail.get("metadata_cache") or {}).get("state") == "stale":

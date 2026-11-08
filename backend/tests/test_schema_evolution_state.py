@@ -174,7 +174,7 @@ class SchemaStateApiTests(unittest.TestCase):
         draft["columns"][-3]["origin"] = draft["columns"][-2]["origin"] = "prod"
         saved = self.client.put("/api/schema-evolution/draft", json={"node_id": self.context["identity"]["node_id"], "identity": self.context["identity"], "draft": draft})
         self.assertEqual(saved.status_code, 200, saved.text)
-        response = self.client.post("/api/schema-evolution/review", json={"node_id": self.node_id, "reference_prod_schema": canonical_schema([{"name": "D", "type_text": "STRING"}], "tech.gold.ledger")})
+        response = self.client.post("/api/schema-evolution/review", json={"node_id": self.context["identity"]["node_id"], "reference_prod_schema": canonical_schema([{"name": "D", "type_text": "STRING"}], "tech.gold.ledger")})
         self.assertEqual(response.status_code, 200, response.text)
         self.plan = response.json()
         self.assertTrue(self.plan["can_apply"], self.plan["blockers"])
@@ -182,7 +182,7 @@ class SchemaStateApiTests(unittest.TestCase):
         return saved.json()["draft"]
 
     def apply(self):
-        return self.client.post("/api/schema-evolution/apply", json={"node_id": self.node_id, "plan_id": self.plan["plan_id"], "warehouse_id": "wh", "confirm_drop": True})
+        return self.client.post("/api/schema-evolution/apply", json={"node_id": self.context["identity"]["node_id"], "plan_id": self.plan["plan_id"], "warehouse_id": "wh", "confirm_drop": True})
 
     def terminal(self, response):
         self.assertEqual(response.status_code, 202, response.text)
@@ -211,6 +211,32 @@ class SchemaStateApiTests(unittest.TestCase):
         result = self.client.post("/api/schema-evolution/validate", json={"node_id": self.node_id}).json()
         self.assertEqual(result["state"], "validated")
         self.assertFalse(self.client.get("/api/schema-evolution/context", params={"node_id": self.node_id}).json()["drift"])
+
+    def test_physical_dev_identity_matches_unified_context_through_the_entire_editor_flow(self):
+        physical_id = self.context["identity"]["node_id"]
+        physical = self.client.get("/api/schema-evolution/context", params={"node_id": physical_id})
+        self.assertEqual(physical.status_code, 200, physical.text)
+        self.assertEqual(physical.json()["draft_key"], self.context["draft_key"])
+        self.assertEqual(physical.json()["identity"], self.context["identity"])
+        self.prepare()
+        self.assertEqual(self.terminal(self.apply())["state"], "succeeded")
+        validation = self.client.post("/api/schema-evolution/validate", json={"node_id": physical_id})
+        self.assertEqual(validation.status_code, 200, validation.text)
+        self.assertEqual(validation.json()["state"], "validated")
+        reconciled = self.client.post("/api/schema-evolution/reconcile", json={"node_id": physical_id})
+        self.assertEqual(reconciled.status_code, 200, reconciled.text)
+        reset = self.client.post("/api/schema-evolution/reset", json={"node_id": physical_id})
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(reset.json()["draft_key"], self.context["draft_key"])
+
+    def test_physical_ids_reject_prod_local_non_table_and_malformed_identifiers(self):
+        for node_id, status in [("databricks:prod:tech:gold:ledger", 403), ("local:fixture", 403),
+                                ("databricks:dev:tech_dev:gold", 422), ("databricks:dev::gold:ledger", 422),
+                                ("invalid:dev:tech_dev:gold:ledger", 422)]:
+            with self.subTest(node_id=node_id):
+                response = self.client.post("/api/schema-evolution/review", json={"node_id": node_id})
+                self.assertEqual(response.status_code, status, response.text)
+        self.assertEqual(self.ddl_calls, [])
 
     def test_b_true_drift_blocks_apply_preserves_edits_and_exposes_real_f(self):
         before = self.prepare()

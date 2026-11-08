@@ -36,4 +36,10 @@ Tests also simulate loss of a DROP response after the remote mutation. Completed
 
 Real Firefox navigation covers both Workbench and Compare entry points, two PROD imports plus a manual column, Review, pre-DDL failure, preserved labels on return/reopen, tab switching, retry and Validate. It asserts that pre-DDL failure does not trigger proposed-schema validation and that Review contains no Connection Details. Evidence images: `.run/workflow-evidence/schema-blocked-apply-preserved-origins.png` and `schema-apply-retry-validated.png`; navigation report: `.run/workflow-evidence/results.json`.
 
+## Follow-up: physical identity rejected at Review
+
+The editor sends the physical DEV `node_id` returned by its initial context to Review, Apply, Validate and Reconcile. The shared backend resolver still decoded every input as a base64 Unified Discover ID, resulting in `Select a table from Unified Discover` before Review could run. Earlier HTTP tests sent unified IDs, and browser fixtures did not decode IDs, so they missed this contract mismatch.
+
+The resolver now accepts both a logical unified table ID and a complete physical Databricks DEV table ID. Both resolve to the same authenticated identity and persisted draft key; table metadata, DEV profile, workspace and physical table ID checks still apply. PROD, LOCAL, non-table and malformed identifiers remain rejected. Regression tests now send physical IDs in the actual Review/Apply requests and exercise Context, Validate, Reconcile and Reset with that same identity. The new tests reproduce the original HTTP 422 before the correction; the schema suite passes all 31 tests afterward. No frontend or Synthetic Studio changes are needed for this correction.
+
 Automated backend execution uses disposable local DEV fixtures with fake Databricks SDK/SQL responses; browser execution uses local HTTP fixtures. Real Databricks DDL/grants/runtime certification remains external and was not performed. No shared table or PROD data was modified. The executor still cannot make multiple remote ALTER statements atomic or prevent a separate client from racing after its final preflight.
