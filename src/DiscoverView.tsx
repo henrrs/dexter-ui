@@ -736,7 +736,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     if (!variant || variant.access !== 'read') return
     selectionRequestSequence.current += 1
     const previous = workbenchTabs.find((item) => item.view === 'schema-evolution' && item.node.id === targetNode.id)
-    const key = previous?.key ?? `${targetNode.id}:schema-evolution`
+    const key = previous?.key ?? `${targetNode.id}:schema-evolution:${crypto.randomUUID()}`
     const tab: WorkbenchTab = { key, node: targetNode, environment: 'dev', view: 'schema-evolution', schemaReference: schemaReference ?? previous?.schemaReference ?? null }
     setWorkbenchTabs((items) => items.some((item) => item.key === key) ? items.map((item) => item.key === key ? tab : item) : [...items, tab])
     setSelected(targetNode); setActiveEnvironment('dev'); setActiveTabKey(key); setActiveSection('schema-evolution')
@@ -776,6 +776,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       setActiveTabKey(tab.key)
       setActiveEnvironment(tab.comparison?.referenceEnvironment ?? tab.environment as CompareEnvironment)
       setActiveSection('compare')
+      if (tab.comparison) void loadComparison(tab.key, tab.comparison)
       return
     }
     if (tab.view === 'synthetic') {
@@ -895,7 +896,13 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         </div>
       })}</div></div>}
       <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{workbenchTabs.filter((tab) => tab.view === 'schema-evolution' || tab.view === 'synthetic').map((tab) => <div key={tab.key} hidden={activeTabKey !== tab.key} data-workflow-tab={tab.key}>
-        {tab.view === 'schema-evolution' ? <SchemaEvolutionStudio active={active && activeTabKey === tab.key} node={tab.node} referenceSchema={tab.schemaReference} onValidated={() => { void refreshOpenHierarchy(true); const compareTab = workbenchTabs.find((item) => item.key === `${tab.node.id}:compare`); if (compareTab?.comparison) void loadComparison(compareTab.key, compareTab.comparison, true) }} onCompare={openCompare} />
+        {tab.view === 'schema-evolution' ? <SchemaEvolutionStudio active={active && activeTabKey === tab.key} node={tab.node} referenceSchema={tab.schemaReference} onValidated={() => {
+            void refreshOpenHierarchy(true)
+            for (const item of workbenchTabs) {
+              if (item.comparison && [item.comparison.referenceNodeId, item.comparison.compareNodeId].includes(tab.node.id)) void loadComparison(item.key, item.comparison, true)
+              if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current)))
+            }
+          }} onCompare={openCompare} />
           : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => { const tableTab = workbenchTabs.find((item) => item.key === tab.node.id); if (tableTab) activateTab(tableTab); else void selectNode(tab.node) }} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
       </div>)}{selected ? <>{activeSection === 'schema-evolution' || activeSection === 'synthetic' ? null : activeSection === 'compare' ? (() => {
         const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from typing import Any
+import json
+import re
 
 from dexter.adapters.databricks_sql import execute_statement
 
@@ -35,7 +37,10 @@ def inspect_table(workspace: Any, identity: dict[str, str]) -> tuple[Any, dict[s
         "table_type": table_type or None,
         "column_mapping": str(props.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"} if observed_props is not None else None,
         "type_widening": str(props.get("delta.enableTypeWidening", "false")).casefold() == "true" if observed_props is not None else None,
-        # Feature flags are observations only. Dexter never enables protocol features.
+        "column_mapping_mode": str(props.get("delta.columnMapping.mode", "none")).casefold() if observed_props is not None else None,
+        "iceberg_compatible": bool(props.get("delta.enableIcebergCompatV2") == "true" or props.get("delta.universalFormat.enabledFormats")),
+        "change_data_feed": str(props.get("delta.enableChangeDataFeed", "false")).casefold() == "true",
+        # These additional protocol types remain observation-only.
         "time_type": str(props.get("delta.feature.timeType", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
         "variant_type": str(props.get("delta.feature.variantType", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
         "timestamp_ntz": str(props.get("delta.feature.timestampNtz", "")).casefold() in {"supported", "enabled"} if observed_props is not None else None,
@@ -47,6 +52,61 @@ def inspect_table(workspace: Any, identity: dict[str, str]) -> tuple[Any, dict[s
         "storage_location": field(target, "storage_location"),
     }
     return target, capabilities
+
+
+def inspect_execution_support(workspace: Any, warehouse_id: str, identity: dict[str, str]) -> dict[str, Any]:
+    """Read-only compute/protocol/grant evidence; never infer support from property presence."""
+    target, _caps = inspect_table(workspace, identity)
+    detail = describe_delta_detail(workspace, warehouse_id, identity)
+    result = execute_statement(workspace, warehouse_id,
+        "SELECT current_version().dbr_version, current_version().dbsql_version", phase="schema-compute")
+    rows = field(field(result, "result", {}), "data_array", []) or []
+    if not rows or len(rows[0]) < 2:
+        raise RuntimeError("The selected DEV compute version could not be verified; no changes were run.")
+    runtime, sql_version = rows[0][:2]
+    version = re.match(r"(\d+)\.(\d+)", str(runtime or sql_version or ""))
+    if not version:
+        raise RuntimeError("The selected DEV compute version is unknown; no changes were run.")
+    pair = tuple(map(int, version.groups()))
+    mapping_supported = pair >= ((11, 3) if runtime else (2024, 35))
+    widening_supported = pair >= ((15, 4) if runtime else (2024, 35))
+    user = workspace.current_user.me()
+    principal = field(user, "user_name") or field(user, "id")
+    principals = {str(principal), str(field(user, "id", ""))}
+    principals.update(str(field(group, "display", "")) for group in field(user, "groups", []) or [])
+    owner = str(field(target, "owner", "")) in principals
+    privileges = set()
+    if not owner:
+        grants = workspace.grants.get_effective(securable_type="TABLE", full_name=".".join(identity[k] for k in ("catalog", "schema", "table")), principal=principal)
+        privileges = {str(privilege).upper().split(".")[-1] for assignment in field(grants, "privilege_assignments", []) or []
+                      for privilege in field(assignment, "privileges", []) or []}
+    features = detail.get("tableFeatures")
+    if isinstance(features, str):
+        try: features = json.loads(features)
+        except ValueError: features = None
+    try:
+        reader, writer = int(detail["minReaderVersion"]), int(detail["minWriterVersion"])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError("Delta reader/writer protocol metadata is unavailable; no changes were run.") from None
+    if writer >= 7 and not isinstance(features, list):
+        raise RuntimeError("Delta table feature metadata is unavailable; no changes were run.")
+    return {"verified": True, "compute": "runtime" if runtime else "sql", "version": str(runtime or sql_version),
+            "column_mapping_supported": mapping_supported, "type_widening_supported": widening_supported,
+            "min_reader_version": reader, "min_writer_version": writer,
+            "table_features": sorted(str(item).casefold() for item in features or []),
+            "modify": owner or bool(privileges & {"MODIFY", "ALL_PRIVILEGES"}), "owner": owner}
+
+
+def feature_sql(target_sql: str, feature: str) -> str:
+    properties = {"column_mapping": ("delta.columnMapping.mode", "name"), "type_widening": ("delta.enableTypeWidening", "true")}
+    if feature not in properties: raise ValueError("Unsupported Delta feature activation")
+    name, value = properties[feature]
+    return f"ALTER TABLE {target_sql} SET TBLPROPERTIES ('{name}' = '{value}')"
+
+
+def execute_feature(workspace: Any, warehouse_id: str, identity: dict[str, str], feature: str) -> dict:
+    if identity.get("environment") != "dev": raise PermissionError("Delta feature activation is restricted to DEV")
+    return execute_statement(workspace, warehouse_id, feature_sql(quote_qualified(identity), feature), phase="schema-feature")
 
 
 def describe_delta_detail(workspace: Any, warehouse_id: str, identity: dict[str, str]) -> dict[str, Any]:

@@ -66,6 +66,8 @@ def required_capabilities(operations: list[dict[str, Any]], capabilities: dict[s
         keys.update({"partition_columns", "has_table_constraints", "row_filter", "has_column_masks"})
     if kinds & {"drop", "rename"}: keys.add("column_mapping")
     if "type" in kinds: keys.add("type_widening")
+    if kinds & {"drop", "rename", "type"}:
+        keys.update(key for key in ("column_mapping_mode", "iceberg_compatible", "change_data_feed") if key in capabilities)
     for item in operations:
         if item["kind"] in {"add", "type"} and (feature := _required_feature(str(item["field"].get("original_type", "")))):
             keys.add(feature[0])
@@ -81,11 +83,55 @@ class SchemaStateError(RuntimeError):
         self.code, self.evidence = code, evidence or {}
 
 
+def expected_feature_state(plan: dict[str, Any], feature: str) -> dict[str, Any]:
+    result = deepcopy(plan)
+    result["required_capabilities"][feature] = True
+    if feature == "column_mapping" and "column_mapping_mode" in result["required_capabilities"]:
+        result["required_capabilities"]["column_mapping_mode"] = "name"
+    result["capability_fingerprint"] = _digest(result["required_capabilities"])
+    return result
+
+
+def schema_after_operation(schema: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any]:
+    result = deepcopy(schema)
+    kind, field = operation["kind"], operation["field"]
+    if kind == "add": result["fields"].append(deepcopy(field))
+    elif kind == "drop": result["fields"] = [item for item in result["fields"] if item["name"].casefold() != operation["column"].casefold()]
+    else:
+        name = operation["from"] if kind == "rename" else operation["column"]
+        existing = next(item for item in result["fields"] if item["name"].casefold() == name.casefold())
+        if kind == "rename": existing["name"] = operation["to"]
+        elif kind == "type":
+            for key in ("original_type", "canonical_type", "precision", "scale", "children"): existing[key] = deepcopy(field.get(key))
+        elif kind == "nullability": existing["nullable"] = field["nullable"]
+        elif kind == "comment": existing["technology_properties"]["comment"] = (field.get("technology_properties") or {}).get("comment")
+    return result
+
+
+def validate_execution_evidence(plan: dict[str, Any], evidence: dict[str, Any], capabilities: dict[str, Any], *, activating: bool = False) -> None:
+    kinds = {item["kind"] for item in plan["operations"]}
+    for feature, used in (("column_mapping", bool(kinds & {"drop", "rename"})), ("type_widening", "type" in kinds)):
+        if not used: continue
+        if not evidence.get("verified") or not evidence.get(feature + "_supported"):
+            raise SchemaStateError("COMPUTE_UNSUPPORTED", f"The selected compute does not have verified {feature.replace('_', ' ')} support. No structural changes were run.")
+        if not evidence.get("modify") or ("rename" in kinds and not evidence.get("owner")):
+            raise SchemaStateError("PERMISSION_DENIED", "The current DEV identity lacks the MODIFY or ownership required by this schema plan.")
+        if capabilities.get(feature):
+            reader, writer = evidence.get("min_reader_version", 0), evidence.get("min_writer_version", 0)
+            features = evidence.get("table_features", [])
+            valid = reader >= 2 and writer >= 5 if feature == "column_mapping" else reader >= 3 and writer >= 7 and any(name in features for name in ("typewidening", "typewidening-preview", "typewideningpreview"))
+            if feature == "column_mapping" and writer >= 7: valid = valid and "columnmapping" in features
+            if not valid:
+                raise SchemaStateError("PROTOCOL_UNAVAILABLE", f"The Delta protocol does not confirm {feature.replace('_', ' ')} support; no structural changes were run.")
+        elif not activating or feature not in plan.get("enabled_features", []):
+            raise SchemaStateError("FEATURE_CONFIRMATION_REQUIRED", "Explicitly select the required Delta feature in Review before applying.")
+
+
 def reviewed_state(plan: dict[str, Any], current: dict[str, Any], capabilities: dict[str, Any], draft: "SchemaDraft") -> dict[str, Any]:
     if plan.get("contract_version") != 2:
         raise SchemaStateError("REVIEW_REQUIRED", "Review this saved draft again to use the current schema validation contract.")
     baseline, proposed = plan["physical_dev_baseline"], plan["proposed_dev_schema"]
-    observed = required_capabilities(plan["operations"], capabilities)
+    observed = {key: required_capabilities(plan["operations"], capabilities).get(key) for key in plan["required_capabilities"]}
     evidence = {"identity": {key: plan["identity"][key] for key in ("node_id", "environment", "table_id")},
         "plan_id": plan["plan_id"], "baseline_fingerprint": fingerprint(baseline),
         "draft_fingerprint": fingerprint(proposed), "current_fingerprint": fingerprint(current),
@@ -337,13 +383,16 @@ def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDr
     return SchemaDraft(old.identity, old.baseline, old.baseline_fingerprint, tuple(columns), old.version)
 
 
-def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilities: dict[str, Any]) -> dict[str, Any]:
+def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilities: dict[str, Any],
+                       enabled_features: tuple[str, ...] = (), execution_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
     """Create a stable plan; unsupported operations are explicitly blocked."""
     proposed = draft.proposed_schema()
     diff = compare_schemas(draft.baseline, proposed)
     before = {item["name"].casefold(): item for item in draft.baseline.get("fields", [])}
     ops: list[dict[str, Any]] = []
     blockers: list[str] = []
+    needed: set[str] = set()
+    unsupported: list[dict[str, str]] = []
     for column in draft.columns:
         old = before.get((column.original_name or "").casefold())
         new = None if column.removed else column.field
@@ -354,9 +403,9 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
             if old["name"].casefold() in {str(item).casefold() for item in capabilities.get("partition_columns", [])}: restricted.append("partition key")
             if restricted:
                 blockers.append(f"{old['name']} has {'/'.join(restricted)} metadata that Dexter cannot safely remove.")
-            elif not capabilities.get("column_mapping"):
-                blockers.append(f"DROP COLUMN {old['name']} requires Delta column mapping; Dexter will not enable it automatically.")
-            else: ops.append({"kind": "drop", "old": old, "new": None, "compatibility": "Breaking"})
+            else:
+                if not capabilities.get("column_mapping"): needed.add("column_mapping")
+                ops.append({"kind": "drop", "old": old, "new": None, "compatibility": "Breaking"})
         elif old and new:
             old_properties = old.get("technology_properties") or {}
             restricted = [key for key in ("identity_field", "generated_expression", "mask") if old_properties.get(key)]
@@ -372,16 +421,21 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
             if old["name"] != new["name"]:
                 if new["name"].casefold() in before:
                     blockers.append(f"The rename target {new['name']} already exists in the DEV table; make this name available in a separate reviewed change first.")
-                elif not capabilities.get("column_mapping"):
-                    blockers.append(f"RENAME COLUMN {old['name']} requires Delta column mapping; Dexter will not enable it automatically.")
-                else: ops.append({"kind": "rename", "old": old, "new": new, "compatibility": "Breaking"})
+                else:
+                    if not capabilities.get("column_mapping"): needed.add("column_mapping")
+                    ops.append({"kind": "rename", "old": old, "new": new, "compatibility": "Breaking"})
             if type_changed:
                 feature = _required_feature(str(new.get("original_type", "")))
                 if feature and not capabilities.get(feature[0]):
                     blockers.append(f"Changing {old['name']} to {new.get('original_type')} is blocked. {feature[1]}")
-                elif capabilities.get("type_widening") and _supported_widening(str(old.get("original_type", "")), str(new.get("original_type", ""))):
+                elif _supported_widening(str(old.get("original_type", "")), str(new.get("original_type", ""))):
+                    if not capabilities.get("type_widening"): needed.add("type_widening")
+                    if capabilities.get("iceberg_compatible") and (new.get("scale") != old.get("scale") or str(old.get("original_type", "")).upper() == "DATE"):
+                        blockers.append(f"Changing {old['name']} is incompatible with the table's Iceberg reader requirements.")
                     ops.append({"kind": "type", "old": old, "new": new, "compatibility": "Requires Validation"})
-                else: blockers.append(f"Changing {old['name']} to {new.get('original_type')} is not a supported widening for this Delta table.")
+                else:
+                    blockers.append(f"Changing {old['name']} to {new.get('original_type')} requires a data rewrite or unsupported conversion; this executor never rewrites records.")
+                    unsupported.append({"column": old["name"], "classification": "REWRITE_REQUIRED", "from": old["original_type"], "to": new["original_type"]})
             if old.get("nullable") != new.get("nullable") and new.get("nullable") is not None:
                 ops.append({"kind": "nullability", "old": old, "new": new, "compatibility": "Requires Validation" if not new["nullable"] else "Compatible"})
             old_comment = (old.get("technology_properties") or {}).get("comment")
@@ -429,8 +483,39 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     if unknown:
         body["blockers"] = sorted(set([*body["blockers"], "Required DEV capabilities are unavailable: " + ", ".join(unknown)]))
     body["capability_fingerprint"] = _digest(body["required_capabilities"])
+    evidence = execution_evidence or {}
+    features = []
+    for key in sorted(needed):
+        reason = None
+        if capabilities.get(key) is None:
+            reason = "Required feature metadata is unavailable. Retry DEV verification."
+        elif not capabilities.get("delta") or capabilities.get("table_type") not in {"MANAGED", "EXTERNAL"}:
+            reason = "Feature activation requires an existing Managed or External Delta table."
+        elif key == "column_mapping" and capabilities.get("column_mapping_mode", "none") != "none":
+            reason = "The observed column mapping mode cannot be safely changed."
+        elif not evidence.get("verified"):
+            reason = "Select a DEV SQL warehouse and verify compute, protocol and privileges in Review."
+        elif not evidence.get(key + "_supported"):
+            reason = "The selected compute version does not support this feature in Dexter."
+        elif not evidence.get("modify") or (any(op["kind"] == "rename" for op in canonical_ops) and not evidence.get("owner")):
+            reason = "The current DEV identity lacks MODIFY or the ownership required for RENAME."
+        selected = key in enabled_features
+        impact = ("Enables name-based mapping and raises table compatibility requirements. Older Delta readers, streaming and CDF consumers may be affected. DROP removes the logical column; older files can retain its values. No REORG or VACUUM is run."
+                  if key == "column_mapping" else "Enables supported metadata-only widening, preserving existing values without rewriting files. Reader/writer protocol requirements can increase; older clients and pipelines may no longer read this table.")
+        features.append({"feature": key, "label": "Delta Column Mapping" if key == "column_mapping" else "Delta Type Widening",
+                         "can_enable": reason is None, "reason": reason, "selected": selected, "impact": impact})
+        if reason or not selected:
+            body["blockers"].append(reason or f"Explicitly choose whether to enable {features[-1]['label']} before applying.")
+    if set(enabled_features) - needed:
+        body["blockers"].append("The requested feature choice is no longer needed. Review the current table again.")
+    body.update(feature_requirements=features, enabled_features=sorted(enabled_features), execution_evidence=evidence,
+                existing_features=sorted(key for key in ("column_mapping", "type_widening") if capabilities.get(key)),
+                unsupported_changes=unsupported,
+                classification="REWRITE_REQUIRED" if unsupported else "UNSUPPORTED" if body["blockers"] and not needed else "FEATURE_REQUIRED" if needed else "DIRECT_DDL")
+    body["blockers"] = sorted(set(body["blockers"]))
     body["plan_id"] = _digest({"version": 2, "identity": identity, "baseline": fingerprint(draft.baseline),
         "proposed": fingerprint(proposed), "capabilities": body["required_capabilities"], "blockers": body["blockers"],
+        "enabled_features": body["enabled_features"], "protocol": {key: evidence.get(key) for key in ("min_reader_version", "min_writer_version", "table_features")},
         "operations": [{**{key: op[key] for key in ("kind", "column", "from", "to")}, "field": field_semantics(op["field"])} for op in canonical_ops]})
     return deepcopy(body)
 

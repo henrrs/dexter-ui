@@ -7,7 +7,7 @@ import { devSchema, workflowFixture } from './workflow-fixture.mjs'
 test('F4 workflows: real Firefox journeys with controlled remote responses', { timeout: 240000 }, async (t) => {
   const fixture = workflowFixture(), results = []
   await withBrowser(fixture, async (browser) => {
-    const { click, clickText, set, execute, wait, reset, screenshot, rect, assertStepper } = browser
+    const { click, clickText, set, execute, wait, reset, screenshot, rect, assertStepper, command, base } = browser
     const synthetic = '[data-workflow-tab]:not([hidden]) .synthetic-studio'
     const evolution = '[data-workflow-tab]:not([hidden]) .schema-evolution'
     const card = async (name) => {
@@ -49,8 +49,8 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await wait(`return document.querySelector(arguments[0] + ' .schema-evolution-summary')?.textContent.includes('1 changes')`, evolution)
         await click('button[aria-label="Close Schema · ledger"]')
         await clickText('ledger', '.workbench-tabs'); await card('Edit Schema')
-        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution)
-        await clickText('Edit Schema', `${evolution} footer`)
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-add')`, evolution)
+        assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution), false)
         await set(`${evolution} .schema-evolution-add input[placeholder="column_name"]`, 'manual_again'); await clickText('Add Column', evolution)
         fixture.state.schemaReviewDelay = 400
         await clickText('Review Changes', `${evolution} footer`)
@@ -100,9 +100,61 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await set(`${evolution} .schema-evolution-warehouse select`, 'wh-stopped'); await clickText('Apply Changes', `${evolution} footer`)
         await wait(`return document.querySelector(arguments[0]).textContent.includes('DEV schema validated')`, evolution)
         await screenshot('schema-apply-retry-validated')
+        await clickText('Back to Workbench', `${evolution} .schema-evolution-footer`)
+        await wait(`return [...document.querySelectorAll(arguments[0] + ' tr')].some(row => row.querySelector('input[aria-label="Column name prod_note"]') && row.querySelector('.schema-draft-label')?.textContent === 'Original DEV')`, evolution)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' input[aria-label="Column name prod_note"]').closest('tr').textContent.includes('Differs from PROD')`, evolution), false)
         assert.ok(fixture.state.requests.filter(item => item.path === '/api/schema-evolution/apply').slice(-2).every(item => item.body.node_id === identity.node_id))
         fixture.state.schemaExtraProd = false; fixture.state.schemaNormalizeTransport = false
         results.push({ journey: 'A2', result: 'passed', evidence: 'schema-blocked-apply-preserved-origins, schema-apply-retry-validated; no post-failure draft validation before DDL' })
+      })
+      await t.test('A3: native types, explicit Delta activation, physical comparison, closed sessions and keyboard navigation', async () => {
+        const identity = fixture.state.draft.identity
+        const freshDraft = () => ({ identity, baseline: structuredClone(devSchema), baseline_fingerprint: 'baseline', version: 1,
+          columns: devSchema.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field: structuredClone(field), removed: false, origin: 'dev' })) })
+        fixture.state.draft = freshDraft(); fixture.state.schemaPhysical = null
+        fixture.state.schemaRequireFeatures = ['column_mapping']
+        await openTable(); await card('Edit Schema')
+        await wait(`return !!document.querySelector(arguments[0] + ' select[aria-label="Type for new column"]')`, evolution)
+        const typeSelector = `${evolution} select[aria-label="Type for new column"]`
+        assert.equal(await execute(`return document.querySelector(arguments[0]).tagName`, typeSelector), 'SELECT')
+        const element = await command(base + '/element', { using: 'css selector', value: typeSelector })
+        await command(base + `/element/${element['element-6066-11e4-a52e-4f735466cecf']}/value`, { text: '\uE015\uE007' })
+        await set(typeSelector, 'DECIMAL(18,2)')
+        await set(`${evolution} input[aria-label="Precision for new column"]`, '22'); await set(`${evolution} input[aria-label="Scale for new column"]`, '4')
+        await set(`${evolution} .schema-evolution-add input[placeholder="column_name"]`, 'typed_amount'); await clickText('Add Column', evolution)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' input[aria-label="Precision for typed_amount"]').value`, evolution), '22')
+        await set(typeSelector, 'ARRAY<STRING>')
+        await set(`${evolution} input[aria-label="Type declaration for new column"]`, 'ARRAY<STRUCT<id:BIGINT>>')
+        await set(`${evolution} .schema-evolution-add input[placeholder="column_name"]`, 'nested_values'); await clickText('Add Column', evolution)
+        await click(`${evolution} button[aria-label="Remove nested_values"]`)
+        await click(`${evolution} button[aria-label="Remove dev_note"]`)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' select[aria-label="Type for dev_note"]').disabled`, evolution), true)
+        await clickText('Review Changes', `${evolution} footer`)
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-feature-choice')`, evolution)
+        await clickText('ledger', '.workbench-tabs'); await clickText('Schema · ledger', '.workbench-tabs')
+        assert.ok(await execute(`return !!document.querySelector(arguments[0] + ' .schema-feature-choice')`, evolution))
+        await set(`${evolution} .schema-evolution-warehouse select`, 'wh-stopped'); await clickText('Verify Delta capabilities', evolution)
+        await wait(`return document.querySelector(arguments[0] + ' input[aria-label="Enable Delta Column Mapping"]')?.disabled === false`, evolution)
+        await click(`${evolution} input[aria-label="Enable Delta Column Mapping"]`)
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-confirm input')`, evolution)
+        await click(`${evolution} .schema-evolution-confirm input`)
+        await wait(`return [...document.querySelectorAll(arguments[0] + ' button')].some(button => button.textContent.includes('Enable Column Mapping and Apply') && !button.disabled)`, evolution)
+        await screenshot('schema-delta-feature-review')
+        await clickText('Enable Column Mapping and Apply', `${evolution} footer`)
+        await wait(`return document.querySelector(arguments[0]).textContent.includes('DEV schema validated')`, evolution)
+        assert.ok(fixture.state.requests.some(item => item.path === '/api/schema-evolution/apply' && item.body.enable_features?.includes('column_mapping')))
+        await click('button[aria-label="Close Schema · ledger"]'); await clickText('ledger', '.workbench-tabs'); await card('Edit Schema')
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-add')`, evolution)
+        assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution), false)
+        fixture.state.schemaReviewDelay = 800
+        await clickText('Review Changes', `${evolution} footer`)
+        await click('button[aria-label="Close Schema · ledger"]'); await clickText('ledger', '.workbench-tabs'); await card('Edit Schema')
+        await wait(`return !!document.querySelector(arguments[0] + ' .schema-evolution-add')`, evolution)
+        await execute('return new Promise(resolve => setTimeout(() => resolve(true), 1000))')
+        assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' .schema-evolution-summary')`, evolution), false)
+        fixture.state.schemaReviewDelay = 0; fixture.state.schemaRequireFeatures = []
+        fixture.state.schemaPhysical = null; fixture.state.draft = freshDraft()
+        results.push({ journey: 'A3', result: 'passed', evidence: 'schema-delta-feature-review; native select and DECIMAL/complex types; switch preserves Review; close/reopen and late requests preserve Edit step' })
       })
       await t.test('B: existing DEV, all strategies, effective schema, preview, review, execution and preserved tabs', async () => {
         await openSynthetic(); await capture('synthetic-01-destination')

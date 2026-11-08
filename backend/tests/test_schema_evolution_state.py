@@ -131,6 +131,10 @@ class SchemaStateApiTests(unittest.TestCase):
         self.stack.enter_context(patch("dexter.catalog.discovery.DiscoverService.detail", side_effect=self.detail))
         self.stack.enter_context(patch("dexter.adapters.databricks.ensure_sql_warehouse_running"))
         self.stack.enter_context(patch("dexter.adapters.databricks_schema_evolution.execute", side_effect=self.ddl))
+        self.support_mock = self.stack.enter_context(patch("dexter.adapters.databricks_schema_evolution.inspect_execution_support", return_value={
+            "verified": True, "column_mapping_supported": True, "type_widening_supported": True,
+            "min_reader_version": 3, "min_writer_version": 7, "table_features": ["columnmapping", "typewidening"],
+            "modify": True, "owner": True, "version": "2026.35", "compute": "sql"}))
         self.fail_ddl = 0
         self.fail_after_ddl = 0
         self.context = self.client.get("/api/schema-evolution/context", params={"node_id": self.node_id}).json()

@@ -15,7 +15,7 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null }
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [] }
   const freshDraft = () => {
     const baseline = state.schemaPhysical ?? devSchema
     return { identity, baseline, baseline_fingerprint: 'baseline', columns: baseline.fields.map((field, i) => ({ column_id: `field-${i}`, original_name: field.name, field, removed: false, origin: 'dev' })), version: 1 }
@@ -61,12 +61,18 @@ export function workflowFixture() {
     if (path === '/api/discover/catalogs') return send({ items: [catalog], cached_paths: [] })
     if (path.endsWith('/children')) return send(page(path.includes('catalog-tech') ? [catalogSchema] : [{ ...table, id: state.rekey ? `${table.id}-refreshed` : table.id }]))
     if (path.endsWith('/warehouses')) return send({ items: [{ id: 'wh-stopped', name: 'DEV SQL', state: 'STOPPED' }], message: null })
-    if (path === '/api/discover/schema-compare') return send({ state: 'different', compatibility: 'structural_difference', differences: [
-      { name: 'id', status: 'matching', prod: prodSchema.fields[0], dev: devSchema.fields[1], changes: [] },
-      { name: 'prod_note', status: 'prod_only', prod: prodSchema.fields[1], dev: null, changes: [] },
-      { name: 'dev_note', status: 'dev_only', prod: null, dev: devSchema.fields[0], changes: [] },
-    ], summary: { matching: 1, prod_only: 1, dev_only: 1 }, prod_schema: state.schemaExtraProd ? { ...prodSchema, fields: [...prodSchema.fields, field('prod_amount', 'DECIMAL(18,2)')] } : prodSchema, dev_schema: devSchema,
-      sides: { prod: { environment: 'prod', state: 'available', qualified_name: prodSchema.qualified_name, access: 'read' }, dev: { environment: 'dev', state: 'available', qualified_name: devSchema.qualified_name, access: 'read' } }, read_only: true, compute_started: false })
+    if (path === '/api/discover/schema-compare') {
+      const prod = state.schemaExtraProd ? { ...prodSchema, fields: [...prodSchema.fields, field('prod_amount', 'DECIMAL(18,2)')] } : prodSchema
+      const dev = state.schemaPhysical ?? devSchema
+      const differences = [...new Set([...prod.fields, ...dev.fields].map(field => field.name))].sort().map(name => {
+        const p = prod.fields.find(field => field.name === name) ?? null, d = dev.fields.find(field => field.name === name) ?? null
+        const status = !p ? 'dev_only' : !d ? 'prod_only' : p.original_type === d.original_type && p.nullable === d.nullable ? 'matching' : 'type_changed'
+        return { name, status, prod: p, dev: d, changes: status === 'type_changed' ? ['type_changed'] : [] }
+      })
+      const summary = Object.fromEntries(['matching', 'prod_only', 'dev_only', 'type_changed'].map(status => [status, differences.filter(item => item.status === status).length]))
+      return send({ state: differences.every(item => item.status === 'matching') ? 'matching' : 'different', compatibility: 'structural_difference', differences, summary, prod_schema: prod, dev_schema: dev,
+        sides: { prod: { environment: 'prod', state: 'available', qualified_name: prod.qualified_name, access: 'read' }, dev: { environment: 'dev', state: 'available', qualified_name: dev.qualified_name, access: 'read' } }, read_only: true, compute_started: false })
+    }
     if (path.startsWith('/api/discover/')) {
       const env = url.searchParams.get('environment') ?? 'dev', selected = env === 'prod' ? prodSchema : devSchema
       return send({ ...table, environment: env, qualified_name: selected.qualified_name, columns: selected.fields.map((field) => ({ name: field.name, type_text: field.original_type, nullable: field.nullable })), technology_properties: { table_type: env === 'prod' ? 'EXTERNAL' : 'MANAGED', data_source_format: 'DELTA', table_id: 'table-1' } })
@@ -85,10 +91,13 @@ export function workflowFixture() {
     if (path === '/api/schema-evolution/review') {
       if (fail()) return
       await new Promise((resolve) => setTimeout(resolve, state.schemaReviewDelay))
-      const operations = state.draft.columns.filter((column) => column.original_name === null && !column.removed).map((column) => ({ kind: 'add', column: column.field.name, field: column.field, compatibility: 'Compatible' }))
-      return send({ plan_id: 'a'.repeat(64), identity, target: devSchema.qualified_name, baseline_fingerprint: 'baseline', proposed_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, operations, blockers: [], risks: [], can_apply: operations.length > 0, drift: false, compatibility: 'Compatible', confirmation_required: false, sql_statements: operations.map((item) => `ALTER TABLE tech_dev.gold.ledger ADD COLUMNS (${item.column} STRING)`) })
+      const operations = state.draft.columns.flatMap(column => column.removed && column.original_name ? [{ kind: 'drop', column: column.original_name, field: column.field, compatibility: 'Breaking' }]
+        : column.original_name === null && !column.removed ? [{ kind: 'add', column: column.field.name, field: column.field, compatibility: 'Compatible' }] : [])
+      const features = state.schemaRequireFeatures.map(feature => ({ feature, label: feature === 'column_mapping' ? 'Delta Column Mapping' : 'Delta Type Widening', can_enable: !!body.warehouse_id, reason: body.warehouse_id ? null : 'Select a DEV warehouse and verify capabilities.', selected: (body.enable_features ?? []).includes(feature), impact: 'Changes Delta compatibility requirements. Older readers and streaming consumers may be affected. No physical cleanup or data rewrite.' }))
+      const blockers = features.filter(feature => !feature.selected).map(feature => 'Explicit feature selection required: ' + feature.label)
+      return send({ plan_id: 'a'.repeat(64), identity, target: devSchema.qualified_name, baseline_fingerprint: 'baseline', proposed_schema: { ...devSchema, fields: state.draft.columns.filter((item) => !item.removed).map((item) => item.field) }, operations, blockers, feature_requirements: features, enabled_features: body.enable_features ?? [], warehouse_id: body.warehouse_id, execution_evidence: { verified: !!body.warehouse_id }, risks: [], can_apply: operations.length > 0 && !blockers.length, drift: false, compatibility: 'Compatible', confirmation_required: operations.some(item => item.kind === 'drop'), sql_statements: operations.map((item) => `ALTER TABLE tech_dev.gold.ledger ADD COLUMNS (${item.column} STRING)`) })
     }
-    if (path === '/api/schema-evolution/apply') { state.currentOperation = operation('schema-evolution'); state.polls = 0; return send(state.currentOperation, 202) }
+    if (path === '/api/schema-evolution/apply') { if (state.schemaRequireFeatures.some(feature => !(body.enable_features ?? []).includes(feature))) return send({ error: { message: 'Explicit feature confirmation missing' } }, 422); state.currentOperation = operation('schema-evolution'); state.polls = 0; return send(state.currentOperation, 202) }
     if (path === '/api/schema-evolution/validate') return send({ state: 'validated', schema: state.schemaPhysical ?? devSchema, assessment: { message: 'Simulated schema validated' } })
     if (path === '/api/synthetic/generators') return send({ items: [
       { id: 'sequence', types: ['BIGINT', 'INT'], provider: 'duckdb', unique: true }, { id: 'random_string', types: ['STRING'], provider: 'duckdb', unique: false },

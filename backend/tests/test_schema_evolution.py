@@ -30,13 +30,16 @@ class SchemaEvolutionDomainTests(unittest.TestCase):
         self.assertEqual(first["operations"][0]["from"], "amount")
         self.assertEqual(first["operations"][0]["to"], "total")
 
-    def test_drop_and_rename_require_existing_column_mapping(self):
+    def test_drop_requires_explicit_mapping_decision_when_feature_is_absent(self):
         draft = SchemaDraft.from_schema(self.identity, self.schema)
         removed = next(item for item in draft.columns if item.field["name"] == "amount")
         draft = draft.remove(removed.column_id)
         plan = plan_schema_change(self.identity, draft, {"delta": True, "table_type": "EXTERNAL", "column_mapping": False})
-        self.assertFalse(plan["operations"])
-        self.assertIn("column mapping", plan["blockers"][0])
+        self.assertEqual([item["kind"] for item in plan["operations"]], ["drop"])
+        self.assertEqual(plan["classification"], "FEATURE_REQUIRED")
+        self.assertEqual(plan["feature_requirements"][0]["feature"], "column_mapping")
+        self.assertFalse(plan["feature_requirements"][0]["selected"])
+        self.assertTrue(plan["blockers"])
 
     def test_adding_required_column_is_blocked_without_backfill(self):
         draft = SchemaDraft.from_schema(self.identity, self.schema).add("required", "STRING", nullable=False)

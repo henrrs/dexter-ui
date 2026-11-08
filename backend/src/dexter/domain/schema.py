@@ -145,7 +145,18 @@ def canonical_schema(
     return result
 
 
+def _comparison_field(field_data: dict[str, Any]) -> dict[str, Any]:
+    normalized = canonical_field({"name": field_data.get("name"), "type_text": field_data.get("original_type") or field_data.get("canonical_type"),
+                                  "precision": field_data.get("precision"), "scale": field_data.get("scale")})
+    return {**field_data, "canonical_type": normalized.canonical_type,
+            "precision": normalized.precision if normalized.canonical_type == "decimal" else None,
+            "scale": normalized.scale if normalized.canonical_type == "decimal" else None,
+            "constraints": tuple(sorted(field_data.get("constraints") or ())),
+            "children": [_comparison_field(child) for child in field_data.get("children") or []]}
+
+
 def _field_signature(field_data: dict[str, Any]) -> tuple[Any, ...]:
+    field_data = _comparison_field(field_data)
     return (
         field_data.get("canonical_type"), field_data.get("precision"), field_data.get("scale"),
         field_data.get("nullable"), tuple(field_data.get("constraints") or ()),
@@ -193,6 +204,7 @@ def compare_schemas(prod: dict[str, Any] | None, dev: dict[str, Any] | None) -> 
             status, changes = "prod_only", []
             counts[status] += 1
         else:
+            prod_field, dev_field = _comparison_field(prod_field), _comparison_field(dev_field)
             changes = []
             if (prod_field.get("canonical_type"), prod_field.get("precision"), prod_field.get("scale")) != (dev_field.get("canonical_type"), dev_field.get("precision"), dev_field.get("scale")):
                 changes.append("type_changed")

@@ -38,6 +38,11 @@ class DiscoveryCache:
             db.close()
         return [str(row["node_key"]) for row in rows]
 
+    def invalidate_node(self, node: str) -> None:
+        """Remove structural metadata after a confirmed/uncertain write, across identity contexts."""
+        with transaction(self.database) as db:
+            db.execute("DELETE FROM discovery_cache WHERE node_key=?", (node,))
+
     def put(self, context: str, node: str, items: list[dict], ttl: int, error: str | None = None) -> dict:
         now = time.time()
         key = context_key(context, node)
