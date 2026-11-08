@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import hashlib
 import json
+import time
 from urllib.parse import quote, urlsplit
 from typing import Any, Callable
 
@@ -438,9 +439,11 @@ def publish_verified_run(workspace: Any, *, warehouse_id: str, destination: dict
                                    storage_type=storage_type, external_location=final_location,
                                    operation_id=operation_id)
             execute_statement(workspace, warehouse_id, ddl, cancelled=cancel_requested, progress=progress)
-            table_info, exists = _read_table(workspace, full_name)
+            table_info, exists = _read_table_until(workspace, full_name, expected_exists=True)
             if not exists:
-                raise SyntheticPublishError("Databricks did not expose the created DEV table after DDL", "TARGET_CREATE_UNCONFIRMED")
+                raise SyntheticPublishError(
+                    "Databricks accepted CREATE TABLE but its metadata did not become visible in time; the saved run can be resumed without repeating the DDL",
+                    "TARGET_CREATE_UNCONFIRMED")
     elif strategy == "drop_recreate":
         assert isinstance(drop_plan, dict)
         expected_fingerprint = str(drop_plan.get("target_fingerprint") or "")
@@ -472,7 +475,7 @@ def publish_verified_run(workspace: Any, *, warehouse_id: str, destination: dict
         execute_statement(workspace, warehouse_id,
             f"DROP TABLE {qualified_name(catalog, schema_name, table)}",
             cancelled=None, progress=progress, phase="drop")
-        _dropped, still_exists = _read_table(workspace, full_name)
+        _dropped, still_exists = _read_table_until(workspace, full_name, expected_exists=False)
         if still_exists:
             raise SyntheticPublishError("DROP was accepted but the target still exists; reconciliation is required", "DESTRUCTIVE_RECONCILIATION_REQUIRED")
         checkpoint("DROPPED", {"phase": "create", "target": full_name, "retry_available": False,
@@ -484,7 +487,7 @@ def publish_verified_run(workspace: Any, *, warehouse_id: str, destination: dict
             storage_type=storage_type, external_location=final_location, operation_id=operation_id,
             properties=keep_properties)
         execute_statement(workspace, warehouse_id, ddl, cancelled=None, progress=progress, phase="create")
-        table_info, exists = _read_table(workspace, full_name)
+        table_info, exists = _read_table_until(workspace, full_name, expected_exists=True)
         if not exists or not _same_schema(_schema_from_table(table_info, full_name), approved_schema):
             raise SyntheticPublishError("The recreated DEV table could not be verified; reconciliation is required", "DESTRUCTIVE_RECONCILIATION_REQUIRED")
         checkpoint("CREATED", {"phase": "materialization", "table_id": _field(table_info, "table_id"),
@@ -593,6 +596,19 @@ def _read_table(workspace: Any, full_name: str) -> tuple[Any, bool]:
         if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"} or "not found" in message:
             return None, False
         raise SyntheticPublishError("The selected DEV identity cannot inspect the destination table", "TARGET_METADATA_UNAVAILABLE") from exc
+
+
+def _read_table_until(workspace: Any, full_name: str, *, expected_exists: bool,
+                      attempts: int = 6) -> tuple[Any, bool]:
+    """Poll metadata after a successful DDL without ever resubmitting that DDL."""
+    table_info, exists = None, False
+    for attempt in range(max(1, attempts)):
+        table_info, exists = _read_table(workspace, full_name)
+        if exists is expected_exists:
+            return table_info, exists
+        if attempt + 1 < attempts:
+            time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+    return table_info, exists
 
 
 def _schema_from_table(table: Any, full_name: str) -> dict[str, Any]:

@@ -29,21 +29,21 @@ def execute_statement(workspace: Any, warehouse_id: str, statement: str, *,
             "disposition": "INLINE",
         })
     except Exception as exc:
-        raise StatementExecutionError("Databricks did not accept the publication statement") from exc
+        raise StatementExecutionError("Databricks did not accept the publication statement", phase=phase) from exc
     statement_id = _field(response, "statement_id")
     if not isinstance(statement_id, str) or not statement_id:
-        raise StatementExecutionError("Databricks did not return a statement identifier")
+        raise StatementExecutionError("Databricks did not return a statement identifier", phase=phase)
     started = time.monotonic()
     if progress:
         progress(statement_id, {"phase": phase, "statement_id": statement_id, "state": "PENDING"})
     while time.monotonic() - started < timeout_seconds:
         if cancelled and cancelled():
             _cancel(workspace, statement_id)
-            raise StatementExecutionError("Synthetic data publication was cancelled")
+            raise StatementExecutionError("Synthetic data publication was cancelled", "CANCELLED", phase)
         try:
             result = workspace.api_client.do("GET", f"/api/2.0/sql/statements/{statement_id}")
         except Exception as exc:
-            raise StatementExecutionError("Could not confirm the Databricks statement state") from exc
+            raise StatementExecutionError("Could not confirm the Databricks statement state", phase=phase) from exc
         status = _field(result, "status") or {}
         state = str(_field(status, "state") or "UNKNOWN").upper().split(".")[-1]
         if state == "SUCCEEDED":
@@ -52,14 +52,15 @@ def execute_statement(workspace: Any, warehouse_id: str, statement: str, *,
             errors = _field(status, "error")
             code = _field(errors, "error_code") if errors else None
             # Do not leak SQL service messages or credentials into local operation logs.
-            raise StatementExecutionError(f"Databricks {phase} statement ended in {state.lower()}" + (f" ({code})" if code else ""),
-                                          str(code) if code else None, phase)
+            safe_code = str(code) if code else ("STATEMENT_CANCELED" if state == "CANCELED" else None)
+            raise StatementExecutionError(f"Databricks {phase} statement ended in {state.lower()}" + (f" ({safe_code})" if safe_code else ""),
+                                          safe_code, phase)
         if progress:
             progress(statement_id, {"phase": phase, "statement_id": statement_id,
                                     "state": state, "elapsed_seconds": int(time.monotonic() - started)})
         time.sleep(max(0.1, poll_seconds))
     _cancel(workspace, statement_id)
-    raise StatementExecutionError("Databricks publication statement exceeded its time limit")
+    raise StatementExecutionError("Databricks publication statement exceeded its time limit", "STATEMENT_TIMEOUT", phase)
 
 
 def _cancel(workspace: Any, statement_id: str) -> None:

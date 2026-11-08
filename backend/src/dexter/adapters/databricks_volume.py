@@ -11,7 +11,9 @@ from typing import Any
 
 
 class VolumeTransportError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: str = "VOLUME_TRANSPORT_FAILED"):
+        super().__init__(message)
+        self.code = code
 
 
 def verify_remote_file(workspace: Any, remote_file: str, *, expected_size: int,
@@ -80,6 +82,51 @@ def ensure_staging_volume(workspace: Any, catalog: str, schema: str, config_dir:
     except Exception:
         raise VolumeTransportError("The Dexter staging Volume could not be verified after creation") from None
     return f"/Volumes/{catalog}/{schema}/dexter"
+
+
+def require_sql_read_access(workspace: Any, volume_root: str) -> None:
+    """Confirm the selected DEV profile can resolve and read its staging Volume."""
+    parts = volume_root.strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "Volumes" or not all(parts[1:4]):
+        raise VolumeTransportError("The staging path is not a valid Unity Catalog Volume path",
+                                  "STAGING_VOLUME_PATH_INVALID")
+    catalog, schema = parts[1:3]
+    volume_name = ".".join(parts[1:4])
+    try:
+        user = workspace.current_user.me()
+        principal = _field(user, "user_name") or _field(user, "display_name")
+        if not principal:
+            raise ValueError("Databricks did not identify the selected profile")
+        volume_info = workspace.volumes.read(name=volume_name)
+        volume_owner = _field(volume_info, "owner")
+        required = (
+            ("CATALOG", catalog, {"USE_CATALOG"}),
+            ("SCHEMA", f"{catalog}.{schema}", {"USE_SCHEMA"}),
+            ("VOLUME", volume_name, {"READ_VOLUME", "WRITE_VOLUME"}),
+        )
+        missing: set[str] = set()
+        for securable_type, full_name, privileges_required in required:
+            response = workspace.grants.get_effective(
+                securable_type=securable_type, full_name=full_name, principal=str(principal))
+            privileges = set()
+            for assignment in _field(response, "privilege_assignments") or []:
+                for privilege in _field(assignment, "privileges") or []:
+                    value = _field(privilege, "privilege") or privilege
+                    privileges.add(str(value).upper().split(".")[-1].replace(" ", "_"))
+            if (securable_type == "VOLUME" and isinstance(volume_owner, str)
+                    and volume_owner.casefold() == str(principal).casefold()):
+                privileges.update(privileges_required)
+            if "ALL_PRIVILEGES" in privileges:
+                privileges.update(privileges_required)
+            missing.update(privileges_required - privileges)
+    except Exception as exc:
+        raise VolumeTransportError(
+            "Dexter could not verify the staging Volume read permissions for the selected DEV identity; generation was not started",
+            "STAGING_VOLUME_PERMISSION_CHECK_FAILED") from exc
+    if missing:
+        raise VolumeTransportError(
+            f"The selected DEV identity is missing {', '.join(value.replace('_', ' ') for value in sorted(missing))} required to stage and read files from {volume_name}",
+            "STAGING_VOLUME_ACCESS_REQUIRED")
 
 
 def create_run_directory(workspace: Any, volume_root: str, run_id: str) -> str:

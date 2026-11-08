@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
+from dexter.adapters.databricks_sql import StatementExecutionError
 from dexter.adapters.databricks_synthetic_publisher import SyntheticPublishError, publish_verified_run
 from dexter.adapters.databricks_volume import (
-    VolumeTransportError, create_run_directory, ensure_staging_volume,
+    VolumeTransportError, create_run_directory, ensure_staging_volume, require_sql_read_access,
     upload_verified, verify_remote_file,
 )
 from dexter.domain.synthetic import ColumnRule, SyntheticGenerationPlan
@@ -151,6 +152,20 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
             _cancelled(operations, runs, operation_id, run_id)
         else:
             _fail(operations, runs, operation_id, run_id, str(exc), code)
+    except StatementExecutionError as exc:
+        if exc.error_code == "CANCELLED" or _cancel_requested(operations, operation_id):
+            _cancelled(operations, runs, operation_id, run_id)
+            return
+        phase = str(exc.phase or "publication").replace("_", " ")
+        error_code = str(exc.error_code or "").upper()
+        if not error_code or not error_code.replace("_", "").isalnum():
+            error_code = "UNKNOWN"
+        operations.update_details(operation_id, failed_phase=exc.phase or "publication",
+                                  databricks_error_code=error_code,
+                                  staged_files_retained=True)
+        message = (f"Dexter could not complete the Databricks SQL step during {phase} ({error_code}). "
+                   "The verified files remain in the DEV staging Volume for recovery.")
+        _fail(operations, runs, operation_id, run_id, message, "DATABRICKS_STATEMENT_FAILED")
     except Exception as exc:
         # Keep stack traces and SDK diagnostics in backend logs only; surface a safe stage message.
         import logging
@@ -168,15 +183,22 @@ def _run_generation_upload(operations: OperationsService, runs: SyntheticRunRepo
     plan = _restore_plan(run["plan"])
     destination = dict(run["destination"])
     workspace = _dev_workspace(operations, config_dir)
-    dev_catalog, dev_schema = str(destination["catalog"]), str(destination["schema"])
-    volume_root = ensure_staging_volume(workspace, dev_catalog, dev_schema, config_dir)
-    volume_path = destination.get("staging_path")
-    if not isinstance(volume_path, str) or not volume_path:
+    staging_path = destination.get("staging_path")
+    if isinstance(staging_path, str) and staging_path:
+        volume_root = _staging_volume_root(staging_path, run_id)
+    else:
+        dev_catalog, dev_schema = str(destination["catalog"]), str(destination["schema"])
+        volume_root = ensure_staging_volume(workspace, dev_catalog, dev_schema, config_dir)
+    # Check SQL-side visibility before generating or uploading a snapshot. The
+    # SDK file API can write a Volume that the selected SQL warehouse cannot read.
+    require_sql_read_access(workspace, volume_root)
+    if not isinstance(staging_path, str) or not staging_path:
         volume_path = create_run_directory(workspace, volume_root, run_id)
         destination["staging_path"] = volume_path
         runs.set_state(run_id, "GENERATING", details={"destination": destination, "staging_path": volume_path})
     else:
         create_run_directory(workspace, volume_root, run_id)
+        volume_path = staging_path
 
     staging = temporary_dir / "synthetic" / run_id
     staging.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -385,6 +407,16 @@ def _remote_path(volume_path: str, file_name: str) -> str:
     if not re_full_chunk_name(file_name):
         raise SyntheticPipelineError("The run manifest contains an invalid chunk filename", "MANIFEST_INVALID")
     return f"{volume_path.rstrip('/')}/{file_name}"
+
+
+def _staging_volume_root(staging_path: str, run_id: str) -> str:
+    normalized = staging_path.rstrip("/")
+    parts = normalized.strip("/").split("/")
+    if (len(parts) != 6 or parts[0] != "Volumes" or parts[4] != "synthetic"
+            or parts[5] != run_id or not all(parts[1:4])):
+        raise VolumeTransportError("The saved staging path does not match this synthetic run",
+                                   "STAGING_PATH_INVALID")
+    return "/" + "/".join(parts[:4])
 
 
 def re_full_chunk_name(value: str) -> bool:
