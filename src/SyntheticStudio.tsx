@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Check, LoaderCircle, RefreshCw, Sparkles, X } from 'lucide-react'
-import { api } from './api'
+import { api, ApiError } from './api'
 import type { CanonicalSchema, DiscoverNode, SyntheticDestination, SyntheticGenerator, SyntheticReview, SyntheticRule, SyntheticRunRequest } from './api'
 import type { Operation } from './types'
 import { SchemaFieldEditor } from './SchemaFieldEditor'
 
 const steps = ['Destination', 'Schema', 'Generation Rules', 'Review', 'Execution'] as const
 type Step = 0 | 1 | 2 | 3 | 4
-type Props = { node: DiscoverNode; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
-type Draft = { step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
+type Props = { active?: boolean; node: DiscoverNode; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
+type Environment = 'prod' | 'dev'
+type SchemaVersion = { schema: CanonicalSchema; rules: SyntheticRule[] }
+type Draft = { schemaBase?: Environment; versions?: Partial<Record<Environment, SchemaVersion>>; step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
 
 function makeSchema(node: DiscoverNode): CanonicalSchema {
   return { qualified_name: node.qualified_name ?? node.name, complete: Boolean(node.columns?.length), constraints: [], technology_properties: {}, fields: (node.columns ?? []).map((column) => {
@@ -39,7 +41,7 @@ function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
     const schema = raw?.schema && Array.isArray(raw.schema.fields) ? raw.schema : initial
     const rules = Array.isArray(raw?.rules) ? raw.rules.filter((rule): rule is SyntheticRule => !!rule && typeof rule.column === 'string' && typeof rule.generator === 'string') : []
     const schemaSource = ['source', 'dev', 'custom'].includes(raw?.schemaSource ?? '') ? raw!.schemaSource! : JSON.stringify(schema.fields) === JSON.stringify(initial.fields) ? 'source' : 'custom'
-    return { step: 0, rowCount: Number.isInteger(raw?.rowCount) && raw!.rowCount! > 0 ? Math.min(1_000_000, raw!.rowCount!) : 1000,
+    return { step: 0, schemaBase: raw?.schemaBase, versions: raw?.versions, rowCount: Number.isInteger(raw?.rowCount) && raw!.rowCount! > 0 ? Math.min(1_000_000, raw!.rowCount!) : 1000,
       locale: raw?.locale === 'en_US' ? 'en_US' : 'pt_BR', seed: Number.isSafeInteger(raw?.seed) ? raw!.seed! : Math.floor(Math.random() * 2_000_000_000),
       schema, schemaSource, rules: schema.fields.map((field) => rules.find((rule) => rule.column === field.name) ?? suggested(field)),
       destination: raw?.destination ?? {} }
@@ -48,18 +50,24 @@ function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
   }
 }
 
-export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable, onCompare, onPublished, comparison }: Props) {
+export function SyntheticStudio({ active = true, node, sourceEnvironment, onClose, onOpenTable, onCompare, onPublished, comparison }: Props) {
+  const sourceKey = node.variants?.find((item) => item.environment === sourceEnvironment)?.node_id ?? node.id
   const initialSchema = useMemo(() => makeSchema(node), [node])
   const [initial] = useState(() => loadDraft(node, initialSchema))
   const [step, setStep] = useState<Step>(0)
   const [schema, setSchema] = useState(initial.schema)
   const [schemaSource, setSchemaSource] = useState<Draft['schemaSource']>(initial.schemaSource)
+  const [schemaBase, setSchemaBase] = useState<Environment>(initial.schemaBase ?? (initial.schemaSource === 'dev' ? 'dev' : sourceEnvironment))
+  const editableBase = useRef<Environment>(initial.schemaBase ?? sourceEnvironment)
+  const [versions, setVersions] = useState<Partial<Record<Environment, SchemaVersion>>>(initial.versions ?? {})
+  const [sourceSchemas, setSourceSchemas] = useState<Partial<Record<Environment, CanonicalSchema>>>({ [sourceEnvironment]: initialSchema })
+  const [schemaReference, setSchemaReference] = useState<Environment>('dev')
   const [rules, setRules] = useState(initial.rules)
   const [rowCount, setRowCount] = useState(initial.rowCount)
   const [locale, setLocale] = useState<'pt_BR' | 'en_US'>(initial.locale)
   const [seed, setSeed] = useState(initial.seed)
   const [destination, setDestination] = useState<Partial<SyntheticDestination>>(() => ({
-    environment: 'dev', strategy: 'create', storage_type: 'managed',
+    environment: 'dev', strategy: node.variants?.some((item) => item.environment === 'dev') ? 'append' : 'create', storage_type: 'managed',
     catalog: node.variants?.find((variant) => variant.environment === 'dev')?.catalog,
     schema: node.variants?.find((variant) => variant.environment === 'dev')?.schema,
     table: node.variants?.find((variant) => variant.environment === 'dev')?.table ?? node.name,
@@ -67,13 +75,15 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   }))
   const [catalogs, setCatalogs] = useState<Array<{ name: string }>>([])
   const [schemas, setSchemas] = useState<Array<{ name: string }>>([])
-  const [tables, setTables] = useState<Array<{ name: string; table_type: string }>>([])
-  const [targetSchema, setTargetSchema] = useState<CanonicalSchema | null>(null)
+  const [tables, setTables] = useState<Array<{ name: string; table_type: string; data_source_format?: string }>>([])
+  const [observedTargetSchema, setTargetSchema] = useState<CanonicalSchema | null>(null)
   const [targetStorageType, setTargetStorageType] = useState<string | null>(null)
+  const [sourceStorageType, setSourceStorageType] = useState<'managed' | 'external' | null>(null)
   const [targetFormat, setTargetFormat] = useState<string | null>(null)
+  const [verification, setVerification] = useState<{ key: string; state: 'idle' | 'checking' | 'present' | 'absent' | 'error'; message?: string }>({ key: '', state: 'idle' })
   const [destinationSuggestion, setDestinationSuggestion] = useState<Awaited<ReturnType<typeof api.syntheticDestinations>>['suggestion']>(null)
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
-  const [externalLocations, setExternalLocations] = useState<Array<{ name: string; url: string; read_only: boolean; authorized?: boolean; score?: number; reason?: string }>>([])
+  const [externalLocations, setExternalLocations] = useState<Array<{ name: string; url: string; read_only: boolean; authorized?: boolean | null; score?: number; reason?: string }>>([])
   const [generatorRegistry, setGeneratorRegistry] = useState<SyntheticGenerator[]>([])
   const [dropRecreateEligible, setDropRecreateEligible] = useState(false)
   const [preview, setPreview] = useState<Array<Record<string, unknown>>>([])
@@ -86,130 +96,200 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   const [reconcileConfirmation, setReconcileConfirmation] = useState('')
   const [confirmDestructive, setConfirmDestructive] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [busyAction, setBusyAction] = useState('')
   const [listing, setListing] = useState(false)
+  const [schemasLoading, setSchemasLoading] = useState(false)
+  const [metadataError, setMetadataError] = useState('')
+  const [sourceError, setSourceError] = useState('')
+  const [generatorError, setGeneratorError] = useState('')
+  const [retryMetadata, setRetryMetadata] = useState(0)
+  const [retryTarget, setRetryTarget] = useState(0)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const previewRequestId = useRef(0)
   const currentPreviewDigest = useRef('')
   const [previewDigest, setPreviewDigest] = useState('')
+  const actionController = useRef<AbortController | null>(null)
+  const alive = useRef(true)
+  const destinationTouched = useRef(false)
+  const schemaTouched = useRef(Boolean(initial.schemaSource === 'custom' || initial.destination.catalog))
 
   const strategy = destination.strategy ?? 'create'
-  const isExistingStrategy = strategy === 'append' || strategy === 'replace' || strategy === 'drop_recreate'
+  const lockedSchema = strategy === 'append' || strategy === 'replace'
+  const isExistingStrategy = lockedSchema || strategy === 'drop_recreate'
   const fullTarget = [destination.catalog, destination.schema, destination.table].filter(Boolean).join('.')
+  const targetState = verification.key === fullTarget ? verification.state : 'checking'
+  const targetExists = targetState === 'present'
+  const targetSchema = targetExists ? observedTargetSchema : null
+  const targetSupportsWrites = targetExists && ['managed', 'external'].includes(targetStorageType ?? '') && targetFormat === 'DELTA'
   const generationDigest = JSON.stringify({ schema, rules, rowCount, locale, seed })
   currentPreviewDigest.current = generationDigest
-  const schemaDirty = schemaSource === 'custom'
-  const targetExists = tables.some((item) => item.name.toLowerCase() === (destination.table ?? '').toLowerCase())
-  const targetSupportsWrites = targetExists && targetStorageType !== 'unsupported' && targetFormat === 'DELTA'
+  const planDigest = JSON.stringify({ generationDigest, destination })
+  const currentPlanDigest = useRef(planDigest)
+  currentPlanDigest.current = planDigest
   const compatibleGenerators = (field: CanonicalSchema['fields'][number]) => {
     const base = (field.original_type.match(/^[A-Za-z_]+/)?.[0] ?? '').toUpperCase()
     return generatorRegistry.filter((item) => item.types.includes(base))
   }
-  const strategyOptions = targetExists
-    ? targetSupportsWrites ? ['append', 'replace', ...(dropRecreateEligible ? ['drop_recreate'] : [])] : []
-    : ['create', 'isolated']
-  const strategyUnavailableReason = targetExists
-    ? !targetSupportsWrites
-      ? 'This existing DEV object is not confirmed as a writable Delta table; refresh its metadata before choosing a publication strategy.'
-      : !isExistingStrategy ? 'This DEV table already exists. Choose an existing-table strategy.' : ''
-    : isExistingStrategy ? 'The selected strategy requires an existing table in DEV.' : ''
+  const reconcileRules = (next: CanonicalSchema, previous: SyntheticRule[]) => next.fields.map((field) => {
+    const rule = previous.find((item) => item.column === field.name) ?? suggested(field)
+    const options = compatibleGenerators(field)
+    const compatible = !generatorRegistry.length || options.some((item) => item.id === rule.generator)
+    const fallback = options.find((item) => item.id === suggested(field).generator) ?? options[0]
+    return compatible || !fallback ? { ...rule, null_percent: field.nullable === false ? 0 : rule.null_percent }
+      : { ...suggested(field), generator: fallback.id, parameters: {}, unique: false }
+  })
+  const allStrategies = [
+    { id: 'create', label: 'Create Table' }, { id: 'isolated', label: 'Create Isolated Table' },
+    { id: 'append', label: 'Append Data' }, { id: 'replace', label: 'Replace Table Data' }, { id: 'drop_recreate', label: 'Drop & Recreate' },
+  ] as const
+  const strategyReason = (value: SyntheticDestination['strategy']) => {
+    if (targetState === 'checking' || listing) return 'Checking destination metadata'
+    if (targetState === 'error') return 'Metadata verification unavailable; retry'
+    if (!destination.catalog || !destination.schema || !destination.table) return 'Choose a DEV destination'
+    if (value === 'isolated') return '' // Selecting this explicitly proposes a distinct name, verified by GET.
+    if (value === 'create') return targetExists ? 'The destination already exists' : targetState !== 'absent' ? 'Destination existence is not verified' : ''
+    if (targetState === 'absent') return 'The DEV table does not exist'
+    if (!targetSupportsWrites) return 'The destination is not a supported managed or external Delta table'
+    if (value === 'drop_recreate' && !dropRecreateEligible) return 'Requires an unchanged Dexter experimental table with verified provenance'
+    return ''
+  }
+  const strategyUnavailableReason = strategyReason(strategy)
   const locationOptions = destinationSuggestion?.external_locations?.length ? destinationSuggestion.external_locations : externalLocations
-  const terminal = operation && ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state)
+  const terminal = Boolean(operation && ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state))
 
   useEffect(() => {
-    try { localStorage.setItem(`dexter.synthetic.draft.${node.id}`, JSON.stringify({ step: 0, rowCount, locale, seed, rules, schema, schemaSource, destination } satisfies Draft)) } catch { /* Draft is kept in memory if browser storage is unavailable. */ }
-  }, [node.id, rowCount, locale, seed, rules, schema, schemaSource, destination])
-
+    alive.current = true
+    return () => { alive.current = false; actionController.current?.abort(); previewRequestId.current += 1 }
+  }, [])
   useEffect(() => {
+    try { localStorage.setItem(`dexter.synthetic.draft.${node.id}`, JSON.stringify({ step, rowCount, locale, seed, rules, schema, schemaSource, schemaBase: editableBase.current, versions, destination } satisfies Draft)) } catch { /* In-memory draft remains available. */ }
+  }, [node.id, step, rowCount, locale, seed, rules, schema, schemaSource, schemaBase, versions, destination])
+  useEffect(() => {
+    if (!lockedSchema && !wasLocked.current) setVersions((current) => ({ ...current, [schemaBase]: { schema, rules } }))
+  }, [schema, rules, schemaBase, lockedSchema])
+  useEffect(() => {
+    if (review && step === 3) { setStep(2); setNotice('The draft or destination changed. Review the updated plan before starting.') }
+    setReview(null); setReviewId(''); setConfirmDestructive(false); setTypedConfirmation('')
+    actionController.current?.abort()
+    if (busyAction === 'review') { setLoading(false); setBusyAction('') }
+  }, [planDigest])
+  useEffect(() => {
+    if (!active) return
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: {
       kind: 'workflow', workflow: 'Prepare DEV', stage: steps[step], name: node.name,
       qualifiedName: node.qualified_name ?? node.name, environment: 'DEV',
     } }))
-  }, [node.id, node.name, node.qualified_name, step])
-
-  const loadListings = async (catalog?: string, schemaName?: string, table?: string) => {
-    setListing(true)
-    try {
-      const result = await api.syntheticDestinations(catalog, schemaName, table, !catalog ? node.id : undefined)
-      if (!catalog) {
-        setCatalogs(result.catalogs); setWarehouses(result.warehouses); setExternalLocations(result.external_locations)
-        setDestinationSuggestion(result.suggestion ?? null)
-        if (result.suggestion && !initial.destination.catalog && !destination.catalog) {
-          setDestination((current) => ({ ...current, catalog: result.suggestion!.catalog, schema: result.suggestion!.schema,
-            table: result.suggestion!.table, strategy: result.suggestion!.target_exists === true ? 'append' : result.suggestion!.target_exists === false ? 'create' : current.strategy,
-            external_location_name: result.suggestion!.suggested_external_location ?? undefined }))
-          setNotice(`Suggested ${result.suggestion.catalog}.${result.suggestion.schema} from a unique Unified Discover mapping. Confirm destination availability before continuing.`)
-        }
-      }
-      else if (!schemaName) setSchemas(result.schemas)
-      else {
-        setTables(result.tables)
-        setTargetSchema(result.target_schema ?? null)
-        setTargetStorageType(result.target_storage_type ?? null)
-        setTargetFormat(result.target_format ?? null)
-        setDropRecreateEligible(Boolean(result.drop_recreate_eligible))
-      }
-      if (result.warehouses.length) setWarehouses(result.warehouses)
-      if (result.external_locations.length) setExternalLocations(result.external_locations)
-      setError('')
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not load DEV destinations.') }
-    finally { setListing(false) }
-  }
+  }, [active, node.id, node.name, node.qualified_name, step])
 
   useEffect(() => {
-    void loadListings()
-    void api.syntheticGenerators().then((result) => setGeneratorRegistry(result.items)).catch((cause) => setError(cause instanceof Error ? cause.message : 'Generator options could not be loaded.'))
-  }, [])
+    const controller = new AbortController()
+    let active = true
+    setListing(true); setMetadataError('')
+    void api.syntheticDestinations(undefined, undefined, undefined, node.id, controller.signal, sourceEnvironment).then((result) => {
+      if (!active) return
+      setCatalogs(result.catalogs); setWarehouses(result.warehouses); setExternalLocations(result.external_locations)
+      setDestinationSuggestion(result.suggestion ?? null); setSourceStorageType(result.source_storage_type ?? null)
+      setMetadataError((result.warnings ?? []).map((item) => `${item.resource.replaceAll('_', ' ')}: ${item.message}`).join(' '))
+      if (!destinationTouched.current && !initial.destination.catalog) setDestination((current) => ({ ...current,
+        ...(result.suggestion ? { catalog: result.suggestion.catalog, schema: result.suggestion.schema, table: result.suggestion.table,
+          strategy: result.suggestion.target_exists === true ? 'append' : result.suggestion.target_exists === false ? 'create' : current.strategy,
+          external_location_name: result.suggestion.suggested_external_location ?? undefined } : {}),
+        ...(!lockedSchema && result.source_storage_type ? { storage_type: result.source_storage_type } : {}),
+      }))
+    }).catch((cause) => { if (active) setMetadataError(cause instanceof Error ? cause.message : 'Connection unavailable. Retry DEV metadata.') })
+      .finally(() => { if (active) setListing(false) })
+    void api.syntheticGenerators(controller.signal).then((result) => { if (active) { setGeneratorRegistry(result.items); setGeneratorError('') } })
+      .catch((cause) => { if (active) setGeneratorError(cause instanceof Error ? cause.message : 'Generator metadata unavailable.') })
+    void api.compareSchemas(node.id, node.id).then((result) => {
+      if (!active) return
+      const available = { ...(result.prod_schema ? { prod: result.prod_schema } : {}), ...(result.dev_schema ? { dev: result.dev_schema } : {}) }
+      setSourceSchemas((current) => ({ ...current, ...available })); setSourceError('')
+      const source = available[sourceEnvironment]
+      if (source && !schemaTouched.current && !lockedSchema) { setSchema(source); setRules(reconcileRules(source, initial.rules)) }
+    }).catch((cause) => { if (active) setSourceError(cause instanceof Error ? cause.message : 'Reference schema metadata unavailable.') })
+    return () => { active = false; controller.abort() }
+  }, [sourceKey, retryMetadata])
+
   useEffect(() => {
     if (!generatorRegistry.length) return
-    setRules((current) => current.map((rule) => {
-      const field = schema.fields.find((item) => item.name === rule.column)
-      if (!field) return rule
-      const options = compatibleGenerators(field)
-      if (options.some((item) => item.id === rule.generator)) return rule
-      const fallback = options.find((item) => item.id === suggested(field).generator) ?? options[0]
-      return fallback ? { ...rule, generator: fallback.id, parameters: {}, unique: false } : rule
-    }))
+    const next = reconcileRules(schema, rules)
+    if (JSON.stringify(next) !== JSON.stringify(rules)) {
+      setRules(next); setNotice('Rules incompatible with the current column types were reset. Compatible configurations were preserved.')
+    }
   }, [generatorRegistry, schema.fields])
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setSchemas([]); setSchemasLoading(Boolean(destination.catalog))
+    if (destination.catalog) void api.syntheticDestinations(destination.catalog, undefined, undefined, undefined, controller.signal).then((result) => {
+      if (active) setSchemas(result.schemas)
+    }).catch((cause) => { if (active) setMetadataError(cause.message) }).finally(() => { if (active) setSchemasLoading(false) })
+    return () => { active = false; controller.abort() }
+  }, [destination.catalog, retryMetadata])
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setTargetSchema(null); setTargetStorageType(null); setTargetFormat(null); setDropRecreateEligible(false); setTables([])
+    if (!destination.catalog || !destination.schema || !destination.table) {
+      setVerification({ key: fullTarget, state: 'idle' }); return
+    }
+    setVerification({ key: fullTarget, state: 'checking' })
+    const timer = window.setTimeout(() => {
+      void api.syntheticDestinations(destination.catalog, destination.schema, destination.table, undefined, controller.signal).then((result) => {
+        if (!active) return
+        setTables(result.tables); setTargetSchema(result.target_schema ?? null); setTargetStorageType(result.target_storage_type ?? null)
+        setTargetFormat(result.target_format ?? null); setDropRecreateEligible(Boolean(result.drop_recreate_eligible))
+        setVerification({ key: fullTarget, state: result.target_state === 'present' ? 'present' : result.target_state === 'absent' ? 'absent' : 'error',
+          message: result.target_state === 'unchecked' ? 'Metadata unavailable. Destination existence is not confirmed.' : undefined })
+      }).catch((cause) => { if (active) setVerification({ key: fullTarget, state: 'error', message: cause.message }) })
+    }, 200)
+    return () => { active = false; window.clearTimeout(timer); controller.abort() }
+  }, [destination.catalog, destination.schema, destination.table, retryTarget, retryMetadata])
+
+  const wasLocked = useRef(lockedSchema)
+  useEffect(() => {
+    if (lockedSchema && targetSchema) {
+      setSchema(targetSchema); setSchemaBase('dev'); setSchemaSource('dev'); setSchemaReference('dev')
+      setRules((current) => reconcileRules(targetSchema, current))
+      if (targetStorageType === 'managed' || targetStorageType === 'external') setDestination((current) => current.storage_type === targetStorageType ? current : { ...current, storage_type: targetStorageType })
+    } else if (!lockedSchema && wasLocked.current) {
+      const base = editableBase.current, saved = versions[base], next = saved?.schema ?? sourceSchemas[base]
+      if (next) { setSchema(next); setRules(reconcileRules(next, saved?.rules ?? [])); setSchemaBase(base); setSchemaSource(saved ? 'custom' : base === 'dev' ? 'dev' : 'source') }
+    }
+    wasLocked.current = lockedSchema
+  }, [lockedSchema, targetSchema, targetStorageType])
+
   useEffect(() => {
     let active = true
     void api.operations().then(async (items) => {
-      const matching = items.find((item) => {
-        if (item.kind !== 'synthetic-data') return false
-        const source = item.details?.source as { qualified_name?: string } | undefined
-        return source?.qualified_name === (node.qualified_name ?? node.name)
-          && (['queued', 'running'].includes(item.state) || (['failed', 'interrupted'].includes(item.state) && item.details?.retry_available === true))
-      })
+      const matching = items.find((item) => item.kind === 'synthetic-data'
+        && (item.details?.source as { qualified_name?: string } | undefined)?.qualified_name === (node.qualified_name ?? node.name)
+        && (['queued', 'running'].includes(item.state) || (['failed', 'interrupted'].includes(item.state) && item.details?.retry_available === true)))
       if (!matching || !active) return
       const runId = matching.details?.synthetic_run_id
       const saved = typeof runId === 'string' ? await api.syntheticRun(runId).catch(() => null) : null
       if (!active) return
       setOperation(matching); setRun(saved); setStep(4)
       if (saved?.destination) setDestination(saved.destination)
-      setNotice('Restored the latest resumable synthetic data operation from the local Operations Manager.')
     }).catch(() => undefined)
     return () => { active = false }
   }, [node.id])
   useEffect(() => {
-    if (destination.catalog) void loadListings(destination.catalog)
-  }, [destination.catalog])
-  useEffect(() => {
-    if (destination.catalog && destination.schema) void loadListings(destination.catalog, destination.schema,
-      isExistingStrategy || targetExists ? destination.table : undefined)
-  }, [destination.catalog, destination.schema, destination.table, isExistingStrategy, targetExists])
-
-  useEffect(() => {
     if (!operation?.id || terminal) return
-    let active = true
+    let active = true, polling = false
     const poll = async () => {
+      if (polling) return
+      polling = true
       try {
         const [next, nextLogs] = await Promise.all([api.operation(operation.id), api.operationLogs(operation.id)])
         if (!active) return
-        if (next.state === 'succeeded' && operation.state !== 'succeeded') onPublished?.()
+        if (next.state === 'succeeded') onPublished?.()
         setOperation(next); setLogs(nextLogs.items)
         const runId = next.details?.synthetic_run_id
-        if (typeof runId === 'string') setRun(await api.syntheticRun(runId))
-      } catch { /* transient local API errors are retried on the next poll */ }
+        if (typeof runId === 'string') { const nextRun = await api.syntheticRun(runId); if (active) setRun(nextRun) }
+      } catch { /* Operation persists locally; retry on the next poll. */ }
+      finally { polling = false }
     }
     void poll()
     const timer = window.setInterval(() => void poll(), 1400)
@@ -217,32 +297,42 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   }, [operation?.id, terminal])
 
   const updateDestination = (update: Partial<SyntheticDestination>) => {
+    destinationTouched.current = true
+    if (!lockedSchema) setVersions((current) => ({ ...current, [schemaBase]: { schema, rules } }))
+    if (lockedSchema && update.strategy && !['append', 'replace'].includes(update.strategy) && sourceStorageType) update = { ...update, storage_type: sourceStorageType }
+    if (update.strategy === 'isolated' && (targetExists || destination.table === node.name)) update = { ...update, table: `${node.name}_synthetic` }
     setDestination((current) => ({ ...current, ...update, environment: 'dev' }))
-    if (update.table) setDropRecreateEligible(false)
-    setReview(null); setOperation(null); setError('')
+    setReview(null); setError(''); setNotice('')
+  }
+  const selectSchemaBase = (base: Environment) => {
+    if (lockedSchema) { setSchemaReference(base); return }
+    const saved = versions[base], next = saved?.schema ?? sourceSchemas[base]
+    if (!next) { setError(`${base.toUpperCase()} schema metadata is unavailable. Retry reference metadata.`); return }
+    schemaTouched.current = true
+    setVersions((current) => ({ ...current, [schemaBase]: { schema, rules } }))
+    editableBase.current = base; setSchemaBase(base); setSchemaSource(saved ? 'custom' : base === 'dev' ? 'dev' : 'source')
+    setSchema(next); setRules(reconcileRules(next, saved?.rules ?? rules)); setNotice(''); setError('')
   }
   const updateRule = (column: string, update: Partial<SyntheticRule>) => setRules((items) => items.map((rule) => rule.column === column
     ? { ...rule, ...update, parameters: update.generator && update.generator !== rule.generator ? {} : update.parameters ?? rule.parameters } : rule))
   const updateParameter = (column: string, key: string, value: unknown) => setRules((items) => items.map((rule) => rule.column === column ? { ...rule, parameters: { ...rule.parameters, [key]: value } } : rule))
   const updateField = (name: string, update: Partial<CanonicalSchema['fields'][number]>) => {
-    setSchemaSource('custom')
+    schemaTouched.current = true; setSchemaSource('custom')
     const decimal = update.original_type ? /^\s*(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(update.original_type) : null
     setSchema((current) => ({ ...current, fields: current.fields.map((field) => field.name === name ? { ...field, ...update,
       canonical_type: update.original_type ? update.original_type.toLowerCase() : update.canonical_type ?? field.canonical_type,
       precision: update.original_type ? decimal ? Number(decimal[1]) : null : update.precision ?? field.precision,
       scale: update.original_type ? decimal ? Number(decimal[2]) : null : update.scale ?? field.scale } : field) }))
     if (update.name && update.name !== name) setRules((current) => current.map((rule) => rule.column === name ? { ...rule, column: update.name! } : rule))
-    setReview(null)
   }
   const addField = () => {
-    setSchemaSource('custom')
-    const name = `new_column_${schema.fields.length + 1}`
-    const field: CanonicalSchema['fields'][number] = { name, original_type: 'STRING', canonical_type: 'string', nullable: true, precision: null, scale: null, constraints: [], children: [], technology_properties: {} }
-    setSchema((current) => ({ ...current, fields: [...current.fields, field] }))
-    setRules((current) => [...current, suggested(field)])
-    setReview(null)
+    schemaTouched.current = true; setSchemaSource('custom')
+    let index = schema.fields.length + 1
+    while (schema.fields.some((field) => field.name === `new_column_${index}`)) index += 1
+    const field: CanonicalSchema['fields'][number] = { name: `new_column_${index}`, original_type: 'STRING', canonical_type: 'string', nullable: true, precision: null, scale: null, constraints: [], children: [], technology_properties: {} }
+    setSchema((current) => ({ ...current, fields: [...current.fields, field] })); setRules((current) => [...current, suggested(field)])
   }
-  const removeField = (name: string) => { setSchemaSource('custom'); setSchema((current) => ({ ...current, fields: current.fields.filter((field) => field.name !== name) })); setRules((current) => current.filter((rule) => rule.column !== name)); setReview(null) }
+  const removeField = (name: string) => { schemaTouched.current = true; setSchemaSource('custom'); setSchema((current) => ({ ...current, fields: current.fields.filter((field) => field.name !== name) })); setRules((current) => current.filter((rule) => rule.column !== name)) }
 
   const request: SyntheticRunRequest = {
     source_node_id: node.id, source_environment: sourceEnvironment,
@@ -251,100 +341,124 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
       storage_type: destination.storage_type ?? 'managed', external_location_name: destination.external_location_name },
     schema, row_count: rowCount, rules, locale, seed,
   }
-
+  const validateSchema = () => {
+    const names = schema.fields.map((field) => field.name.trim().toLowerCase())
+    if (!names.length) return 'Add at least one column before continuing.'
+    if (names.some((name) => !name)) return 'Every column needs a name.'
+    if (new Set(names).size !== names.length) return 'Column names must be unique.'
+    if (!generatorRegistry.length) return generatorError || 'Generator options are loading. Retry generator metadata if this persists.'
+    const unsupported = schema.fields.find((field) => !compatibleGenerators(field).length)
+    if (unsupported) return `No implemented generator supports ${unsupported.original_type} for column ${unsupported.name}. Change its type or remove it from this generation plan.`
+    return ''
+  }
   const generatePreview = async () => {
-    const requestId = ++previewRequestId.current
-    const requestDigest = generationDigest
-    setLoading(true); setError('')
-    try { const result = await api.syntheticPreview(schema, Math.min(rowCount, 100), rules, locale, seed); if (requestId !== previewRequestId.current || currentPreviewDigest.current !== requestDigest) return; setPreview(result.rows); setPreviewDigest(requestDigest); setNotice('Preview generated locally; no Databricks table was changed.') }
-    catch (cause) { if (requestId === previewRequestId.current && currentPreviewDigest.current === requestDigest) setError(cause instanceof Error ? cause.message : 'Preview could not be generated.') }
-    finally { if (requestId === previewRequestId.current) setLoading(false) }
+    const invalid = validateSchema()
+    if (invalid) { setError(invalid); return }
+    const requestId = ++previewRequestId.current, requestDigest = generationDigest
+    setLoading(true); setBusyAction('preview'); setError(''); setNotice('')
+    try {
+      const result = await api.syntheticPreview(schema, Math.min(rowCount, 100), rules, locale, seed)
+      if (!alive.current || requestId !== previewRequestId.current) return
+      if (currentPreviewDigest.current !== requestDigest) { setNotice('The generation settings changed during preview. Generate a new preview for the current draft.'); return }
+      setPreview(result.rows); setPreviewDigest(requestDigest)
+    } catch (cause) { if (alive.current && requestId === previewRequestId.current && currentPreviewDigest.current === requestDigest) setError(cause instanceof Error ? cause.message : 'Preview could not be generated.') }
+    finally { if (alive.current && requestId === previewRequestId.current) { setLoading(false); setBusyAction('') } }
   }
   const navigateToStep = (target: number) => {
-    if (target === 4) { if (operation) setStep(4); else setError('Execution becomes available after you review and approve a publication plan.'); return }
+    setError(''); setNotice('')
+    if (target === 4) { if (operation) setStep(4); else setError('Review and approve a publication plan before Execution.'); return }
+    if (target <= step) { actionController.current?.abort(); setStep(target as Step); return }
     if (target === 3) { void reviewPlan(); return }
-    if (target >= 2) {
-      const missing = schema.fields.find((field) => compatibleGenerators(field).length === 0)
-      if (missing) { setError(`No implemented generator supports ${missing.original_type} for column ${missing.name}. Change its type or keep it out of this generation plan.`); return }
-      const invalid = schema.fields.find((field) => !rules.some((rule) => rule.column === field.name))
-      if (invalid) { setError(`Choose a generation rule for ${invalid.name} before continuing.`); return }
-    }
-    if (target >= 1 && (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id || strategyUnavailableReason
-      || (destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && !destination.external_location_name))) {
-      setError(strategyUnavailableReason || 'Choose a DEV catalog, schema, table, SQL warehouse, and any required External Location before continuing.'); return
-    }
-    setError(''); setStep(target as Step)
+    if (target === 2) { const invalid = validateSchema(); if (invalid) { setError(invalid); return } }
+    setStep(target as Step)
   }
   const reviewPlan = async () => {
-    if (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id) { setError('Choose a DEV catalog, schema, table, and SQL warehouse before review.'); return }
+    const invalid = validateSchema()
+    if (invalid) { setError(invalid); return }
+    if (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id) { setError('Choose a DEV catalog, schema, table and SQL warehouse in Destination before reviewing publication. Local preview remains available.'); return }
     if (strategyUnavailableReason) { setError(strategyUnavailableReason); return }
-    if (destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && !destination.external_location_name) { setError('Select an External Location with verified DEV privileges before review.'); return }
-    if (['append', 'replace'].includes(strategy) && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields))) { setError('Use the selected DEV table schema before reviewing Append or Replace.'); return }
-    const unsupported = schema.fields.find((field) => !compatibleGenerators(field).length)
-    if (unsupported) { setError(`No implemented generator supports ${unsupported.original_type} for column ${unsupported.name}. Choose a supported type before review.`); return }
-    const missingRule = schema.fields.find((field) => !rules.some((rule) => rule.column === field.name))
-    if (missingRule) { setError(`Choose a generation rule for ${missingRule.name} before review.`); return }
-    setLoading(true); setError('')
-    const id = crypto.randomUUID()
-    setReviewId(id)
-    setConfirmDestructive(false); setTypedConfirmation('')
-    try { const result = await api.syntheticReview({ ...request, review_id: id }); setReview(result); setStep(3); setNotice('DEV destination, schema, permissions, and publication strategy were rechecked.') }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'Review could not be completed.') }
-    finally { setLoading(false) }
+    if (targetState !== 'present' && targetState !== 'absent') { setError('Verification pending. Confirm DEV destination metadata before publication review.'); return }
+    if (destination.storage_type === 'external' && !lockedSchema && !destination.external_location_name) { setError('Select an authorized External Location in Destination before review.'); return }
+    if (lockedSchema && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields))) { setError('The physical DEV schema is still being verified. Retry destination metadata before reviewing Append or Replace.'); return }
+    const controller = new AbortController(), digest = planDigest
+    actionController.current?.abort(); actionController.current = controller
+    setLoading(true); setBusyAction('review'); setError(''); setNotice('')
+    const id = crypto.randomUUID(); setConfirmDestructive(false); setTypedConfirmation('')
+    try {
+      const result = await api.syntheticReview({ ...request, review_id: id }, controller.signal)
+      if (!alive.current || controller.signal.aborted || currentPlanDigest.current !== digest) return
+      setError(''); setReviewId(id); setReview(result); setStep(3)
+    } catch (cause) { if (alive.current && !controller.signal.aborted) setError(cause instanceof Error ? cause.message : 'Review could not be completed.') }
+    finally { if (alive.current && actionController.current === controller) { setLoading(false); setBusyAction('') } }
   }
   const startRun = async () => {
-    if (!review) return
-    setLoading(true); setError('')
+    if (!review) { setError('Review the current plan before starting.'); return }
+    if (!review.publication_ready || review.permissions.state !== 'confirmed') { setError(review.block_reason || review.permissions.message); return }
+    if ((strategy === 'replace' || strategy === 'drop_recreate') && !confirmDestructive) { setError('Confirm the reviewed impact before starting.'); return }
+    setLoading(true); setBusyAction('start'); setError('')
     try {
       const result = await api.startSyntheticRun({ ...request, destination: review.destination, schema: review.schema,
         review_id: reviewId, plan_digest: review.plan_digest, confirm_destructive: confirmDestructive, typed_confirmation: typedConfirmation })
-      setOperation(result); setStep(4); setNotice('The isolated worker has started. Its progress is reported by the running operation.')
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'The synthetic data run could not start.') }
-    finally { setLoading(false) }
+      if (alive.current) { setOperation(result); setStep(4) }
+    } catch (cause) {
+      if (alive.current) {
+        setError(cause instanceof Error ? cause.message : 'The synthetic data run could not start.')
+        if (cause instanceof ApiError && cause.status === 409) { setReview(null); setStep(2) }
+      }
+    }
+    finally { if (alive.current) { setLoading(false); setBusyAction('') } }
   }
   const reconcileRun = async () => {
     const runId = operation?.details?.synthetic_run_id
-    if (typeof runId !== 'string') return
+    if (typeof runId !== 'string') { setError('The saved run identity is unavailable. Reopen the operation.'); return }
     setLoading(true); setError('')
     try {
       const result = await api.reconcileSyntheticRun(runId, reconcileConfirmation)
+      if (!alive.current) return
       setNotice(`${result.message} Current target: ${result.target_state.replaceAll('_', ' ')}.`)
       setOperation((current) => current ? { ...current, details: { ...current.details, reconciliation_required: false, reconciled_state: result.target_state } } : current)
-      setReconcileConfirmation('')
-      onPublished?.()
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'The current DEV state could not be reconciled safely.') }
-    finally { setLoading(false) }
+      setReconcileConfirmation(''); onPublished?.()
+    } catch (cause) { if (alive.current) setError(cause instanceof Error ? cause.message : 'The current DEV state could not be reconciled safely.') }
+    finally { if (alive.current) setLoading(false) }
   }
   const cancelRun = async () => { if (!operation) return; try { setOperation(await api.cancelOperation(operation.id)); setNotice('Cancellation requested. The worker will stop at a safe checkpoint.') } catch (cause) { setError(cause instanceof Error ? cause.message : 'Cancellation could not be requested.') } }
   const resumeRun = async () => { if (!operation) return; try { setOperation(await api.retryOperation(operation.id)); setNotice('Recovery started from verified files in the saved manifest.') } catch (cause) { setError(cause instanceof Error ? cause.message : 'This run could not be resumed.') } }
+  const displayedSchema = lockedSchema && schemaReference === 'prod' ? sourceSchemas.prod ?? schema : schema
 
   return <section className="synthetic-studio" aria-label="Synthetic Data Studio">
     <header className="synthetic-header"><div><span className="eyebrow">PREPARE DEV · SYNTHETIC DATA</span><h2>Prepare DEV</h2><code>{node.qualified_name ?? node.name} · source {sourceEnvironment.toUpperCase()}</code></div><button className="button secondary small" onClick={onClose}><X size={13} /> Close</button></header>
     {comparison && <div className="synthetic-context-note"><strong>Compare Tables context</strong><span>{comparison.state ?? 'Schema comparison'}{comparison.summary && ` · ${Object.entries(comparison.summary).filter(([, count]) => count).map(([key, count]) => `${count} ${key.replaceAll('_', '-')}`).join(' · ')}`}</span></div>}
-    <nav className="synthetic-step-strip" aria-label="Prepare DEV steps">{steps.map((label, index) => <button key={label} type="button" className={step === index ? 'active' : step > index ? 'complete' : ''} aria-current={step === index ? 'step' : undefined} disabled={Boolean(operation) && !terminal && index !== 4} onClick={() => navigateToStep(index)}><span>{step > index ? <Check size={12} /> : `0${index + 1}`}</span>{label}</button>)}</nav>
-    {error && <div className="discover-error" role="alert">{error}</div>}{notice && <p className="synthetic-notice" role="status">{notice}</p>}
+    <nav className="synthetic-step-strip" aria-label="Prepare DEV steps">{steps.map((label, index) => <button key={label} type="button" className={step === index ? 'active' : step > index ? 'complete' : ''} aria-current={step === index ? 'step' : undefined} disabled={(Boolean(operation) && !terminal && index !== 4) || (loading && busyAction === 'start')} onClick={() => navigateToStep(index)}><span>{step > index ? <Check size={12} /> : `0${index + 1}`}</span>{label}</button>)}</nav>
+    {error && <div className="discover-error" role="alert">{error}</div>}
+    {metadataError && step < 4 && <div className="workflow-remote-warning" role="alert">{metadataError}<button className="button secondary small" disabled={listing} onClick={() => { setRetryMetadata((value) => value + 1); setRetryTarget((value) => value + 1) }}>Retry DEV verification</button></div>}
+    {generatorError && <div className="workflow-remote-warning" role="alert">{generatorError}<button className="button secondary small" onClick={() => setRetryMetadata((value) => value + 1)}>Retry generators</button></div>}
+    {notice && <p className="synthetic-notice" role="status">{notice}</p>}
 
-    {step === 0 && <section className="synthetic-panel"><h3>01 · Destination</h3><p>Choose the DEV destination. Dexter reads only metadata during review; generated records are published only to this DEV profile.</p>
-      <div className="synthetic-destination-grid"><label>DEV catalog<select value={destination.catalog ?? ''} disabled={listing || !catalogs.length} onChange={(event) => updateDestination({ catalog: event.target.value, schema: '', table: '' })}><option value="">{listing ? 'Loading catalogs…' : 'Select catalog'}</option>{catalogs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
-        <label>DEV schema<select value={destination.schema ?? ''} disabled={!destination.catalog || listing} onChange={(event) => updateDestination({ schema: event.target.value, table: '' })}><option value="">Select schema</option>{schemas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
-        <label>Publication strategy<select value={strategy} onChange={(event) => updateDestination({ strategy: event.target.value as SyntheticDestination['strategy'] })}>{!strategyOptions.includes(strategy) && <option value={strategy} disabled>{strategy.replaceAll('_', ' ')} · unavailable for this target</option>}{strategyOptions.map((item) => <option key={item} value={item}>{({ create: 'Create new table', isolated: 'Create isolated table', append: 'Append to existing table', replace: 'Replace table data', drop_recreate: 'Drop & Recreate · Dexter experimental tables only' })[item]}</option>)}</select></label>
-        {isExistingStrategy ? <label>Existing DEV table<select value={destination.table ?? ''} disabled={!destination.schema || listing} onChange={(event) => updateDestination({ table: event.target.value })}><option value="">Select table</option>{tables.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.table_type}</option>)}</select></label>
-          : <label>{strategy === 'isolated' ? 'New isolated table' : 'New table'}<input value={destination.table ?? ''} onChange={(event) => updateDestination({ table: event.target.value })} placeholder={`${node.name}${strategy === 'isolated' ? '_test' : ''}`} /></label>}
-        <label>SQL warehouse<select value={destination.warehouse_id ?? ''} disabled={!warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select></label>
-        <label>Table storage<select value={destination.storage_type ?? 'managed'} disabled={strategy === 'append' || strategy === 'replace'} onChange={(event) => updateDestination({ storage_type: event.target.value as 'managed' | 'external' })}><option value="managed">Managed Delta</option><option value="external">External Delta</option></select></label>
-        {destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && <label>{strategy === 'drop_recreate' ? 'New authorized External Location' : 'Authorized External Location'}<select value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{locationOptions.filter((item) => !item.read_only).map((item) => <option key={item.name} value={item.name} disabled={item.authorized === false}>{item.name} · {item.url}{item.score ? ` · path match ${item.score}` : ''}{item.authorized === false ? ' · not authorized' : ''}</option>)}</select>{destinationSuggestion && <small>{destinationSuggestion.suggested_external_location ? 'One unique authorized location matched the mapped DEV path.' : 'No single authorized location matched confidently; choose a verified location manually.'}</small>}</label>}
+    {step === 0 && <section className="synthetic-panel"><h3>01 · Destination</h3>
+      <div className="synthetic-destination-grid"><label>DEV catalog<select aria-label="DEV catalog" value={destination.catalog ?? ''} disabled={listing || !catalogs.length} onChange={(event) => updateDestination({ catalog: event.target.value, schema: '', table: '' })}><option value="">{listing ? 'Loading catalogs…' : 'Select catalog'}</option>{catalogs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+        <label>DEV schema<select aria-label="DEV schema" value={destination.schema ?? ''} disabled={!destination.catalog || schemasLoading} onChange={(event) => updateDestination({ schema: event.target.value, table: '' })}><option value="">{schemasLoading ? 'Loading schemas…' : 'Select schema'}</option>{schemas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+        <label>Publication strategy<select aria-label="Publication strategy" value={strategy} onChange={(event) => updateDestination({ strategy: event.target.value as SyntheticDestination['strategy'] })}>{allStrategies.map((item) => {
+          const reason = strategyReason(item.id)
+          return <option key={item.id} value={item.id} disabled={Boolean(reason)}>{item.label}{reason ? ` · ${reason}` : ''}</option>
+        })}</select></label>
+        <label>{isExistingStrategy ? 'Existing DEV table' : strategy === 'isolated' ? 'New isolated table' : 'New table'}<input aria-label="DEV table" list="synthetic-dev-tables" value={destination.table ?? ''} onChange={(event) => updateDestination({ table: event.target.value })} placeholder={node.name} /><datalist id="synthetic-dev-tables">{tables.map((item) => <option key={item.name} value={item.name}>{item.table_type}</option>)}</datalist></label>
+        <label>SQL warehouse<select aria-label="DEV SQL warehouse" value={destination.warehouse_id ?? ''} disabled={!warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select><small>Required for publication review. A stopped warehouse starts only when execution requires compute.</small></label>
+        <label>Table storage<select aria-label="Table storage" value={destination.storage_type ?? 'managed'} disabled={lockedSchema} onChange={(event) => updateDestination({ storage_type: event.target.value as 'managed' | 'external' })}><option value="managed">Managed Delta</option><option value="external">External Delta</option></select>{lockedSchema && <small>Uses the existing DEV table storage. Create Isolated or eligible Drop &amp; Recreate lets you choose new storage.</small>}</label>
+        {destination.storage_type === 'external' && !lockedSchema && <label>Authorized External Location<select aria-label="External Location" value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{locationOptions.map((item) => <option key={item.name} value={item.name} disabled={item.read_only || item.authorized === false}>{item.name}{item.read_only ? ' · Read-only' : item.authorized === false ? ' · Permission denied' : item.authorized == null ? ' · Verification required' : ''}</option>)}</select></label>}
       </div>
-      {strategyUnavailableReason && <div className="synthetic-blocked-note" role="alert">{strategyUnavailableReason}</div>}
-      {strategy === 'drop_recreate' && <div className={dropRecreateEligible ? 'synthetic-permission-note confirmed' : 'synthetic-blocked-note'}>{dropRecreateEligible ? 'Dexter run provenance and physical table ID verified. The final privilege, dependency, storage, and metadata preflight is still required.' : 'Preflight required. Only unchanged Dexter experimental tables with a verified run marker and physical table ID can proceed; existing corporate tables remain ineligible.'}</div>}
-      <footer className="synthetic-actions"><small>Profile: Databricks DEV · {destination.catalog && destination.schema ? `${destination.catalog}.${destination.schema}` : 'Select a destination'}</small><button className="button primary small" disabled={listing} onClick={() => navigateToStep(1)}>Schema <ArrowRight size={13} /></button></footer>
+      <div className="workflow-verification" role="status" data-state={targetState}>{targetState === 'checking' ? <><LoaderCircle size={13} className="spin" /> Verification pending · checking DEV destination…</> : targetState === 'present' ? 'DEV destination found' : targetState === 'absent' ? 'Destination not found · a new table can be created' : targetState === 'error' ? verification.message : 'Select a DEV destination for publication.'}{targetState === 'error' && <button className="button secondary small" onClick={() => setRetryTarget((value) => value + 1)}>Retry destination</button>}</div>
+      {strategyUnavailableReason && !['checking', 'error', 'idle'].includes(targetState) && <p className="workflow-field-hint">{strategyUnavailableReason}</p>}
+      <footer className="synthetic-actions"><small>Editing and local preview are available while remote publication checks are pending.</small><button className="button primary small" onClick={() => navigateToStep(1)}>Schema <ArrowRight size={13} /></button></footer>
     </section>}
 
-    {step === 1 && <section className="synthetic-panel"><h3>02 · Schema Editor</h3><p>Start from a clearly identified schema source, then review the proposed DEV schema before publication. No DDL runs here.</p>
-      <div className="synthetic-schema-diff"><strong>Schema source · {schemaSource === 'dev' ? 'Existing DEV table' : schemaSource === 'custom' ? 'Custom draft' : sourceEnvironment.toUpperCase()}</strong><span>{['append', 'replace'].includes(strategy) ? 'The existing table schema is required and cannot be edited for this strategy.' : `${schema.fields.length} columns from ${schema.qualified_name}`}</span>{['append', 'replace'].includes(strategy) && targetSchema && <button className="button secondary small" onClick={() => { if (schemaDirty && !window.confirm('Replace the current schema edits and generation rules with the selected DEV table schema?')) return; setSchema(targetSchema); setSchemaSource('dev'); setRules(targetSchema.fields.map(suggested)); setPreviewDigest(''); setNotice('Schema source changed to the selected DEV table.') }}>Use selected DEV schema</button>}</div>
-      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{schema.fields.map((field) => <SchemaFieldEditor key={field.name} mode="synthetic" field={field} disabled={['append', 'replace'].includes(strategy)} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
-      {!['append', 'replace'].includes(strategy) && <button className="button secondary small" onClick={addField}>Add column</button>}
-      <div className="synthetic-schema-diff"><strong>Draft validation</strong><span>{schema.fields.length} columns · unsupported or capability-gated types will be explained before publication</span></div>
-      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(0)}><ArrowLeft size={13} /> Destination</button><button className="button primary small" disabled={!schema.fields.length || schema.fields.some((field) => !field.name.trim()) || (['append', 'replace'].includes(strategy) && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields)))} onClick={() => setStep(2)}>Generation Rules <ArrowRight size={13} /></button></footer>
+    {step === 1 && <section className="synthetic-panel"><h3>02 · Schema Editor</h3>
+      <div className="synthetic-schema-source" role="group" aria-label="Schema base">{(['prod', 'dev'] as const).map((base) => <button type="button" className={`button secondary small ${(lockedSchema ? schemaReference : schemaBase) === base ? 'selected' : ''}`} aria-pressed={(lockedSchema ? schemaReference : schemaBase) === base} key={base} disabled={base === 'dev' ? !(lockedSchema ? targetSchema : sourceSchemas.dev) : !sourceSchemas.prod} onClick={() => selectSchemaBase(base)}>{base.toUpperCase()}{lockedSchema && base === 'prod' ? ' · reference' : ''}</button>)}<span>{lockedSchema ? `Effective schema · DEV · ${targetSchema?.qualified_name ?? 'Verification pending'}` : `${schemaBase.toUpperCase()} base${schemaSource === 'custom' ? ' · Edited draft' : ''} · ${schema.fields.length} columns`}</span></div>
+      {sourceError && <p className="workflow-field-hint">{sourceError}<button className="button secondary small" onClick={() => setRetryMetadata((value) => value + 1)}>Retry reference metadata</button></p>}
+      {lockedSchema && <p className="workflow-field-hint">Append and Replace Data preserve the physical DEV schema. PROD is available as a reference; return to Destination to choose a strategy that permits structural changes.</p>}
+      {lockedSchema && !targetSchema && <p className="workflow-field-hint" role="status">DEV schema verification is pending. Local preview can use the preserved draft; publication remains blocked.</p>}
+      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{displayedSchema.fields.map((field, index) => <SchemaFieldEditor key={index} mode="synthetic" field={field} disabled={lockedSchema} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
+      {!lockedSchema && <button className="button secondary small" onClick={addField}>Add column</button>}
+      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(0)}><ArrowLeft size={13} /> Destination</button><button className="button primary small" onClick={() => navigateToStep(2)}>Generation Rules <ArrowRight size={13} /></button></footer>
     </section>}
 
     {step === 2 && <section className="synthetic-panel"><h3>03 · Generation Rules</h3><p>DuckDB generates structured values. Mimesis is used only for semantic fields such as names, addresses, and phone numbers.</p>
@@ -367,7 +481,7 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
         </div><div className="synthetic-null-control"><input aria-label={`Null percentage for ${field.name}`} type="number" min={0} max={100} disabled={field.nullable === false} value={rule.null_percent} onChange={(event) => updateRule(field.name, { null_percent: Number(event.target.value) })} /><label><input type="checkbox" checked={rule.unique} disabled={!['sequence','integer_range'].includes(rule.generator)} onChange={(event) => updateRule(field.name,{ unique: event.target.checked })} />Unique</label></div></div>
       })}</div>
       {preview.length > 0 && previewDigest === generationDigest && <div className="synthetic-preview"><h4>Real generated preview · {preview.length} rows</h4><table><thead><tr>{schema.fields.map((field) => <th key={field.name}>{field.name}</th>)}</tr></thead><tbody>{preview.slice(0, 12).map((row, index) => <tr key={index}>{schema.fields.map((field) => <td key={field.name}>{String(row[field.name] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}{previewDigest && previewDigest !== generationDigest && <div className="synthetic-blocked-note" role="status">The draft changed after this preview. Generate a new preview to review current values.</div>}
-      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(1)}><ArrowLeft size={13} /> Schema</button><div><button className="button secondary small" disabled={loading} onClick={() => void generatePreview()}>{loading ? <LoaderCircle size={13} className="spin" /> : <Sparkles size={13} />} Preview ≤100 rows</button><button className="button primary small" disabled={loading} onClick={() => void reviewPlan()}>Review Plan <ArrowRight size={13} /></button></div></footer>
+      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(1)}><ArrowLeft size={13} /> Schema</button><div><button className="button secondary small" disabled={loading} onClick={() => void generatePreview()}>{busyAction === 'preview' ? <LoaderCircle size={13} className="spin" /> : <Sparkles size={13} />} {busyAction === 'preview' ? 'Generating preview…' : 'Preview ≤100 rows'}</button><button className="button primary small" disabled={loading} onClick={() => void reviewPlan()}>{busyAction === 'review' ? <><LoaderCircle size={13} className="spin" /> Checking publication…</> : 'Review Plan'} <ArrowRight size={13} /></button></div></footer>
     </section>}
 
     {step === 3 && review && <section className="synthetic-panel"><h3>04 · Review Plan</h3><p>These details are re-read from the configured DEV profile immediately before the run begins.</p>
@@ -375,9 +489,9 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
       <div className="synthetic-schema-diff"><strong>Schema change plan</strong>{Object.entries(review.schema_changes).map(([key, values]) => <span key={key}>{key}: {values.length ? values.join(', ') : 'none'}</span>)}</div>
       <div className="synthetic-schema-diff"><strong>Publication plan</strong>{review.publication_plan.map((item, index) => <span key={`${item.stage}-${index}`}><b>{item.stage}</b> · {item.action}</span>)}</div>
       <div className={`synthetic-runtime-note ${review.runtime.mechanism === 'systemd-user-cgroup-v2' ? 'confirmed' : 'degraded'}`}><strong>Worker resource policy · {review.runtime.mechanism}</strong><span>{review.runtime.memory_limit_message} Queue capacity {review.runtime.max_pending_files}; local staging cap {(review.runtime.staging_limit_bytes / 1024 / 1024).toFixed(0)} MiB.</span></div>
-      <div className={`synthetic-permission-note ${review.permissions.state}`}><strong>{review.permissions.state === 'confirmed' ? 'Permissions verified' : 'Publication blocked'}</strong><span>{review.permissions.message}</span></div>
+      <div className={`synthetic-permission-note ${review.permissions.state}`}><strong>{review.permissions.state === 'confirmed' ? 'Permissions verified' : 'Publication blocked'}</strong><span>{review.permissions.message}</span>{review.permissions.state !== 'confirmed' && <button className="button secondary small" disabled={loading} onClick={() => void reviewPlan()}>Retry publication verification</button>}</div>
       {review.warnings.filter((warning) => warning !== review.block_reason).map((warning) => <div className="synthetic-blocked-note" key={warning}>{warning}</div>)}
-      {review.block_reason && <div className="synthetic-blocked-note">{review.block_reason}</div>}
+      {review.block_reason && review.block_reason !== review.permissions.message && <div className="synthetic-blocked-note" role="alert">{review.block_reason}<button className="button secondary small" disabled={loading} onClick={() => void reviewPlan()}>Retry publication verification</button></div>}
       {strategy === 'replace' && <div className="synthetic-destructive-confirm"><label><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand the existing DEV table rows will be replaced; its schema and properties will remain.</label></div>}
       {strategy === 'drop_recreate' && review.destructive_plan && <section className="synthetic-destructive-review"><h4>Destructive preflight · {review.destructive_plan.status.replaceAll('_', ' ')}</h4><p>Plan {review.destructive_plan.plan_id} · {review.destructive_plan.eligibility}</p>
         <div className="synthetic-schema-diff"><strong>Impact</strong><span>Remove: {review.destructive_plan.impacts.removed}</span><span>Recreate: {review.destructive_plan.impacts.recreated}</span><span>Preserved: {review.destructive_plan.impacts.preserved.join(', ') || 'none'}</span><span>Not preserved: {review.destructive_plan.impacts.not_preserved.join(', ') || 'none'}</span><span>New storage location: {review.destructive_plan.new_location ?? 'Managed storage'}</span></div>
@@ -388,7 +502,8 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
         {review.destructive_plan.block_reasons.map((reason) => <div className="synthetic-blocked-note" key={reason}>{reason}</div>)}
         <div className="synthetic-destructive-confirm"><label><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand this action drops and recreates the existing DEV table after all generated files are uploaded and verified.</label><label>Type the physical target <code>{fullTarget}</code><input value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)} /></label><small>Confirmation is bound to this preflight plan and expires if table metadata or privileges change.</small></div>
       </section>}
-      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(2)}><ArrowLeft size={13} /> Edit plan</button><button className="button primary small" disabled={loading || !review.publication_ready || review.permissions.state !== 'confirmed' || (strategy === 'replace' && !confirmDestructive) || (strategy === 'drop_recreate' && (!confirmDestructive || typedConfirmation !== fullTarget))} onClick={() => void startRun()}>{loading ? <LoaderCircle size={13} className="spin" /> : null} Approve &amp; Start <ArrowRight size={13} /></button></footer>
+      {review.publication_ready && review.permissions.state === 'confirmed' && ['replace', 'drop_recreate'].includes(strategy) && !confirmDestructive && <p className="workflow-field-hint">Confirm the impact above to enable Approve &amp; Start.</p>}
+      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(2)}><ArrowLeft size={13} /> Edit plan</button><button className="button primary small" disabled={loading || !review.publication_ready || review.permissions.state !== 'confirmed' || (strategy === 'replace' && !confirmDestructive) || (strategy === 'drop_recreate' && (!confirmDestructive || typedConfirmation !== fullTarget))} onClick={() => void startRun()}>{loading ? <LoaderCircle size={13} className="spin" /> : null} Approve &amp; Start <ArrowRight size={13} /></button></footer>
     </section>}
 
     {step === 4 && operation && <section className="synthetic-panel synthetic-execution"><h3>05 · Execution · {operation.state.toUpperCase()}</h3><p>{operation.message}</p><div className="operation-progress-track"><span style={{ width: `${operation.progress}%` }} /></div><strong>{operation.progress}% · {operation.details?.phase ?? 'queued'}</strong>
@@ -425,6 +540,6 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
       {['failed','interrupted'].includes(operation.state) && operation.details?.retry_available && <button className="button secondary small" onClick={() => void resumeRun()}><RefreshCw size={12} /> Resume from manifest</button>}
       <footer className="synthetic-actions"><small>{operation.details?.memory_limit_bytes ? 'OS cgroup limit active · 256 MiB aggregate worker budget' : operation.details?.rss_guard_bytes ? `RSS guard · ${(Number(operation.details.rss_guard_bytes)/1024/1024).toFixed(0)} MiB; hard ceiling not guaranteed` : 'Resource policy not reported'}</small>{operation.state === 'succeeded' && <button className="button primary small" onClick={onClose}>Finish</button>}</footer>
     </section>}
-    {step < 3 && <div className="synthetic-footer-note"><Sparkles size={13} /><span>Generation uses schema metadata only. It does not read PROD records; publication is restricted to the local DEV Databricks profile.</span></div>}
+
   </section>
 }

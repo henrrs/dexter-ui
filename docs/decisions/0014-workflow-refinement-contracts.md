@@ -22,11 +22,19 @@ Compare Tables, Schema Evolution, and Prepare DEV share schema metadata but have
 
 ## Consequences
 
+### Stabilization on 2026-11-08
+
+Navigation to Schema and Generation Rules does not require remote publication checks or a warehouse. Append/Replace select the observed physical DEV schema and storage because those strategies preserve the table; editable schema/rule snapshots remain available when returning to a creation strategy. Switching PROD/DEV bases restores the respective draft instead of discarding compatible edits. Open workflow tabs retain their own React sessions and only the active one emits context.
+
+Draft columns carry `origin` (`dev`, `prod`, `manual`) through SQLite serialization, undo, removal/restoration and review. Modified/removed presentation uses the draft operation and its baseline; canonical Schema Diff does not infer editing provenance. Autosave uses the physical DEV node ID; persisted client-added columns may be omitted by Undo, while baseline columns must remain represented.
+
+Bound workflow requests, request cancellation and snapshot checks reject obsolete responses. Structured verification distinguishes confirmed 403/404 from network failures and unclassified metadata errors. An unverified review can be inspected but never executed. A repeated accepted start with the same review ID reuses the saved synthetic run and operation, including after a lost HTTP response; execution still rechecks a fresh review and all existing safety gates before its first acceptance.
+
 These checks reduce invalid plans before review while keeping final publication and schema-plan validation on the backend. They do not certify a live Databricks workspace; API permission checks and destination suggestions still require the configured local DEV identity at runtime. Types unsupported by the current generator or table protocol remain unavailable rather than being coerced.
 
 ## Alternatives rejected
 
-- Guessing DEV names from `_dev` suffixes or auto-switching schema to match a publication strategy: rejected because logical/physical mappings differ and edits would be lost.
+- Guessing DEV names from `_dev` suffixes or discarding edits when selecting a strategy: rejected because logical/physical mappings differ and edits must be preserved.
 - Choosing the first External Location or any location with one matching word: rejected because it is neither confident path evidence nor proof of effective permission.
 - Showing every generator for every SQL type or using a sequence fallback: rejected because options would advertise invalid data plans.
 - Letting asynchronous preview responses replace the latest user draft: rejected because the displayed values could describe a different plan.

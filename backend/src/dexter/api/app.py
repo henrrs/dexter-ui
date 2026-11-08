@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import binascii
 import json
 import logging
 import shutil
@@ -299,6 +298,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     schema_evolution_slots = threading.BoundedSemaphore(2)
     schema_evolution_active_targets: set[str] = set()
     schema_evolution_target_lock = threading.Lock()
+    synthetic_start_lock = threading.Lock()
 
     def materialization_finished(operation_id: str, worker_id: str, _future) -> None:
         try:
@@ -355,8 +355,9 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException):
         codes = {400: "BAD_REQUEST", 403: "FORBIDDEN", 404: "NOT_FOUND", 409: "CONFLICT", 422: "INVALID_REQUEST"}
-        message = exc.detail if isinstance(exc.detail, str) else "The request could not be completed."
-        return JSONResponse({"error": {"code": codes.get(exc.status_code, "REQUEST_FAILED"), "message": message}}, status_code=exc.status_code, headers=exc.headers)
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        message = exc.detail if isinstance(exc.detail, str) else detail.get("message", "The request could not be completed.")
+        return JSONResponse({"error": {"code": detail.get("code", codes.get(exc.status_code, "REQUEST_FAILED")), "message": message}}, status_code=exc.status_code, headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def internal_error(_request: Request, exc: Exception):
@@ -649,8 +650,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             from databricks.sdk import WorkspaceClient
             from dexter.adapters.databricks import profile_config_file
             return WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
-        except Exception:
-            raise HTTPException(503, detail="The configured Databricks DEV profile could not authenticate") from None
+        except Exception as exc:
+            raise _remote_failure(exc) from None
+
+    def _remote_failure(exc):
+        from dexter.adapters.databricks_diagnostics import classify_failure
+        diagnosis = classify_failure(exc)
+        logger.info("DEV verification failed: %s (%s)", diagnosis["code"], type(exc).__name__)
+        return HTTPException(diagnosis["status"], detail={"code": diagnosis["code"], "message": diagnosis["message"]})
 
     def _schema_evolution_canonical(detail: dict, qualified_name: str):
         from dexter.domain.schema import canonical_schema
@@ -678,7 +685,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(403, detail="Schema Evolution is restricted to the configured Databricks DEV profile")
         detail = discover.detail(physical_id, force=force)
         if not detail or detail.get("access") != "read" or detail.get("kind") != "table":
-            raise HTTPException(403, detail="DEV table metadata is unavailable or read access is not confirmed")
+            raise HTTPException(409, detail={"code": "metadata_unavailable", "message": "Metadata unavailable. The physical DEV table schema could not be verified."})
         config = settings_repo.get("databricks.dev")
         if not config or not config.get("profile"):
             raise HTTPException(409, detail="No Databricks DEV profile is configured")
@@ -690,8 +697,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             principal = workspace.current_user.me()
             principal_id = str(getattr(principal, "id", None) or getattr(principal, "user_name", None) or "unknown")
             host = safe_workspace_host(config["profile"])
-        except Exception:
-            raise HTTPException(503, detail="The configured Databricks DEV profile could not authenticate") from None
+        except Exception as exc:
+            raise _remote_failure(exc) from None
         if not host or detail.get("workspace") != host:
             raise HTTPException(403, detail="The table workspace does not match the configured DEV profile")
         technology = detail.get("technology_properties") or {}
@@ -711,7 +718,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     def _schema_capabilities(workspace, identity):
         from dexter.adapters.databricks_schema_evolution import inspect_table
-        target, capabilities = inspect_table(workspace, identity)
+        try:
+            target, capabilities = inspect_table(workspace, identity)
+        except Exception as exc:
+            raise _remote_failure(exc) from None
         if not capabilities["delta"]:
             capabilities["blocker"] = "Schema Evolution currently supports Delta tables only."
         if capabilities["table_type"] not in {"MANAGED", "EXTERNAL"}:
@@ -834,7 +844,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         source = next((item for item in variants if item.get("environment") == body.source_environment and item.get("access") == "read"), None)
         if source is None:
             raise HTTPException(403, detail="A readable Databricks schema is required as the generation reference")
-        source_detail = unified.detail(body.source_node_id, str(source["environment"]))
+        try:
+            source_detail = unified.detail(body.source_node_id, str(source["environment"]))
+        except Exception as exc:
+            raise _remote_failure(exc) from None
         source_columns = source_detail.get("columns") if isinstance(source_detail, dict) else None
         if not isinstance(source_columns, list) or not source_columns:
             raise HTTPException(409, detail="The source table schema is unavailable; load its schema before continuing")
@@ -855,6 +868,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(422, detail="The selected publication strategy is unsupported")
         if destination["storage_type"] not in {"managed", "external"}:
             raise HTTPException(422, detail="Choose Managed or External storage")
+        strategy = destination["strategy"]
         workspace = _synthetic_workspace()
         try:
             warehouses = list(workspace.warehouses.list())
@@ -867,7 +881,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             except Exception as exc:
                 status = getattr(exc, "status_code", None)
                 code = str(getattr(exc, "error_code", "")).upper()
-                if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"} or "not found" in str(exc).casefold():
+                if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST", "NOT_FOUND"}:
                     target, exists = None, False
                 else:
                     raise
@@ -877,13 +891,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             if exists:
                 columns = getattr(target, "columns", None) or []
                 if not columns:
-                    raise HTTPException(403, detail="The DEV profile cannot inspect the destination schema")
+                    raise HTTPException(409, detail={"code": "metadata_unavailable", "message": "Metadata unavailable. Databricks returned no columns for the selected DEV table."})
                 actual_schema = canonical_schema(list(columns), table_name, complete=True)
                 table_type = str(getattr(target, "table_type", "")).upper().split(".")[-1]
                 actual_storage = "external" if table_type == "EXTERNAL" else "managed" if table_type == "MANAGED" else "unsupported"
                 actual_location = getattr(target, "storage_location", None)
             if exists and strategy in {"append", "replace", "drop_recreate"} and actual_storage == "unsupported":
-                raise HTTPException(409, detail="The selected DEV object is not a writable managed or external table; choose a different destination.")
+                raise HTTPException(409, detail={"code": "operation_unsupported", "message": "Operation unsupported. The DEV object is not a managed or external table."})
+            if exists and strategy in {"append", "replace", "drop_recreate"} and str(getattr(target, "data_source_format", "")).upper().split(".")[-1] != "DELTA":
+                raise HTTPException(409, detail={"code": "operation_unsupported", "message": "Operation unsupported. This strategy requires a Delta table."})
             from dexter.adapters.databricks_synthetic_publisher import external_uri_is_safe
             selected_external = None
             if destination["storage_type"] == "external" and destination["strategy"] in {"create", "isolated", "drop_recreate"}:
@@ -945,9 +961,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     (selected_external or {}).get("name"))
                 permission_check = {"state": "confirmed", "message": "DEV publication privileges are available."}
             except Exception as exc:
-                permission_check = {"state": "blocked", "message": str(exc)}
-            if permission_check["state"] != "confirmed" and strategy != "drop_recreate":
-                raise HTTPException(403, detail=permission_check["message"])
+                from dexter.adapters.databricks_diagnostics import classify_failure
+                diagnosis = classify_failure(exc)
+                permission_check = {"state": diagnosis["code"], "message": diagnosis["message"]}
+            # Review remains inspectable when verification fails; execution is gated below.
             if destination["storage_type"] == "external" and selected_external:
                 destination["external_location"] = selected_external
             source_table_name = str(source_schema.get("qualified_name", "")).rsplit(".", 1)[-1].casefold()
@@ -1017,6 +1034,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             digest = hashlib.sha256(json_module.dumps(review_document, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
             publication_ready = strategy != "drop_recreate" or bool(destructive_plan and destructive_plan.get("status") == "ready_for_confirmation")
             block_reason = ((destructive_plan or {}).get("block_reasons") or [None])[0] if not publication_ready else None
+            if permission_check["state"] != "confirmed":
+                publication_ready, block_reason = False, permission_check["message"]
             impact_warnings = ([block_reason] if block_reason else [])
             if strategy == "replace":
                 impact_warnings.append("Existing DEV table rows will be atomically replaced after the staged snapshot is validated; its schema and table properties are preserved.")
@@ -1068,29 +1087,41 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         except HTTPException:
             raise
         except Exception as exc:
-            logger.info("Synthetic DEV review failed (%s)", type(exc).__name__)
-            raise HTTPException(503, detail="The DEV destination metadata or permissions could not be verified") from None
+            raise _remote_failure(exc) from None
 
     @app.get("/api/synthetic/destinations")
     def synthetic_destinations(catalog: str | None = None, schema: str | None = None, table: str | None = None,
-                               source_node_id: str | None = None):
+                               source_node_id: str | None = None, source_environment: str = "prod"):
+        if source_environment not in {"prod", "dev"}:
+            raise HTTPException(422, detail="Choose a DEV or PROD reference environment")
         workspace = _synthetic_workspace()
         try:
-            warehouses = [{"id": item.id, "name": item.name, "state": str(item.state).upper().split(".")[-1]}
-                          for item in workspace.warehouses.list()]
+            warehouses, warnings = [], []
             if catalog is None:
+                try:
+                    warehouses = [{"id": item.id, "name": item.name, "state": str(item.state).upper().split(".")[-1]}
+                                  for item in workspace.warehouses.list()]
+                except Exception as exc:
+                    from dexter.adapters.databricks_diagnostics import classify_failure
+                    warnings.append({**classify_failure(exc), "resource": "warehouses"})
                 catalogs = [{"name": item.name} for item in workspace.catalogs.list()]
                 try:
                     locations = list(workspace.external_locations.list())
                     external_locations = [{"name": item.name, "url": getattr(item, "url", ""), "read_only": bool(getattr(item, "read_only", False))} for item in locations]
-                except Exception:
+                except Exception as exc:
+                    from dexter.adapters.databricks_diagnostics import classify_failure
+                    warnings.append({**classify_failure(exc), "resource": "external_locations"})
                     locations, external_locations = [], []
                 suggestion = None
+                source_storage_type = None
                 if source_node_id:
                     try:
                         kind, source_variants, _availability = _variants(source_node_id)
-                        source = next((item for item in source_variants if item.get("environment") == "prod"), None)
-                        source = source or next((item for item in source_variants if item.get("environment") == "dev"), None)
+                        source = next((item for item in source_variants if item.get("environment") == source_environment), None)
+                        if source:
+                            source_detail = unified.detail(source_node_id, source["environment"])
+                            storage_type = str((source_detail.get("technology_properties") or {}).get("table_type", "")).upper().split(".")[-1]
+                            source_storage_type = "external" if storage_type == "EXTERNAL" else "managed" if storage_type == "MANAGED" else None
                         if kind == "table" and source and source.get("schema") and source.get("table"):
                             logical_catalog = str(source.get("logical_catalog") or source.get("catalog") or "")
                             roots = unified.catalogs(force=False).get("items", [])
@@ -1109,7 +1140,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                     except Exception as exc:
                                         status = getattr(exc, "status_code", None)
                                         code = str(getattr(exc, "error_code", "")).upper()
-                                        if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"} or "not found" in str(exc).casefold():
+                                        if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST", "NOT_FOUND"}:
                                             target_exists = False
                                         else:
                                             target_exists = None
@@ -1119,41 +1150,46 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                                   "target_state": "present" if target_exists is True else "absent" if target_exists is False else "unknown",
                                                   "source": str(source.get("catalog", "")) + "." + str(source["schema"]) + "." + str(source["table"]),
                                                   "mapping": "unique_unified_discover_match"}
-                    except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+                    except Exception as exc:
+                        logger.info("Optional destination suggestion unavailable (%s)", type(exc).__name__)
+                        warnings.append({"code": "metadata_unavailable", "message": "Reference metadata is unavailable. Choose a DEV destination manually or retry reference metadata in Schema.", "resource": "reference_metadata"})
                         suggestion = None
                 # Location scores are hints only. A location is auto-suggested only when the
                 # highest score is unique and effective DEV grants have been verified.
-                if suggestion and locations:
+                if locations:
                     from dexter.adapters.databricks_synthetic_publisher import _privileges
                     from dexter.domain.synthetic import rank_external_locations
                     authorized_names = set()
+                    unknown_names = set()
                     try:
                         user = workspace.current_user.me()
                         principal = getattr(user, "user_name", None) or getattr(user, "display_name", None)
                     except Exception:
                         principal = None
                     for location in locations:
-                        url = str(getattr(location, "url", "") or "")
                         name = str(getattr(location, "name", "") or "")
-                        search = f"{name} {url}".casefold()
-                        path_match = suggestion["catalog"].casefold() in search and suggestion["schema"].casefold() in search
-                        if principal and path_match and not getattr(location, "read_only", False):
+                        if principal and not getattr(location, "read_only", False):
                             try:
                                 effective = workspace.grants.get_effective(securable_type="EXTERNAL_LOCATION", full_name=name, principal=principal)
                                 privileges = _privileges(effective)
                                 if {"CREATE_EXTERNAL_TABLE", "EXTERNAL_USE_LOCATION"}.issubset(privileges):
                                     authorized_names.add(name)
                             except Exception:
-                                pass
+                                unknown_names.add(name)
+                        elif not principal:
+                            unknown_names.add(name)
+                    external_locations = [{**item, "authorized": None if item["name"] in unknown_names else item["name"] in authorized_names} for item in external_locations]
                     ranked, best_location = rank_external_locations(
                         [{"name": str(getattr(item, "name", "") or ""), "url": str(getattr(item, "url", "") or ""),
                           "read_only": bool(getattr(item, "read_only", False))} for item in locations],
-                        catalog=suggestion["catalog"], schema=suggestion["schema"], table=suggestion["table"],
+                        catalog=(suggestion or {}).get("catalog", ""), schema=(suggestion or {}).get("schema", ""), table=(suggestion or {}).get("table", ""),
                         authorized_names=authorized_names)
-                    suggestion["external_locations"] = ranked
-                    suggestion["suggested_external_location"] = best_location
+                    if suggestion:
+                        suggestion["external_locations"] = [{**item, "authorized": None if item["name"] in unknown_names else item["authorized"]} for item in ranked]
+                        suggestion["suggested_external_location"] = best_location
                 return {"catalogs": catalogs, "schemas": [], "tables": [], "warehouses": warehouses,
-                        "external_locations": external_locations, "suggestion": suggestion}
+                        "external_locations": external_locations, "suggestion": suggestion,
+                        "source_storage_type": source_storage_type, "warnings": warnings}
             schemas = [{"name": item.name} for item in workspace.schemas.list(catalog_name=catalog)] if schema is None else []
             tables = [{"name": item.name, "table_type": str(item.table_type).upper().split(".")[-1],
                        "data_source_format": str(getattr(item, "data_source_format", "")).upper().split(".")[-1]}
@@ -1162,8 +1198,19 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             drop_recreate_eligible = False
             target_storage_type = None
             target_format = None
+            target_state = "unchecked"
             if table and catalog and schema:
-                target = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
+                try:
+                    target = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
+                except Exception as exc:
+                    from dexter.adapters.databricks_diagnostics import classify_failure
+                    diagnosis = classify_failure(exc)
+                    if diagnosis["code"] != "destination_not_found":
+                        raise
+                    return {"catalogs": [], "schemas": [], "tables": tables, "warehouses": [],
+                            "external_locations": [], "target_state": "absent", "target_schema": None,
+                            "drop_recreate_eligible": False}
+                target_state = "present"
                 from dexter.domain.schema import canonical_schema
                 from dexter.services.synthetic_runs import SyntheticRunRepository
                 target_schema = canonical_schema(list(getattr(target, "columns", None) or []),
@@ -1182,13 +1229,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                         workspace_identity=workspace_identity, table_id=getattr(target, "table_id", None))
                     and not repository.destructive_target_locked(
                         {"catalog": catalog, "schema": schema, "table": table}, workspace_identity))
-            return {"catalogs": [], "schemas": schemas, "tables": tables, "target_schema": target_schema,
+            return {"catalogs": [], "schemas": schemas, "tables": tables, "target_schema": target_schema, "target_state": target_state,
                     "target_storage_type": target_storage_type, "target_format": target_format,
                     "drop_recreate_eligible": drop_recreate_eligible,
                     "warehouses": warehouses, "external_locations": []}
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.info("DEV destination listing failed (%s)", type(exc).__name__)
-            raise HTTPException(503, detail="Could not list destinations available to the DEV profile") from None
+            raise _remote_failure(exc) from None
 
     @app.get("/api/synthetic/generators")
     def synthetic_generators():
@@ -1201,6 +1249,18 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     @app.post("/api/synthetic/runs", status_code=202)
     def start_synthetic_run(body: SyntheticStartRequest):
+        with synthetic_start_lock:
+            return _start_synthetic_run(body)
+
+    def _start_synthetic_run(body: SyntheticStartRequest):
+        from dexter.services.synthetic_runs import SyntheticRunRepository
+        repository = SyntheticRunRepository(paths.database)
+        run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "dexter:synthetic:" + body.review_id)) if body.review_id else str(uuid.uuid4())
+        existing = repository.get(run_id)
+        if existing:
+            if (existing.get("manifest", {}).get("review") or {}).get("plan_digest") != body.plan_digest:
+                raise HTTPException(409, detail="This review already started a different plan. Review the current draft again.")
+            return operations.get(existing["operation_id"])
         reviewed = _synthetic_schema_request(body)
         if reviewed["plan_digest"] != body.plan_digest:
             raise HTTPException(409, detail="Destination metadata or plan changed after review. Review it again before starting.")
@@ -1217,15 +1277,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         if not capability.available:
             raise HTTPException(503, detail=capability.message)
         from dexter.domain.synthetic import ColumnRule, SyntheticGenerationPlan
-        from dexter.services.synthetic_runs import SyntheticRunRepository
         rules = tuple(ColumnRule(column=item.column, generator=item.generator, parameters=item.parameters,
                                  null_percent=item.null_percent, unique=item.unique) for item in body.rules)
         plan = SyntheticGenerationPlan(reviewed["schema"], body.row_count, rules, body.locale, body.seed,
                                        publication=reviewed["destination"])
         operation = operations.create("synthetic-data", "Synthetic data run queued")
-        run_id, worker_id = str(uuid.uuid4()), uuid.uuid4().hex
-        SyntheticRunRepository(paths.database).create(run_id, operation["id"], plan.to_dict(), reviewed["destination"], review=reviewed)
+        worker_id = uuid.uuid4().hex
+        repository.create(run_id, operation["id"], plan.to_dict(), reviewed["destination"], review=reviewed)
         operations.update_details(operation["id"], synthetic_run_id=run_id, plan_digest=body.plan_digest,
+                                  review_id=body.review_id,
                                   source=reviewed["source"], runtime_capability=capability.mechanism,
                                   retry_available=True, phase="queued")
         if not operations.acquire_worker_lease(operation["id"], worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS):

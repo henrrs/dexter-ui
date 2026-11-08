@@ -124,3 +124,11 @@ Validation on 2026-11-08:
 - `python3 -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
 - The complete backend suite was attempted but cannot pass in this checkout's `.venv`: `duckdb`, `pyarrow`, FastAPI, and httpx are absent. Five materialization/generation tests therefore errored or failed due missing runtime packages; seven existing tests were skipped. The new HTTP generator-contract test is also skipped until FastAPI/httpx are installed. No package install was attempted because the configured package registry is the project’s deny-by-default placeholder.
 - No live Databricks workspace or table data was accessed. Destination mapping and effective-grant ranking are covered only by code paths and domain/API contract definitions here; a configured DEV workspace is required for live certification.
+
+## F4.2/F4.3 workflow stabilization
+
+Validation on 2026-11-08 uses a real Firefox frontend plus controlled local HTTP fixtures for navigation and separate HTTP/backend tests with fake Databricks SDK responses. The complete backend suite passes (147 tests) using the already installed sibling interpreter with this checkout's Mimesis on PYTHONPATH. No dependency download or registry fallback was used.
+
+`npm run test:ui` covers the five requested journeys: Schema Evolution from Compare and Workbench, existing DEV publication, isolated creation with both schema bases/storage options, classified remote failures and recovery, and the five-stage layout at FHD/4K. Additional assertions cover stale responses, in-flight draft edits, canceled review navigation, preview invalidation, timeout recovery and post-review drift. `node --test scripts/ui-contract.test.mjs`, production build, Python compilation and whitespace checks pass.
+
+The [stabilization report](workflow-stabilization.md) records root causes, corrections, evidence paths and the live Databricks certification boundary. Browser screenshots and results are generated under `.run/workflow-evidence/`; they are not committed.

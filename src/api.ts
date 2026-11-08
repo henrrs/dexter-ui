@@ -1,15 +1,32 @@
 import type { Connections, Operation } from './types'
 
+export class ApiError extends Error {
+  constructor(message: string, public code: string, public status: number) { super(message); this.name = 'ApiError' }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const response = await fetch(`/api${path}`, {
+  const bounded = /^\/(synthetic|schema-evolution|operations)(?:\/|\?|$)/.test(path) || path === '/discover/schema-compare'
+  const timeout = bounded ? AbortSignal.timeout(60000) : null
+  let response: Response
+  try { response = await fetch(`/api${path}`, {
     ...init,
     headers,
+    signal: timeout ? init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout : init?.signal,
+  }) } catch (cause) {
+    if (init?.signal?.aborted) throw cause
+    throw new ApiError(cause instanceof Error && cause.name === 'TimeoutError'
+      ? 'Verification timed out. Your draft is preserved; retry the action.'
+      : 'Connection unavailable. The local API could not be reached; retry the action.', 'connection_unavailable', 0)
+  }
+  const payload = await response.json().catch(() => {
+    throw new ApiError('The local API returned an incomplete response. Your draft is preserved; retry the action.', 'metadata_unavailable', response.status)
   })
-  const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throw new Error(payload?.detail ?? payload?.error?.message ?? `Request failed (${response.status})`)
+    const detail = payload?.detail ?? payload?.error
+    const message = typeof detail === 'string' ? detail : Array.isArray(detail) ? detail.map((item) => item.msg ?? 'Invalid request').join('; ') : detail?.message
+    throw new ApiError(message ?? `Request failed (${response.status})`, detail?.code ?? 'request_failed', response.status)
   }
   return payload as T
 }
@@ -31,16 +48,16 @@ export const api = {
   previewRemote: (nodeId: string, environment: 'dev' | 'prod', warehouse_id: string) => request<{ columns: string[]; rows: Record<string, unknown>[]; truncated: boolean }>('/discover/preview', { method: 'POST', body: JSON.stringify({ node_id: nodeId, environment, warehouse_id }) }),
   queryDatabricks: (nodeId: string, environment: 'dev' | 'prod', warehouse_id: string, sql: string, limit = 500) => request<{ columns: string[]; schema?: Array<{ name: string; type: string }>; rows: Record<string, unknown>[]; truncated: boolean; executed_sql?: string }>('/discover/query', { method: 'POST', body: JSON.stringify({ node_id: nodeId, environment, warehouse_id, sql, limit }) }),
   compareSchemas: (prodNodeId: string, devNodeId: string | null, force = false) => request<SchemaCompareResult>('/discover/schema-compare', { method: 'POST', body: JSON.stringify({ prod_node_id: prodNodeId, dev_node_id: devNodeId, force }) }),
-  schemaEvolutionContext: (nodeId: string) => request<SchemaEvolutionContext>(`/schema-evolution/context?${new URLSearchParams({ node_id: nodeId })}`),
+  schemaEvolutionContext: (nodeId: string, signal?: AbortSignal) => request<SchemaEvolutionContext>(`/schema-evolution/context?${new URLSearchParams({ node_id: nodeId })}`, { signal }),
   saveSchemaDraft: (nodeId: string, identity: Record<string, string>, draft: SchemaDraft) => request<{ draft: SchemaDraft; drift: boolean }>('/schema-evolution/draft', { method: 'PUT', body: JSON.stringify({ node_id: nodeId, identity, draft }) }),
   resetSchemaDraft: (nodeId: string) => request<SchemaEvolutionContext>('/schema-evolution/reset', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) }),
   reviewSchema: (nodeId: string) => request<SchemaChangePlan>('/schema-evolution/review', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) }),
   applySchema: (nodeId: string, planId: string, warehouseId: string, confirmDrop: boolean) => request<Operation>('/schema-evolution/apply', { method: 'POST', body: JSON.stringify({ node_id: nodeId, plan_id: planId, warehouse_id: warehouseId, confirm_drop: confirmDrop }) }),
   validateSchema: (nodeId: string) => request<SchemaValidation>('/schema-evolution/validate', { method: 'POST', body: JSON.stringify({ node_id: nodeId }) }),
-  syntheticGenerators: () => request<{ items: SyntheticGenerator[] }>('/synthetic/generators'),
-  syntheticPreview: (schema: CanonicalSchema, rowCount: number, rules: Array<{ column: string; generator: string; parameters: Record<string, unknown>; null_percent: number; unique: boolean }>, locale: 'pt_BR' | 'en_US', seed: number) => request<{ rows: Array<Record<string, unknown>>; columns: Array<{ name: string; type: string }>; seed: number; plan_digest: string }>('/synthetic/preview', { method: 'POST', body: JSON.stringify({ schema, row_count: rowCount, rules, locale, seed }) }),
-  syntheticDestinations: (catalog?: string, schema?: string, table?: string, sourceNodeId?: string) => request<SyntheticDestinations>(`/synthetic/destinations?${new URLSearchParams({ ...(catalog ? { catalog } : {}), ...(schema ? { schema } : {}), ...(table ? { table } : {}), ...(sourceNodeId ? { source_node_id: sourceNodeId } : {}) })}`),
-  syntheticReview: (payload: SyntheticRunRequest) => request<SyntheticReview>('/synthetic/review', { method: 'POST', body: JSON.stringify(payload) }),
+  syntheticGenerators: (signal?: AbortSignal) => request<{ items: SyntheticGenerator[] }>('/synthetic/generators', { signal }),
+  syntheticPreview: (schema: CanonicalSchema, rowCount: number, rules: Array<{ column: string; generator: string; parameters: Record<string, unknown>; null_percent: number; unique: boolean }>, locale: 'pt_BR' | 'en_US', seed: number, signal?: AbortSignal) => request<{ rows: Array<Record<string, unknown>>; columns: Array<{ name: string; type: string }>; seed: number; plan_digest: string }>('/synthetic/preview', { signal, method: 'POST', body: JSON.stringify({ schema, row_count: rowCount, rules, locale, seed }) }),
+  syntheticDestinations: (catalog?: string, schema?: string, table?: string, sourceNodeId?: string, signal?: AbortSignal, sourceEnvironment?: 'dev' | 'prod') => request<SyntheticDestinations>(`/synthetic/destinations?${new URLSearchParams({ ...(catalog ? { catalog } : {}), ...(schema ? { schema } : {}), ...(table ? { table } : {}), ...(sourceNodeId ? { source_node_id: sourceNodeId } : {}), ...(sourceEnvironment ? { source_environment: sourceEnvironment } : {}) })}`, { signal }),
+  syntheticReview: (payload: SyntheticRunRequest, signal?: AbortSignal) => request<SyntheticReview>('/synthetic/review', { signal, method: 'POST', body: JSON.stringify(payload) }),
   startSyntheticRun: (payload: SyntheticStartRequest) => request<Operation>('/synthetic/runs', { method: 'POST', body: JSON.stringify(payload) }),
   syntheticRun: (id: string) => request<SyntheticRun>(`/synthetic/runs/${id}`),
   reconcileSyntheticRun: (id: string, typed_confirmation: string) => request<{ run_id: string; state: string; target_state: string; message: string }>(`/synthetic/runs/${id}/reconcile`, { method: 'POST', body: JSON.stringify({ typed_confirmation }) }),
@@ -73,7 +90,7 @@ export type CanonicalSchemaField = {
   children: Array<Record<string, unknown>>; technology_properties: Record<string, unknown>
 }
 export type CanonicalSchema = { qualified_name: string; fields: CanonicalSchemaField[]; constraints: string[]; technology_properties: Record<string, unknown>; complete: boolean }
-export type SchemaDraftColumn = { column_id: string; original_name: string | null; field: CanonicalSchemaField; removed: boolean }
+export type SchemaDraftColumn = { column_id: string; original_name: string | null; field: CanonicalSchemaField; removed: boolean; origin?: 'dev' | 'prod' | 'manual' }
 export type SchemaDraft = { identity: Record<string, string>; baseline: CanonicalSchema; baseline_fingerprint: string; columns: SchemaDraftColumn[]; version: number }
 export type SchemaEvolutionContext = { identity: Record<string, string>; schema: CanonicalSchema; draft: SchemaDraft; drift: boolean; metadata_cache?: { state: string; fetched_at: number } | null; draft_key: string }
 export type SchemaChangePlan = { plan_id: string; identity: Record<string, string>; target: string; baseline_fingerprint: string; proposed_fingerprint: string; proposed_schema: CanonicalSchema; operations: Array<{ kind: string; column: string; from: string | null; to: string | null; field: CanonicalSchemaField; compatibility: string }>; blockers: string[]; risks?: string[]; compatibility: string; confirmation_required: boolean; sql_statements: string[]; can_apply: boolean; drift: boolean; diff: SchemaCompareResult }
@@ -83,7 +100,7 @@ export type SyntheticGenerator = { id: string; types: string[]; provider: 'duckd
 export type SyntheticDestination = { environment: 'dev'; catalog: string; schema: string; table: string; warehouse_id: string; strategy: 'create' | 'isolated' | 'append' | 'replace' | 'drop_recreate'; storage_type: 'managed' | 'external'; external_location_name?: string; external_location?: { name: string | null; url: string; read_only: boolean } | string | null }
 export type SyntheticRunRequest = { source_node_id: string; source_environment: 'dev' | 'prod'; destination: SyntheticDestination; schema: CanonicalSchema; row_count: number; rules: SyntheticRule[]; locale: 'pt_BR' | 'en_US'; seed: number; review_id?: string }
 export type SyntheticStartRequest = SyntheticRunRequest & { plan_digest: string; confirm_destructive?: boolean; typed_confirmation?: string }
-export type SyntheticDestinations = { catalogs: Array<{ name: string }>; schemas: Array<{ name: string }>; tables: Array<{ name: string; table_type: string; data_source_format?: string }>; target_schema?: CanonicalSchema | null; target_storage_type?: string | null; target_format?: string | null; drop_recreate_eligible?: boolean; warehouses: Array<{ id: string; name: string; state: string }>; external_locations: Array<{ name: string; url: string; read_only: boolean }>; suggestion?: { catalog: string; schema: string; table: string; target_exists: boolean | null; target_type?: string | null; target_state?: string; source: string; mapping: string; suggested_external_location?: string | null; external_locations?: Array<{ name: string; url: string; score: number; authorized: boolean; read_only: boolean; reason: string }> } | null }
+export type SyntheticDestinations = { catalogs: Array<{ name: string }>; schemas: Array<{ name: string }>; tables: Array<{ name: string; table_type: string; data_source_format?: string }>; target_schema?: CanonicalSchema | null; target_storage_type?: string | null; target_format?: string | null; drop_recreate_eligible?: boolean; warehouses: Array<{ id: string; name: string; state: string }>; external_locations: Array<{ name: string; url: string; read_only: boolean; authorized?: boolean | null }>; target_state?: 'present' | 'absent' | 'unchecked'; source_storage_type?: 'managed' | 'external' | null; warnings?: Array<{ code: string; message: string; resource: string }>; suggestion?: { catalog: string; schema: string; table: string; target_exists: boolean | null; target_type?: string | null; target_state?: string; source: string; mapping: string; suggested_external_location?: string | null; external_locations?: Array<{ name: string; url: string; score: number; authorized: boolean | null; read_only: boolean; reason: string }> } | null }
 export type SyntheticDestructivePlan = { status: string; eligibility: string; plan_id: string; target: { qualified_name: string; table_id: string; owner: string; storage_type: string; location: string | null; properties: Record<string, string>; schema: CanonicalSchema; direct_grants: Array<{ principal: string; privileges: string[] }>; dependencies: Array<Record<string, unknown>> }; target_fingerprint: string; proposed_schema: CanonicalSchema; storage_type: string; external_location: { name: string | null; url: string; read_only: boolean } | null; new_location: string | null; detected_dependencies: Array<Record<string, unknown>>; required_privileges: string[]; validation: Record<string, boolean | string>; impacts: { removed: string; recreated: string; preserved: string[]; not_preserved: string[] }; ddl: { drop: string; create: string | null }; risks: string[]; block_reasons: string[]; provenance?: { verified: boolean; run_id: string | null; message: string } }
 export type SyntheticReview = { source: { environment: string; qualified_name: string }; source_schema: CanonicalSchema; schema: CanonicalSchema; destination: SyntheticDestination; target_exists: boolean; target_schema: CanonicalSchema | null; target_storage_type: string; target_location: string | null; external_location: { name: string | null; url: string; read_only: boolean } | null; strategy: string; row_count: number; seed: number; plan_digest: string; schema_changes: Record<string, string[]>; publication_ready: boolean; block_reason: string | null; permissions: { state: string; message: string }; warnings: string[]; destructive_plan?: SyntheticDestructivePlan | null; workspace_identity?: { profile: string; host: string }; publication_plan: Array<{ stage: string; action: string }>; runtime: { mechanism: string; memory_limit_bytes: number | null; rss_guard_bytes: number | null; memory_limit_message: string; max_pending_files: number; staging_limit_bytes: number } }
 export type SyntheticRun = { run_id: string; state: string; plan: Record<string, unknown>; destination: SyntheticDestination; chunks: Array<{ chunk_index: number; row_count: number; byte_count: number; state: string; error?: string }> }

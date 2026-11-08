@@ -36,6 +36,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [collapsedBySearch, setCollapsedBySearch] = useState<Set<string>>(new Set())
   const treeStateRef = useRef({ sources, pages, expanded, query, collapsedBySearch })
   const compareRequestSequence = useRef(0)
+  const selectionRequestSequence = useRef(0)
   treeStateRef.current = { sources, pages, expanded, query, collapsedBySearch }
   const [refreshing, setRefreshing] = useState(false)
   const [sourcesLoaded, setSourcesLoaded] = useState(false)
@@ -289,17 +290,17 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         return replacement
           ? {
             ...tab,
-            key: tab.view === 'local-query' ? `${replacement.id}:local-query` : tab.view === 'compare' ? `${replacement.id}:compare` : tab.view === 'synthetic' ? `${replacement.id}:synthetic` : tab.view === 'schema-evolution' ? `${replacement.id}:schema-evolution` : replacement.id,
+            key: tab.view === 'synthetic' || tab.view === 'schema-evolution' ? tab.key : tab.view === 'local-query' ? `${replacement.id}:local-query` : tab.view === 'compare' ? `${replacement.id}:compare` : replacement.id,
             node: { ...tab.node, ...replacement, columns: tab.node.columns ?? replacement.columns, access: tab.node.access ?? replacement.access },
           }
           : tab
       }))
       setActiveTabKey((activeKey) => {
         const activeTab = workbenchTabs.find((tab) => tab.key === activeKey)
-        if (!activeTab) return activeKey
+        if (!activeTab || activeTab.view === 'synthetic' || activeTab.view === 'schema-evolution') return activeKey
         const replacement = findTableReplacement(activeTab.node)
         if (!replacement) return activeKey
-        return activeTab.view === 'local-query' ? `${replacement.id}:local-query` : activeTab.view === 'compare' ? `${replacement.id}:compare` : activeTab.view === 'synthetic' ? `${replacement.id}:synthetic` : activeTab.view === 'schema-evolution' ? `${replacement.id}:schema-evolution` : replacement.id
+        return activeTab.view === 'local-query' ? `${replacement.id}:local-query` : activeTab.view === 'compare' ? `${replacement.id}:compare` : replacement.id
       })
     } catch (error) {
       setSourcesError(error instanceof Error ? error.message : 'Catalog metadata could not be refreshed.')
@@ -331,6 +332,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
 
   const selectNode = async (node: DiscoverNode, environment?: 'dev' | 'prod' | 'local') => {
     if (node.kind !== 'table' && node.kind !== 'view') { setMakeLocalOpen(false); setSelected(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })); return }
+    const requestId = ++selectionRequestSequence.current
     const preferred = environment ?? (node.variants?.some((variant) => variant.environment === activeEnvironment) ? activeEnvironment : node.variants?.some((variant) => variant.environment === 'dev') ? 'dev' : node.variants?.some((variant) => variant.environment === 'prod') ? 'prod' : 'local')
     setActiveSection('overview')
     setMakeLocalOpen(false)
@@ -345,6 +347,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     setRemotePreview(null); setLocalRows([]); setLocalColumns([]); setLocalQueryError('')
     try {
       const detail = await api.discoverCatalogDetail(node.id, preferred)
+      if (requestId !== selectionRequestSequence.current) return
       setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
       setSelectedColumns((detail.columns ?? []).map((column) => column.name))
     }
@@ -702,6 +705,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   }
   const openCompare = () => {
     if (!selected) return
+    selectionRequestSequence.current += 1
     const availableReferenceEnvironment: CompareEnvironment | null = activeEnvironment === 'dev' && selected.variants?.some((variant) => variant.environment === 'dev') ? 'dev'
       : activeEnvironment === 'prod' && selected.variants?.some((variant) => variant.environment === 'prod') ? 'prod'
         : selected.variants?.some((variant) => variant.environment === 'prod') ? 'prod'
@@ -730,8 +734,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     if (!targetNode || targetNode.kind !== 'table') return
     const variant = targetNode.variants?.find((item) => item.environment === 'dev')
     if (!variant || variant.access !== 'read') return
-    const key = `${targetNode.id}:schema-evolution`
-    const previous = workbenchTabs.find((item) => item.key === key)
+    selectionRequestSequence.current += 1
+    const previous = workbenchTabs.find((item) => item.view === 'schema-evolution' && item.node.id === targetNode.id)
+    const key = previous?.key ?? `${targetNode.id}:schema-evolution`
     const tab: WorkbenchTab = { key, node: targetNode, environment: 'dev', view: 'schema-evolution', schemaReference: schemaReference ?? previous?.schemaReference ?? null }
     setWorkbenchTabs((items) => items.some((item) => item.key === key) ? items.map((item) => item.key === key ? tab : item) : [...items, tab])
     setSelected(targetNode); setActiveEnvironment('dev'); setActiveTabKey(key); setActiveSection('schema-evolution')
@@ -741,6 +746,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const targetNode = sourceNode ?? selected
     if (!targetNode || !targetNode.columns?.length) return
     const key = `${targetNode.id}:synthetic`
+    const existing = workbenchTabs.find((item) => item.view === 'synthetic' && item.node.id === targetNode.id)
+    if (existing) { activateTab(existing); return }
+    selectionRequestSequence.current += 1
     const tab: WorkbenchTab = { key, node: targetNode, environment: sourceEnvironment, view: 'synthetic', syntheticComparison: comparisonContext }
     setWorkbenchTabs((items) => items.some((item) => item.key === key) ? items.map((item) => item.key === key ? tab : item) : [...items, tab])
     setSelected(targetNode)
@@ -758,6 +766,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     void loadComparison(key, next)
   }
   const activateTab = (tab: WorkbenchTab) => {
+    selectionRequestSequence.current += 1
     if (tab.view === 'local-query') {
       void openLocalQuery(tab.node, tab.queryEnvironment)
       return
@@ -855,9 +864,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   })
 
   const visible = useMemo(() => sources.filter((node) => !query.trim() || matchesLoadedBranch(node)), [sources, pages, query])
-  if (!active) return null
   return <>
-    {explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search loaded catalogs, schemas and tables…" value={query} onChange={(event) => { setQuery(event.target.value); setCollapsedBySearch(new Set()) }} /></label></div>
+    {active && explorerOpen && <aside className="explorer discover-shell-explorer" style={{ width: explorerWidth }}><div className="panel-heading discover-explorer-heading"><div><span className="eyebrow">CATALOG</span><h2>Explorer</h2></div><div className="discover-explorer-actions"><button className="icon-button subtle" aria-label="Refresh catalog metadata" onClick={() => void refreshCatalog()} disabled={refreshing}><RefreshCw size={14} className={refreshing ? 'spin' : ''} /></button><button className="icon-button subtle" aria-label="Collapse explorer" onClick={onCollapseExplorer}><PanelLeftClose size={15} /></button></div></div><div className="discover-controls"><label className="explorer-search"><Search size={14} /><input aria-label="Search loaded metadata" placeholder="Search loaded catalogs, schemas and tables…" value={query} onChange={(event) => { setQuery(event.target.value); setCollapsedBySearch(new Set()) }} /></label></div>
         <div className="discover-tree">
           {sources.length === 0 && (!sourcesLoaded || refreshing)
             ? <div className="loading-state"><LoaderCircle size={15} className="spin" /> Loading catalog metadata…</div>
@@ -875,8 +883,8 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         </div>
         <div className="resize-handle" onPointerDown={onResizeExplorer} role="separator" aria-orientation="vertical" aria-label="Resize explorer" />
       </aside>}
-    {!explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
-    <main className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
+    {active && !explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
+    <main hidden={!active} style={active ? undefined : { display: 'none' }} className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
       <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
       {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => {
         const label = tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.view === 'compare' ? `Compare · ${tab.node.name}` : tab.view === 'synthetic' ? `Synthetic · ${tab.node.name}` : tab.view === 'schema-evolution' ? `Schema · ${tab.node.name}` : tab.node.name
@@ -886,7 +894,10 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
           <button aria-label={`Close ${label}`} onClick={() => { const remaining = workbenchTabs.filter((item) => item.key !== tab.key); setWorkbenchTabs(remaining); if (activeTabKey === tab.key) { const next = remaining.at(-1); if (next) activateTab(next); else { setSelected(null); setActiveTabKey(null); setActiveSection('overview'); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) } } }}><X size={12} /></button>
         </div>
       })}</div></div>}
-      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{selected ? <>{activeSection === 'schema-evolution' ? <SchemaEvolutionStudio key={activeTabKey} node={selected} referenceSchema={workbenchTabs.find((item) => item.key === activeTabKey)?.schemaReference} onValidated={() => { void refreshOpenHierarchy(true); const tab = workbenchTabs.find((item) => item.key === `${selected.id}:compare`); if (tab?.comparison) void loadComparison(tab.key, tab.comparison, true) }} onCompare={openCompare} /> : activeSection === 'synthetic' ? <SyntheticStudio key={selected.id} node={selected} sourceEnvironment={(workbenchTabs.find((tab) => tab.key === activeTabKey)?.environment === 'prod' ? 'prod' : 'dev')} comparison={workbenchTabs.find((tab) => tab.key === activeTabKey)?.syntheticComparison} onClose={() => { setActiveSection('overview'); setActiveTabKey(selected.id) }} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} /> : activeSection === 'compare' ? (() => {
+      <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{workbenchTabs.filter((tab) => tab.view === 'schema-evolution' || tab.view === 'synthetic').map((tab) => <div key={tab.key} hidden={activeTabKey !== tab.key} data-workflow-tab={tab.key}>
+        {tab.view === 'schema-evolution' ? <SchemaEvolutionStudio active={active && activeTabKey === tab.key} node={tab.node} referenceSchema={tab.schemaReference} onValidated={() => { void refreshOpenHierarchy(true); const compareTab = workbenchTabs.find((item) => item.key === `${tab.node.id}:compare`); if (compareTab?.comparison) void loadComparison(compareTab.key, compareTab.comparison, true) }} onCompare={openCompare} />
+          : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => { const tableTab = workbenchTabs.find((item) => item.key === tab.node.id); if (tableTab) activateTab(tableTab); else void selectNode(tab.node) }} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
+      </div>)}{selected ? <>{activeSection === 'schema-evolution' || activeSection === 'synthetic' ? null : activeSection === 'compare' ? (() => {
         const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')
         const comparison = compareTab?.comparison
         if (!compareTab || !comparison) return <div className="compare-empty"><LoaderCircle size={16} className="spin" /> Preparing comparison…</div>

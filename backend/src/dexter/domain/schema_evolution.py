@@ -123,6 +123,7 @@ class DraftColumn:
     original_name: str | None
     field: dict[str, Any]
     removed: bool = False
+    origin: str = "dev"
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +153,7 @@ class SchemaDraft:
         field = {"name": name, "original_type": data_type, "canonical_type": data_type.lower(),
                  "nullable": nullable, "precision": None, "scale": None, "constraints": [],
                  "children": [], "technology_properties": ({"comment": comment} if comment else {})}
-        item = DraftColumn("new-" + hashlib.sha256(f"{name}:{len(self.columns)}".encode()).hexdigest()[:16], None, field)
+        item = DraftColumn("new-" + hashlib.sha256(f"{name}:{len(self.columns)}".encode()).hexdigest()[:16], None, field, origin="manual")
         return SchemaDraft(self.identity, self.baseline, self.baseline_fingerprint, (*self.columns, item), self.version)
 
     def update(self, column_id: str, *, name: str | None = None, data_type: str | None = None,
@@ -171,19 +172,19 @@ class SchemaDraft:
                 field["precision"], field["scale"] = (int(dec.group(1)), int(dec.group(2))) if dec else (None, None)
             if nullable is not None: field["nullable"] = nullable
             if comment is not None: field["technology_properties"] = {**field.get("technology_properties", {}), "comment": comment}
-            columns.append(DraftColumn(item.column_id, item.original_name, field, item.removed))
+            columns.append(DraftColumn(item.column_id, item.original_name, field, item.removed, item.origin))
         if not found: raise KeyError(column_id)
         proposed = [item.field["name"].casefold() for item in columns if not item.removed]
         if len(proposed) != len(set(proposed)): raise ValueError("Column names must be unique")
         return SchemaDraft(self.identity, self.baseline, self.baseline_fingerprint, tuple(columns), self.version)
 
     def remove(self, column_id: str) -> "SchemaDraft":
-        columns = tuple(DraftColumn(i.column_id, i.original_name, i.field, True if i.column_id == column_id else i.removed) for i in self.columns)
+        columns = tuple(DraftColumn(i.column_id, i.original_name, i.field, True if i.column_id == column_id else i.removed, i.origin) for i in self.columns)
         if not any(i.column_id == column_id for i in self.columns): raise KeyError(column_id)
         return SchemaDraft(self.identity, self.baseline, self.baseline_fingerprint, columns, self.version)
 
     def restore(self, column_id: str) -> "SchemaDraft":
-        columns = tuple(DraftColumn(i.column_id, i.original_name, i.field, False if i.column_id == column_id else i.removed) for i in self.columns)
+        columns = tuple(DraftColumn(i.column_id, i.original_name, i.field, False if i.column_id == column_id else i.removed, i.origin) for i in self.columns)
         if not any(i.column_id == column_id for i in self.columns): raise KeyError(column_id)
         return SchemaDraft(self.identity, self.baseline, self.baseline_fingerprint, columns, self.version)
 
@@ -193,7 +194,7 @@ class SchemaDraft:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SchemaDraft":
         return cls(raw["identity"], raw["baseline"], raw["baseline_fingerprint"],
-                   tuple(DraftColumn(**item) for item in raw["columns"]), raw.get("version", 1))
+                   tuple(DraftColumn(**{**item, "origin": item.get("origin", "dev" if item.get("original_name") is not None else "manual")}) for item in raw["columns"]), raw.get("version", 1))
 
 
 def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDraft:
@@ -208,6 +209,10 @@ def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDr
     columns: list[DraftColumn] = []
     for item in old.columns:
         update = candidate_by_id.pop(item.column_id, None)
+        # Client-added draft columns may be deleted or undone after an autosave.
+        # Physical baseline columns must remain represented, including removals.
+        if update is None and item.original_name is None:
+            continue
         if update is None or update.original_name != item.original_name:
             raise ValueError("Existing draft columns cannot be removed or reassigned")
         name = validate_identifier(str(update.field.get("name", "")))
@@ -226,7 +231,7 @@ def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDr
                                              "children": item.field.get("children", []), **next_properties}))
         field = {**item.field, **normalized, "name": name, "original_type": data_type,
                  "technology_properties": next_properties}
-        columns.append(DraftColumn(item.column_id, item.original_name, field, bool(update.removed)))
+        columns.append(DraftColumn(item.column_id, item.original_name, field, bool(update.removed), item.origin))
     for item in proposed.columns:
         if item.column_id not in candidate_by_id and item.column_id not in by_id: continue
     # New columns are accepted only with a fresh stable client-generated ID and primitive validated type.
@@ -246,7 +251,9 @@ def sanitize_draft(candidate: dict[str, Any], saved: dict[str, Any]) -> SchemaDr
                                             "comment": comment} if comment else {"name": name, "type_text": data_type, "nullable": nullable}))
             field["original_type"] = data_type
             field["technology_properties"] = {"comment": comment} if comment else {}
-            columns.append(DraftColumn(item.column_id, None, field, bool(item.removed)))
+            if item.origin not in {"prod", "manual"}:
+                raise ValueError("New column origin must be PROD or manual")
+            columns.append(DraftColumn(item.column_id, None, field, bool(item.removed), item.origin))
     names = [item.field["name"].casefold() for item in columns if not item.removed]
     if len(names) != len(set(names)): raise ValueError("Column names must be unique")
     return SchemaDraft(old.identity, old.baseline, old.baseline_fingerprint, tuple(columns), old.version)
