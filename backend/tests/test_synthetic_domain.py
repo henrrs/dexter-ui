@@ -4,7 +4,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from dexter.domain.synthetic import ColumnRule, MAX_ROWS, SchemaChangePlan, SyntheticGenerationPlan
+from dexter.domain.synthetic import ColumnRule, MAX_ROWS, SchemaChangePlan, SyntheticGenerationPlan, rank_external_locations
 from dexter.db.database import migrate
 from dexter.services.operations import OperationsService
 from dexter.services.synthetic_runs import DestructiveTargetLocked, SyntheticRunRepository
@@ -18,6 +18,29 @@ def schema(fields=None):
 
 
 class SyntheticPlanTests(unittest.TestCase):
+    def test_external_location_requires_unique_catalog_schema_match_and_grants(self):
+        candidates = [
+            {"name": "gold-root", "url": "abfss://x/dev/tech/gold", "read_only": False},
+            {"name": "other-root", "url": "abfss://x/dev/tech/silver", "read_only": False},
+            {"name": "readonly", "url": "abfss://x/dev/tech/gold", "read_only": True},
+        ]
+        ranked, suggestion = rank_external_locations(candidates, catalog="tech", schema="gold", table="customers", authorized_names={"gold-root", "other-root", "readonly"})
+        self.assertEqual(suggestion, "gold-root")
+        self.assertTrue(ranked[0]["authorized"])
+        self.assertIsNone(rank_external_locations(candidates, catalog="tech", schema="gold", table="customers", authorized_names={"readonly"})[1])
+        tied, no_suggestion = rank_external_locations([candidates[0], {**candidates[0], "name": "same"}], catalog="tech", schema="gold", table="customers", authorized_names={"gold-root", "same"})
+        self.assertIsNone(no_suggestion)
+        self.assertEqual(len(tied), 2)
+
+    def test_generator_registry_defaults_match_types_instead_of_using_sequence_fallback(self):
+        from dexter.domain.synthetic import GENERATOR_REGISTRY, generator_contract
+        from dexter.services.synthetic_generation import suggested_rule
+        self.assertEqual(suggested_rule({"name": "metric", "original_type": "DOUBLE", "canonical_type": "double"}).generator, "decimal_range")
+        self.assertEqual(suggested_rule({"name": "label", "original_type": "STRING", "canonical_type": "string"}).generator, "random_string")
+        self.assertEqual(suggested_rule({"name": "customer_name", "original_type": "STRING", "canonical_type": "string"}).generator, "name")
+        self.assertEqual({item["id"] for item in generator_contract()}, set(GENERATOR_REGISTRY))
+        self.assertNotIn("STRING", GENERATOR_REGISTRY["decimal_range"]["types"])
+
     def test_accepts_reusable_bounded_plan_and_round_trips(self):
         plan = SyntheticGenerationPlan(schema(), 100, (
             ColumnRule("id", "sequence", {"start": 1}, unique=True),

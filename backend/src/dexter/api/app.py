@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import binascii
 import json
 import logging
 import shutil
@@ -881,6 +882,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 table_type = str(getattr(target, "table_type", "")).upper().split(".")[-1]
                 actual_storage = "external" if table_type == "EXTERNAL" else "managed" if table_type == "MANAGED" else "unsupported"
                 actual_location = getattr(target, "storage_location", None)
+            if exists and strategy in {"append", "replace", "drop_recreate"} and actual_storage == "unsupported":
+                raise HTTPException(409, detail="The selected DEV object is not a writable managed or external table; choose a different destination.")
             from dexter.adapters.databricks_synthetic_publisher import external_uri_is_safe
             selected_external = None
             if destination["storage_type"] == "external" and destination["strategy"] in {"create", "isolated", "drop_recreate"}:
@@ -904,6 +907,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                         raise HTTPException(422, detail="The existing External Location contains credential-like URL components and cannot be used safely")
                 selected_external = {"name": None, "url": safe_location, "read_only": False}
             from dexter.domain.synthetic import ColumnRule, SchemaChangePlan, SyntheticGenerationPlan
+            strategy = destination["strategy"]
+            if strategy in {"create", "isolated"} and exists:
+                raise HTTPException(409, detail="The selected DEV target already exists. Choose a different destination name or an eligible existing-table strategy.")
+            if strategy in {"append", "replace", "drop_recreate"} and not exists:
+                raise HTTPException(409, detail="The selected strategy requires an existing DEV table. Refresh the destination list and choose a confirmed target.")
             rules = tuple(ColumnRule(column=item.column, generator=item.generator, parameters=item.parameters,
                                      null_percent=item.null_percent, unique=item.unique) for item in body.rules)
             generation = SyntheticGenerationPlan(proposed, body.row_count, rules, body.locale, body.seed,
@@ -911,17 +919,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             errors = generation.validate()
             if errors:
                 raise HTTPException(422, detail="; ".join(errors))
-            strategy = destination["strategy"]
-            if strategy in {"create", "isolated"} and exists:
-                raise HTTPException(409, detail="The selected target already exists; choose a new isolated name or another strategy")
-            if strategy in {"append", "replace", "drop_recreate"} and not exists:
-                raise HTTPException(409, detail="The selected strategy requires an existing DEV table")
             original_storage = actual_storage if exists else destination["storage_type"]
             if actual_location and not external_uri_is_safe(str(actual_location)):
                 actual_location = "<redacted>"
             original_location = str(actual_location) if actual_location else None
             if strategy in {"append", "replace"}:
-                proposed = actual_schema
                 destination["storage_type"] = original_storage
                 destination["external_location"] = original_location
                 selected_external = None if original_storage == "managed" else {"name": None, "url": original_location, "read_only": False}
@@ -1070,7 +1072,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(503, detail="The DEV destination metadata or permissions could not be verified") from None
 
     @app.get("/api/synthetic/destinations")
-    def synthetic_destinations(catalog: str | None = None, schema: str | None = None, table: str | None = None):
+    def synthetic_destinations(catalog: str | None = None, schema: str | None = None, table: str | None = None,
+                               source_node_id: str | None = None):
         workspace = _synthetic_workspace()
         try:
             warehouses = [{"id": item.id, "name": item.name, "state": str(item.state).upper().split(".")[-1]}
@@ -1078,16 +1081,87 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             if catalog is None:
                 catalogs = [{"name": item.name} for item in workspace.catalogs.list()]
                 try:
-                    external_locations = [{"name": item.name, "url": getattr(item, "url", ""), "read_only": bool(getattr(item, "read_only", False))} for item in workspace.external_locations.list()]
+                    locations = list(workspace.external_locations.list())
+                    external_locations = [{"name": item.name, "url": getattr(item, "url", ""), "read_only": bool(getattr(item, "read_only", False))} for item in locations]
                 except Exception:
-                    external_locations = []
+                    locations, external_locations = [], []
+                suggestion = None
+                if source_node_id:
+                    try:
+                        kind, source_variants, _availability = _variants(source_node_id)
+                        source = next((item for item in source_variants if item.get("environment") == "prod"), None)
+                        source = source or next((item for item in source_variants if item.get("environment") == "dev"), None)
+                        if kind == "table" and source and source.get("schema") and source.get("table"):
+                            logical_catalog = str(source.get("logical_catalog") or source.get("catalog") or "")
+                            roots = unified.catalogs(force=False).get("items", [])
+                            root_matches = [item for item in roots if str(item.get("name", "")).casefold() == logical_catalog.casefold()]
+                            if len(root_matches) == 1 and not root_matches[0].get("ambiguous"):
+                                mapped_schemas = unified.children(root_matches[0]["id"], force=False).get("items", [])
+                                schema_matches = [item for item in mapped_schemas if str(item.get("name", "")).casefold() == str(source["schema"]).casefold()]
+                                dev_variants = [variant for item in schema_matches for variant in item.get("variants", []) if variant.get("environment") == "dev"]
+                                if len(schema_matches) == 1 and len(dev_variants) == 1 and not schema_matches[0].get("ambiguous"):
+                                    mapped = dev_variants[0]
+                                    mapped_catalog, mapped_schema = str(mapped["catalog"]), str(mapped["schema"])
+                                    # A candidate name is suggested only when the logical tree gives a unique physical DEV path.
+                                    try:
+                                        existing_target = workspace.tables.get(full_name=f"{mapped_catalog}.{mapped_schema}.{source['table']}")
+                                        target_exists = True
+                                    except Exception as exc:
+                                        status = getattr(exc, "status_code", None)
+                                        code = str(getattr(exc, "error_code", "")).upper()
+                                        if status == 404 or code in {"TABLE_OR_VIEW_NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"} or "not found" in str(exc).casefold():
+                                            target_exists = False
+                                        else:
+                                            target_exists = None
+                                    target_type = str(getattr(existing_target, "table_type", "")).upper().split(".")[-1] if target_exists else None
+                                    suggestion = {"catalog": mapped_catalog, "schema": mapped_schema, "table": str(source["table"]),
+                                                  "target_exists": target_exists, "target_type": target_type,
+                                                  "target_state": "present" if target_exists is True else "absent" if target_exists is False else "unknown",
+                                                  "source": str(source.get("catalog", "")) + "." + str(source["schema"]) + "." + str(source["table"]),
+                                                  "mapping": "unique_unified_discover_match"}
+                    except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+                        suggestion = None
+                # Location scores are hints only. A location is auto-suggested only when the
+                # highest score is unique and effective DEV grants have been verified.
+                if suggestion and locations:
+                    from dexter.adapters.databricks_synthetic_publisher import _privileges
+                    from dexter.domain.synthetic import rank_external_locations
+                    authorized_names = set()
+                    try:
+                        user = workspace.current_user.me()
+                        principal = getattr(user, "user_name", None) or getattr(user, "display_name", None)
+                    except Exception:
+                        principal = None
+                    for location in locations:
+                        url = str(getattr(location, "url", "") or "")
+                        name = str(getattr(location, "name", "") or "")
+                        search = f"{name} {url}".casefold()
+                        path_match = suggestion["catalog"].casefold() in search and suggestion["schema"].casefold() in search
+                        if principal and path_match and not getattr(location, "read_only", False):
+                            try:
+                                effective = workspace.grants.get_effective(securable_type="EXTERNAL_LOCATION", full_name=name, principal=principal)
+                                privileges = _privileges(effective)
+                                if {"CREATE_EXTERNAL_TABLE", "EXTERNAL_USE_LOCATION"}.issubset(privileges):
+                                    authorized_names.add(name)
+                            except Exception:
+                                pass
+                    ranked, best_location = rank_external_locations(
+                        [{"name": str(getattr(item, "name", "") or ""), "url": str(getattr(item, "url", "") or ""),
+                          "read_only": bool(getattr(item, "read_only", False))} for item in locations],
+                        catalog=suggestion["catalog"], schema=suggestion["schema"], table=suggestion["table"],
+                        authorized_names=authorized_names)
+                    suggestion["external_locations"] = ranked
+                    suggestion["suggested_external_location"] = best_location
                 return {"catalogs": catalogs, "schemas": [], "tables": [], "warehouses": warehouses,
-                        "external_locations": external_locations}
+                        "external_locations": external_locations, "suggestion": suggestion}
             schemas = [{"name": item.name} for item in workspace.schemas.list(catalog_name=catalog)] if schema is None else []
-            tables = [{"name": item.name, "table_type": str(item.table_type).upper().split(".")[-1]}
+            tables = [{"name": item.name, "table_type": str(item.table_type).upper().split(".")[-1],
+                       "data_source_format": str(getattr(item, "data_source_format", "")).upper().split(".")[-1]}
                       for item in workspace.tables.list(catalog_name=catalog, schema_name=schema)] if schema else []
             target_schema = None
             drop_recreate_eligible = False
+            target_storage_type = None
+            target_format = None
             if table and catalog and schema:
                 target = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
                 from dexter.domain.schema import canonical_schema
@@ -1099,6 +1173,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     "host": str(getattr(getattr(workspace, "config", None), "host", "") or "").rstrip("/")}
                 target_type = str(getattr(target, "table_type", "")).upper().split(".")[-1]
                 target_format = str(getattr(target, "data_source_format", "")).upper().split(".")[-1]
+                target_storage_type = "external" if target_type == "EXTERNAL" else "managed" if target_type == "MANAGED" else "unsupported"
                 marker = str((getattr(target, "properties", None) or {}).get("dexter.synthetic.run_id") or "")
                 repository = SyntheticRunRepository(paths.database)
                 drop_recreate_eligible = bool(target_type in {"MANAGED", "EXTERNAL"} and target_format == "DELTA"
@@ -1108,11 +1183,17 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     and not repository.destructive_target_locked(
                         {"catalog": catalog, "schema": schema, "table": table}, workspace_identity))
             return {"catalogs": [], "schemas": schemas, "tables": tables, "target_schema": target_schema,
+                    "target_storage_type": target_storage_type, "target_format": target_format,
                     "drop_recreate_eligible": drop_recreate_eligible,
                     "warehouses": warehouses, "external_locations": []}
         except Exception as exc:
             logger.info("DEV destination listing failed (%s)", type(exc).__name__)
             raise HTTPException(503, detail="Could not list destinations available to the DEV profile") from None
+
+    @app.get("/api/synthetic/generators")
+    def synthetic_generators():
+        from dexter.domain.synthetic import generator_contract
+        return {"items": generator_contract()}
 
     @app.post("/api/synthetic/review")
     def synthetic_review(body: SyntheticReviewRequest):

@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Check, LoaderCircle, RefreshCw, Sparkles, X } from 'lucide-react'
 import { api } from './api'
-import type { CanonicalSchema, DiscoverNode, SyntheticDestination, SyntheticReview, SyntheticRule, SyntheticRunRequest } from './api'
+import type { CanonicalSchema, DiscoverNode, SyntheticDestination, SyntheticGenerator, SyntheticReview, SyntheticRule, SyntheticRunRequest } from './api'
 import type { Operation } from './types'
 import { SchemaFieldEditor } from './SchemaFieldEditor'
 
 const steps = ['Destination', 'Schema', 'Generation Rules', 'Review', 'Execution'] as const
 type Step = 0 | 1 | 2 | 3 | 4
 type Props = { node: DiscoverNode; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
-type Draft = { step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; destination: Partial<SyntheticDestination> }
+type Draft = { step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
 
 function makeSchema(node: DiscoverNode): CanonicalSchema {
   return { qualified_name: node.qualified_name ?? node.name, complete: Boolean(node.columns?.length), constraints: [], technology_properties: {}, fields: (node.columns ?? []).map((column) => {
@@ -28,8 +28,9 @@ function suggested(field: CanonicalSchema['fields'][number]): SyntheticRule {
           : name.includes('address') || name.includes('endereco') || name.includes('endereço') ? 'address'
             : type.includes('bool') ? 'boolean' : /decimal|numeric/.test(type) ? 'decimal_range'
               : type.includes('timestamp') ? 'timestamp_range' : type.includes('date') ? 'date_range'
-                : /int|long|bigint|short|byte/.test(type) ? (name === 'id' || name.endsWith('_id') ? 'sequence' : 'integer_range') : 'sequence'
-  return { column: field.name, generator, parameters: {}, null_percent: 0, unique: generator === 'sequence' && (name === 'id' || name.endsWith('_id')) }
+              : /int|long|bigint|short|byte/.test(type) ? (name === 'id' || name.endsWith('_id') ? 'sequence' : 'integer_range')
+                : /double|float|real/.test(type) ? 'decimal_range' : /string|varchar|char/.test(type) ? 'random_string' : 'fixed'
+  return { column: field.name, generator, parameters: generator === 'fixed' ? { value: null } : {}, null_percent: 0, unique: generator === 'sequence' && (name === 'id' || name.endsWith('_id')) }
 }
 
 function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
@@ -37,12 +38,13 @@ function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
     const raw = JSON.parse(localStorage.getItem(`dexter.synthetic.draft.${node.id}`) ?? 'null') as Partial<Draft> | null
     const schema = raw?.schema && Array.isArray(raw.schema.fields) ? raw.schema : initial
     const rules = Array.isArray(raw?.rules) ? raw.rules.filter((rule): rule is SyntheticRule => !!rule && typeof rule.column === 'string' && typeof rule.generator === 'string') : []
+    const schemaSource = ['source', 'dev', 'custom'].includes(raw?.schemaSource ?? '') ? raw!.schemaSource! : JSON.stringify(schema.fields) === JSON.stringify(initial.fields) ? 'source' : 'custom'
     return { step: 0, rowCount: Number.isInteger(raw?.rowCount) && raw!.rowCount! > 0 ? Math.min(1_000_000, raw!.rowCount!) : 1000,
       locale: raw?.locale === 'en_US' ? 'en_US' : 'pt_BR', seed: Number.isSafeInteger(raw?.seed) ? raw!.seed! : Math.floor(Math.random() * 2_000_000_000),
-      schema, rules: schema.fields.map((field) => rules.find((rule) => rule.column === field.name) ?? suggested(field)),
+      schema, schemaSource, rules: schema.fields.map((field) => rules.find((rule) => rule.column === field.name) ?? suggested(field)),
       destination: raw?.destination ?? {} }
   } catch {
-    return { step: 0, rowCount: 1000, locale: 'pt_BR', seed: Math.floor(Math.random() * 2_000_000_000), schema: initial, rules: initial.fields.map(suggested), destination: {} }
+    return { step: 0, rowCount: 1000, locale: 'pt_BR', seed: Math.floor(Math.random() * 2_000_000_000), schema: initial, schemaSource: 'source', rules: initial.fields.map(suggested), destination: {} }
   }
 }
 
@@ -51,6 +53,7 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   const [initial] = useState(() => loadDraft(node, initialSchema))
   const [step, setStep] = useState<Step>(0)
   const [schema, setSchema] = useState(initial.schema)
+  const [schemaSource, setSchemaSource] = useState<Draft['schemaSource']>(initial.schemaSource)
   const [rules, setRules] = useState(initial.rules)
   const [rowCount, setRowCount] = useState(initial.rowCount)
   const [locale, setLocale] = useState<'pt_BR' | 'en_US'>(initial.locale)
@@ -65,8 +68,13 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   const [catalogs, setCatalogs] = useState<Array<{ name: string }>>([])
   const [schemas, setSchemas] = useState<Array<{ name: string }>>([])
   const [tables, setTables] = useState<Array<{ name: string; table_type: string }>>([])
+  const [targetSchema, setTargetSchema] = useState<CanonicalSchema | null>(null)
+  const [targetStorageType, setTargetStorageType] = useState<string | null>(null)
+  const [targetFormat, setTargetFormat] = useState<string | null>(null)
+  const [destinationSuggestion, setDestinationSuggestion] = useState<Awaited<ReturnType<typeof api.syntheticDestinations>>['suggestion']>(null)
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
-  const [externalLocations, setExternalLocations] = useState<Array<{ name: string; url: string; read_only: boolean }>>([])
+  const [externalLocations, setExternalLocations] = useState<Array<{ name: string; url: string; read_only: boolean; authorized?: boolean; score?: number; reason?: string }>>([])
+  const [generatorRegistry, setGeneratorRegistry] = useState<SyntheticGenerator[]>([])
   const [dropRecreateEligible, setDropRecreateEligible] = useState(false)
   const [preview, setPreview] = useState<Array<Record<string, unknown>>>([])
   const [review, setReview] = useState<SyntheticReview | null>(null)
@@ -81,29 +89,65 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   const [listing, setListing] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const previewRequestId = useRef(0)
+  const currentPreviewDigest = useRef('')
+  const [previewDigest, setPreviewDigest] = useState('')
 
   const strategy = destination.strategy ?? 'create'
   const isExistingStrategy = strategy === 'append' || strategy === 'replace' || strategy === 'drop_recreate'
   const fullTarget = [destination.catalog, destination.schema, destination.table].filter(Boolean).join('.')
+  const generationDigest = JSON.stringify({ schema, rules, rowCount, locale, seed })
+  currentPreviewDigest.current = generationDigest
+  const schemaDirty = schemaSource === 'custom'
+  const targetExists = tables.some((item) => item.name.toLowerCase() === (destination.table ?? '').toLowerCase())
+  const targetSupportsWrites = targetExists && targetStorageType !== 'unsupported' && targetFormat === 'DELTA'
+  const compatibleGenerators = (field: CanonicalSchema['fields'][number]) => {
+    const base = (field.original_type.match(/^[A-Za-z_]+/)?.[0] ?? '').toUpperCase()
+    return generatorRegistry.filter((item) => item.types.includes(base))
+  }
+  const strategyOptions = targetExists
+    ? targetSupportsWrites ? ['append', 'replace', ...(dropRecreateEligible ? ['drop_recreate'] : [])] : []
+    : ['create', 'isolated']
+  const strategyUnavailableReason = targetExists
+    ? !targetSupportsWrites
+      ? 'This existing DEV object is not confirmed as a writable Delta table; refresh its metadata before choosing a publication strategy.'
+      : !isExistingStrategy ? 'This DEV table already exists. Choose an existing-table strategy.' : ''
+    : isExistingStrategy ? 'The selected strategy requires an existing table in DEV.' : ''
+  const locationOptions = destinationSuggestion?.external_locations?.length ? destinationSuggestion.external_locations : externalLocations
   const terminal = operation && ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state)
 
   useEffect(() => {
-    try { localStorage.setItem(`dexter.synthetic.draft.${node.id}`, JSON.stringify({ step: 0, rowCount, locale, seed, rules, schema, destination } satisfies Draft)) } catch { /* Draft is kept in memory if browser storage is unavailable. */ }
-  }, [node.id, rowCount, locale, seed, rules, schema, destination])
+    try { localStorage.setItem(`dexter.synthetic.draft.${node.id}`, JSON.stringify({ step: 0, rowCount, locale, seed, rules, schema, schemaSource, destination } satisfies Draft)) } catch { /* Draft is kept in memory if browser storage is unavailable. */ }
+  }, [node.id, rowCount, locale, seed, rules, schema, schemaSource, destination])
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: {
+      kind: 'workflow', workflow: 'Prepare DEV', stage: steps[step], name: node.name,
+      qualifiedName: node.qualified_name ?? node.name, environment: 'DEV',
+    } }))
+  }, [node.id, node.name, node.qualified_name, step])
 
   const loadListings = async (catalog?: string, schemaName?: string, table?: string) => {
     setListing(true)
     try {
-      const result = await api.syntheticDestinations(catalog, schemaName, table)
-      if (!catalog) { setCatalogs(result.catalogs); setWarehouses(result.warehouses); setExternalLocations(result.external_locations) }
+      const result = await api.syntheticDestinations(catalog, schemaName, table, !catalog ? node.id : undefined)
+      if (!catalog) {
+        setCatalogs(result.catalogs); setWarehouses(result.warehouses); setExternalLocations(result.external_locations)
+        setDestinationSuggestion(result.suggestion ?? null)
+        if (result.suggestion && !initial.destination.catalog && !destination.catalog) {
+          setDestination((current) => ({ ...current, catalog: result.suggestion!.catalog, schema: result.suggestion!.schema,
+            table: result.suggestion!.table, strategy: result.suggestion!.target_exists === true ? 'append' : result.suggestion!.target_exists === false ? 'create' : current.strategy,
+            external_location_name: result.suggestion!.suggested_external_location ?? undefined }))
+          setNotice(`Suggested ${result.suggestion.catalog}.${result.suggestion.schema} from a unique Unified Discover mapping. Confirm destination availability before continuing.`)
+        }
+      }
       else if (!schemaName) setSchemas(result.schemas)
       else {
         setTables(result.tables)
+        setTargetSchema(result.target_schema ?? null)
+        setTargetStorageType(result.target_storage_type ?? null)
+        setTargetFormat(result.target_format ?? null)
         setDropRecreateEligible(Boolean(result.drop_recreate_eligible))
-        if (table && result.target_schema?.fields?.length && isExistingStrategy) {
-          setSchema(result.target_schema)
-          setRules(result.target_schema.fields.map(suggested))
-        }
       }
       if (result.warehouses.length) setWarehouses(result.warehouses)
       if (result.external_locations.length) setExternalLocations(result.external_locations)
@@ -112,7 +156,21 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
     finally { setListing(false) }
   }
 
-  useEffect(() => { void loadListings() }, [])
+  useEffect(() => {
+    void loadListings()
+    void api.syntheticGenerators().then((result) => setGeneratorRegistry(result.items)).catch((cause) => setError(cause instanceof Error ? cause.message : 'Generator options could not be loaded.'))
+  }, [])
+  useEffect(() => {
+    if (!generatorRegistry.length) return
+    setRules((current) => current.map((rule) => {
+      const field = schema.fields.find((item) => item.name === rule.column)
+      if (!field) return rule
+      const options = compatibleGenerators(field)
+      if (options.some((item) => item.id === rule.generator)) return rule
+      const fallback = options.find((item) => item.id === suggested(field).generator) ?? options[0]
+      return fallback ? { ...rule, generator: fallback.id, parameters: {}, unique: false } : rule
+    }))
+  }, [generatorRegistry, schema.fields])
   useEffect(() => {
     let active = true
     void api.operations().then(async (items) => {
@@ -137,8 +195,8 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   }, [destination.catalog])
   useEffect(() => {
     if (destination.catalog && destination.schema) void loadListings(destination.catalog, destination.schema,
-      isExistingStrategy ? destination.table : undefined)
-  }, [destination.catalog, destination.schema, destination.table, isExistingStrategy])
+      isExistingStrategy || targetExists ? destination.table : undefined)
+  }, [destination.catalog, destination.schema, destination.table, isExistingStrategy, targetExists])
 
   useEffect(() => {
     if (!operation?.id || terminal) return
@@ -167,19 +225,24 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
     ? { ...rule, ...update, parameters: update.generator && update.generator !== rule.generator ? {} : update.parameters ?? rule.parameters } : rule))
   const updateParameter = (column: string, key: string, value: unknown) => setRules((items) => items.map((rule) => rule.column === column ? { ...rule, parameters: { ...rule.parameters, [key]: value } } : rule))
   const updateField = (name: string, update: Partial<CanonicalSchema['fields'][number]>) => {
+    setSchemaSource('custom')
+    const decimal = update.original_type ? /^\s*(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/i.exec(update.original_type) : null
     setSchema((current) => ({ ...current, fields: current.fields.map((field) => field.name === name ? { ...field, ...update,
-      canonical_type: update.original_type ? update.original_type.toLowerCase() : update.canonical_type ?? field.canonical_type } : field) }))
+      canonical_type: update.original_type ? update.original_type.toLowerCase() : update.canonical_type ?? field.canonical_type,
+      precision: update.original_type ? decimal ? Number(decimal[1]) : null : update.precision ?? field.precision,
+      scale: update.original_type ? decimal ? Number(decimal[2]) : null : update.scale ?? field.scale } : field) }))
     if (update.name && update.name !== name) setRules((current) => current.map((rule) => rule.column === name ? { ...rule, column: update.name! } : rule))
     setReview(null)
   }
   const addField = () => {
+    setSchemaSource('custom')
     const name = `new_column_${schema.fields.length + 1}`
     const field: CanonicalSchema['fields'][number] = { name, original_type: 'STRING', canonical_type: 'string', nullable: true, precision: null, scale: null, constraints: [], children: [], technology_properties: {} }
     setSchema((current) => ({ ...current, fields: [...current.fields, field] }))
     setRules((current) => [...current, suggested(field)])
     setReview(null)
   }
-  const removeField = (name: string) => { setSchema((current) => ({ ...current, fields: current.fields.filter((field) => field.name !== name) })); setRules((current) => current.filter((rule) => rule.column !== name)); setReview(null) }
+  const removeField = (name: string) => { setSchemaSource('custom'); setSchema((current) => ({ ...current, fields: current.fields.filter((field) => field.name !== name) })); setRules((current) => current.filter((rule) => rule.column !== name)); setReview(null) }
 
   const request: SyntheticRunRequest = {
     source_node_id: node.id, source_environment: sourceEnvironment,
@@ -190,12 +253,37 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   }
 
   const generatePreview = async () => {
+    const requestId = ++previewRequestId.current
+    const requestDigest = generationDigest
     setLoading(true); setError('')
-    try { const result = await api.syntheticPreview(schema, Math.min(rowCount, 100), rules, locale, seed); setPreview(result.rows); setNotice('Preview generated locally; no Databricks table was changed.') }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'Preview could not be generated.') }
-    finally { setLoading(false) }
+    try { const result = await api.syntheticPreview(schema, Math.min(rowCount, 100), rules, locale, seed); if (requestId !== previewRequestId.current || currentPreviewDigest.current !== requestDigest) return; setPreview(result.rows); setPreviewDigest(requestDigest); setNotice('Preview generated locally; no Databricks table was changed.') }
+    catch (cause) { if (requestId === previewRequestId.current && currentPreviewDigest.current === requestDigest) setError(cause instanceof Error ? cause.message : 'Preview could not be generated.') }
+    finally { if (requestId === previewRequestId.current) setLoading(false) }
+  }
+  const navigateToStep = (target: number) => {
+    if (target === 4) { if (operation) setStep(4); else setError('Execution becomes available after you review and approve a publication plan.'); return }
+    if (target === 3) { void reviewPlan(); return }
+    if (target >= 2) {
+      const missing = schema.fields.find((field) => compatibleGenerators(field).length === 0)
+      if (missing) { setError(`No implemented generator supports ${missing.original_type} for column ${missing.name}. Change its type or keep it out of this generation plan.`); return }
+      const invalid = schema.fields.find((field) => !rules.some((rule) => rule.column === field.name))
+      if (invalid) { setError(`Choose a generation rule for ${invalid.name} before continuing.`); return }
+    }
+    if (target >= 1 && (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id || strategyUnavailableReason
+      || (destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && !destination.external_location_name))) {
+      setError(strategyUnavailableReason || 'Choose a DEV catalog, schema, table, SQL warehouse, and any required External Location before continuing.'); return
+    }
+    setError(''); setStep(target as Step)
   }
   const reviewPlan = async () => {
+    if (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id) { setError('Choose a DEV catalog, schema, table, and SQL warehouse before review.'); return }
+    if (strategyUnavailableReason) { setError(strategyUnavailableReason); return }
+    if (destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && !destination.external_location_name) { setError('Select an External Location with verified DEV privileges before review.'); return }
+    if (['append', 'replace'].includes(strategy) && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields))) { setError('Use the selected DEV table schema before reviewing Append or Replace.'); return }
+    const unsupported = schema.fields.find((field) => !compatibleGenerators(field).length)
+    if (unsupported) { setError(`No implemented generator supports ${unsupported.original_type} for column ${unsupported.name}. Choose a supported type before review.`); return }
+    const missingRule = schema.fields.find((field) => !rules.some((rule) => rule.column === field.name))
+    if (missingRule) { setError(`Choose a generation rule for ${missingRule.name} before review.`); return }
     setLoading(true); setError('')
     const id = crypto.randomUUID()
     setReviewId(id)
@@ -233,28 +321,30 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
   return <section className="synthetic-studio" aria-label="Synthetic Data Studio">
     <header className="synthetic-header"><div><span className="eyebrow">PREPARE DEV · SYNTHETIC DATA</span><h2>Prepare DEV</h2><code>{node.qualified_name ?? node.name} · source {sourceEnvironment.toUpperCase()}</code></div><button className="button secondary small" onClick={onClose}><X size={13} /> Close</button></header>
     {comparison && <div className="synthetic-context-note"><strong>Compare Tables context</strong><span>{comparison.state ?? 'Schema comparison'}{comparison.summary && ` · ${Object.entries(comparison.summary).filter(([, count]) => count).map(([key, count]) => `${count} ${key.replaceAll('_', '-')}`).join(' · ')}`}</span></div>}
-    <nav className="synthetic-step-strip" aria-label="Prepare DEV steps">{steps.map((label, index) => <button key={label} type="button" className={step === index ? 'active' : step > index ? 'complete' : ''} aria-current={step === index ? 'step' : undefined} disabled={index > step || (index < 4 && Boolean(operation) && !terminal)} onClick={() => { if (index <= step && index < 4 && (!operation || terminal)) setStep(index as Step) }}><span>{step > index ? <Check size={12} /> : `0${index + 1}`}</span>{label}</button>)}</nav>
+    <nav className="synthetic-step-strip" aria-label="Prepare DEV steps">{steps.map((label, index) => <button key={label} type="button" className={step === index ? 'active' : step > index ? 'complete' : ''} aria-current={step === index ? 'step' : undefined} disabled={Boolean(operation) && !terminal && index !== 4} onClick={() => navigateToStep(index)}><span>{step > index ? <Check size={12} /> : `0${index + 1}`}</span>{label}</button>)}</nav>
     {error && <div className="discover-error" role="alert">{error}</div>}{notice && <p className="synthetic-notice" role="status">{notice}</p>}
 
     {step === 0 && <section className="synthetic-panel"><h3>01 · Destination</h3><p>Choose the DEV destination. Dexter reads only metadata during review; generated records are published only to this DEV profile.</p>
       <div className="synthetic-destination-grid"><label>DEV catalog<select value={destination.catalog ?? ''} disabled={listing || !catalogs.length} onChange={(event) => updateDestination({ catalog: event.target.value, schema: '', table: '' })}><option value="">{listing ? 'Loading catalogs…' : 'Select catalog'}</option>{catalogs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
         <label>DEV schema<select value={destination.schema ?? ''} disabled={!destination.catalog || listing} onChange={(event) => updateDestination({ schema: event.target.value, table: '' })}><option value="">Select schema</option>{schemas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
-        <label>Publication strategy<select value={strategy} onChange={(event) => { updateDestination({ strategy: event.target.value as SyntheticDestination['strategy'] }); setSchema(initialSchema); setRules(initialSchema.fields.map(suggested)) }}><option value="create">Create new table</option><option value="isolated">Create isolated table</option><option value="append">Append to existing table</option><option value="replace">Replace table data</option><option value="drop_recreate">Drop &amp; Recreate · Dexter experimental tables only</option></select></label>
+        <label>Publication strategy<select value={strategy} onChange={(event) => updateDestination({ strategy: event.target.value as SyntheticDestination['strategy'] })}>{!strategyOptions.includes(strategy) && <option value={strategy} disabled>{strategy.replaceAll('_', ' ')} · unavailable for this target</option>}{strategyOptions.map((item) => <option key={item} value={item}>{({ create: 'Create new table', isolated: 'Create isolated table', append: 'Append to existing table', replace: 'Replace table data', drop_recreate: 'Drop & Recreate · Dexter experimental tables only' })[item]}</option>)}</select></label>
         {isExistingStrategy ? <label>Existing DEV table<select value={destination.table ?? ''} disabled={!destination.schema || listing} onChange={(event) => updateDestination({ table: event.target.value })}><option value="">Select table</option>{tables.map((item) => <option key={item.name} value={item.name}>{item.name} · {item.table_type}</option>)}</select></label>
           : <label>{strategy === 'isolated' ? 'New isolated table' : 'New table'}<input value={destination.table ?? ''} onChange={(event) => updateDestination({ table: event.target.value })} placeholder={`${node.name}${strategy === 'isolated' ? '_test' : ''}`} /></label>}
         <label>SQL warehouse<select value={destination.warehouse_id ?? ''} disabled={!warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select></label>
         <label>Table storage<select value={destination.storage_type ?? 'managed'} disabled={strategy === 'append' || strategy === 'replace'} onChange={(event) => updateDestination({ storage_type: event.target.value as 'managed' | 'external' })}><option value="managed">Managed Delta</option><option value="external">External Delta</option></select></label>
-        {destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && <label>{strategy === 'drop_recreate' ? 'New authorized External Location' : 'Authorized External Location'}<select value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{externalLocations.filter((item) => !item.read_only).map((item) => <option key={item.name} value={item.name}>{item.name} · {item.url}</option>)}</select></label>}
+        {destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && <label>{strategy === 'drop_recreate' ? 'New authorized External Location' : 'Authorized External Location'}<select value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{locationOptions.filter((item) => !item.read_only).map((item) => <option key={item.name} value={item.name} disabled={item.authorized === false}>{item.name} · {item.url}{item.score ? ` · path match ${item.score}` : ''}{item.authorized === false ? ' · not authorized' : ''}</option>)}</select>{destinationSuggestion && <small>{destinationSuggestion.suggested_external_location ? 'One unique authorized location matched the mapped DEV path.' : 'No single authorized location matched confidently; choose a verified location manually.'}</small>}</label>}
       </div>
+      {strategyUnavailableReason && <div className="synthetic-blocked-note" role="alert">{strategyUnavailableReason}</div>}
       {strategy === 'drop_recreate' && <div className={dropRecreateEligible ? 'synthetic-permission-note confirmed' : 'synthetic-blocked-note'}>{dropRecreateEligible ? 'Dexter run provenance and physical table ID verified. The final privilege, dependency, storage, and metadata preflight is still required.' : 'Preflight required. Only unchanged Dexter experimental tables with a verified run marker and physical table ID can proceed; existing corporate tables remain ineligible.'}</div>}
-      <footer className="synthetic-actions"><small>Profile: Databricks DEV · {destination.catalog && destination.schema ? `${destination.catalog}.${destination.schema}` : 'Select a destination'}</small><button className="button primary small" disabled={!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id || (destination.storage_type === 'external' && (!isExistingStrategy || strategy === 'drop_recreate') && !destination.external_location_name)} onClick={() => setStep(1)}>Schema <ArrowRight size={13} /></button></footer>
+      <footer className="synthetic-actions"><small>Profile: Databricks DEV · {destination.catalog && destination.schema ? `${destination.catalog}.${destination.schema}` : 'Select a destination'}</small><button className="button primary small" disabled={listing} onClick={() => navigateToStep(1)}>Schema <ArrowRight size={13} /></button></footer>
     </section>}
 
-    {step === 1 && <section className="synthetic-panel"><h3>02 · Schema Editor</h3><p>Start from the selected table schema, edit the proposed DEV schema, and review structural changes before publication. No DDL runs here.</p>
-      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{schema.fields.map((field) => <SchemaFieldEditor key={field.name} mode="synthetic" field={field} onChange={(change) => updateField(field.name, { ...change, ...(change.original_type ? { precision: null, scale: null } : {}) })} onRemove={() => removeField(field.name)} />)}</div>
-      <button className="button secondary small" onClick={addField}>Add column</button>
-      <div className="synthetic-schema-diff"><strong>Schema draft</strong><span>{schema.fields.length} columns · {schema.fields.filter((field) => !['string','integer','bigint','decimal','double','boolean','date','timestamp'].some((type) => field.canonical_type.includes(type))).length} unsupported types are validated before publication</span></div>
-      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(0)}><ArrowLeft size={13} /> Destination</button><button className="button primary small" disabled={!schema.fields.length || schema.fields.some((field) => !field.name.trim())} onClick={() => setStep(2)}>Generation Rules <ArrowRight size={13} /></button></footer>
+    {step === 1 && <section className="synthetic-panel"><h3>02 · Schema Editor</h3><p>Start from a clearly identified schema source, then review the proposed DEV schema before publication. No DDL runs here.</p>
+      <div className="synthetic-schema-diff"><strong>Schema source · {schemaSource === 'dev' ? 'Existing DEV table' : schemaSource === 'custom' ? 'Custom draft' : sourceEnvironment.toUpperCase()}</strong><span>{['append', 'replace'].includes(strategy) ? 'The existing table schema is required and cannot be edited for this strategy.' : `${schema.fields.length} columns from ${schema.qualified_name}`}</span>{['append', 'replace'].includes(strategy) && targetSchema && <button className="button secondary small" onClick={() => { if (schemaDirty && !window.confirm('Replace the current schema edits and generation rules with the selected DEV table schema?')) return; setSchema(targetSchema); setSchemaSource('dev'); setRules(targetSchema.fields.map(suggested)); setPreviewDigest(''); setNotice('Schema source changed to the selected DEV table.') }}>Use selected DEV schema</button>}</div>
+      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{schema.fields.map((field) => <SchemaFieldEditor key={field.name} mode="synthetic" field={field} disabled={['append', 'replace'].includes(strategy)} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
+      {!['append', 'replace'].includes(strategy) && <button className="button secondary small" onClick={addField}>Add column</button>}
+      <div className="synthetic-schema-diff"><strong>Draft validation</strong><span>{schema.fields.length} columns · unsupported or capability-gated types will be explained before publication</span></div>
+      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(0)}><ArrowLeft size={13} /> Destination</button><button className="button primary small" disabled={!schema.fields.length || schema.fields.some((field) => !field.name.trim()) || (['append', 'replace'].includes(strategy) && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields)))} onClick={() => setStep(2)}>Generation Rules <ArrowRight size={13} /></button></footer>
     </section>}
 
     {step === 2 && <section className="synthetic-panel"><h3>03 · Generation Rules</h3><p>DuckDB generates structured values. Mimesis is used only for semantic fields such as names, addresses, and phone numbers.</p>
@@ -262,7 +352,9 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
       <div className="synthetic-rules"><div className="synthetic-rule-row heading"><span>Column</span><span>Type</span><span>Generator</span><span>Null %</span></div>{schema.fields.map((field) => {
         const rule = rules.find((item) => item.column === field.name) ?? suggested(field)
         const number = (label: string, key: string, fallback: number) => <label>{label}<input type="number" value={String(rule.parameters[key] ?? fallback)} onChange={(event) => updateParameter(field.name, key, Number(event.target.value))} /></label>
-        return <div className="synthetic-rule-row" key={field.name}><strong>{field.name}</strong><code>{field.original_type}</code><div className="synthetic-generator-control"><select aria-label={`Generator for ${field.name}`} value={rule.generator} onChange={(event) => updateRule(field.name, { generator: event.target.value })}>{['sequence','integer_range','decimal_range','date_range','timestamp_range','boolean','enum','fixed','name','email','company','address','phone'].map((item) => <option key={item} value={item}>{item.replaceAll('_',' ')}</option>)}</select>
+        const allowedGenerators = compatibleGenerators(field)
+        const columnError = error.split('; ').find((message) => message.toLowerCase().includes(field.name.toLowerCase()))
+        return <div className="synthetic-rule-row" key={field.name}><strong>{field.name}</strong><code>{field.original_type}</code><div className="synthetic-generator-control"><select aria-label={`Generator for ${field.name}`} value={rule.generator} onChange={(event) => updateRule(field.name, { generator: event.target.value })}>{allowedGenerators.map((item) => <option key={item.id} value={item.id}>{item.id.replaceAll('_',' ')}</option>)}</select>{!allowedGenerators.length && <small role="alert">No implemented generator supports this type.</small>}{columnError && <small className="synthetic-column-error" role="alert">{columnError}</small>}
           {rule.generator === 'integer_range' && <div className="synthetic-parameter-pair">{number('Minimum','min',0)}{number('Maximum','max',1000)}</div>}
           {rule.generator === 'decimal_range' && <div className="synthetic-parameter-pair">{number('Minimum','min',0)}{number('Maximum','max',1000)}</div>}
           {rule.generator === 'sequence' && <div className="synthetic-parameter-pair">{number('Start','start',1)}{number('Step','step',1)}</div>}
@@ -274,7 +366,7 @@ export function SyntheticStudio({ node, sourceEnvironment, onClose, onOpenTable,
           {rule.unique && <small>Unique values required</small>}
         </div><div className="synthetic-null-control"><input aria-label={`Null percentage for ${field.name}`} type="number" min={0} max={100} disabled={field.nullable === false} value={rule.null_percent} onChange={(event) => updateRule(field.name, { null_percent: Number(event.target.value) })} /><label><input type="checkbox" checked={rule.unique} disabled={!['sequence','integer_range'].includes(rule.generator)} onChange={(event) => updateRule(field.name,{ unique: event.target.checked })} />Unique</label></div></div>
       })}</div>
-      {preview.length > 0 && <div className="synthetic-preview"><h4>Real generated preview · {preview.length} rows</h4><table><thead><tr>{schema.fields.map((field) => <th key={field.name}>{field.name}</th>)}</tr></thead><tbody>{preview.slice(0, 12).map((row, index) => <tr key={index}>{schema.fields.map((field) => <td key={field.name}>{String(row[field.name] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}
+      {preview.length > 0 && previewDigest === generationDigest && <div className="synthetic-preview"><h4>Real generated preview · {preview.length} rows</h4><table><thead><tr>{schema.fields.map((field) => <th key={field.name}>{field.name}</th>)}</tr></thead><tbody>{preview.slice(0, 12).map((row, index) => <tr key={index}>{schema.fields.map((field) => <td key={field.name}>{String(row[field.name] ?? 'NULL')}</td>)}</tr>)}</tbody></table></div>}{previewDigest && previewDigest !== generationDigest && <div className="synthetic-blocked-note" role="status">The draft changed after this preview. Generate a new preview to review current values.</div>}
       <footer className="synthetic-actions"><button className="button secondary small" onClick={() => setStep(1)}><ArrowLeft size={13} /> Schema</button><div><button className="button secondary small" disabled={loading} onClick={() => void generatePreview()}>{loading ? <LoaderCircle size={13} className="spin" /> : <Sparkles size={13} />} Preview ≤100 rows</button><button className="button primary small" disabled={loading} onClick={() => void reviewPlan()}>Review Plan <ArrowRight size={13} /></button></div></footer>
     </section>}
 

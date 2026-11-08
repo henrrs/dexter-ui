@@ -38,6 +38,7 @@ def suggested_rule(field: dict[str, Any]) -> ColumnRule:
     name = str(field.get("name", ""))
     lower = name.casefold()
     dtype = str(field.get("canonical_type") or field.get("original_type") or "").casefold()
+    parameters: dict[str, Any] = {}
     if "email" in lower or lower.endswith("_mail"):
         generator = "email"
     elif any(token in lower for token in ("name", "nome")):
@@ -58,9 +59,13 @@ def suggested_rule(field: dict[str, Any]) -> ColumnRule:
         generator = "date_range"
     elif any(token in dtype for token in ("int", "long", "bigint", "short", "byte")):
         generator = "sequence" if lower == "id" or lower.endswith("_id") else "integer_range"
+    elif any(token in dtype for token in ("double", "float", "real")):
+        generator = "decimal_range"
+    elif any(token in dtype for token in ("string", "varchar", "char")):
+        generator = "random_string"
     else:
-        generator = "sequence"
-    parameters: dict[str, Any] = {}
+        generator = "fixed"
+        parameters = {"value": None}
     if generator == "enum":
         parameters["values"] = []
     return ColumnRule(name, generator, parameters, 0, generator == "sequence" and (lower == "id" or lower.endswith("_id")))
@@ -265,6 +270,8 @@ def generate_parquet_chunks(
                         value = str(raw)
                     else:
                         value = "'" + str(raw).replace("'", "''") + "'"
+                elif generator == "random_string":
+                    value = f"substr(md5(CAST(hash({offset} + {seed_value}) AS VARCHAR)), 1, 24)"
                 else:
                     value = f"s.{qname}"
                 if rule.null_percent:

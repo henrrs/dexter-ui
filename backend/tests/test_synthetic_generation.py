@@ -134,6 +134,26 @@ class SyntheticGenerationTests(unittest.TestCase):
         self.assertEqual(kind, "TIMESTAMP")
         self.assertEqual(len(values), 3)
 
+    def test_random_string_is_deterministic_and_generator_contract_is_shared(self):
+        from dexter.domain.synthetic import generator_contract
+        schema = {"qualified_name": "dev.gold.labels", "fields": [
+            {"name": "label", "original_type": "STRING", "canonical_type": "string", "nullable": False},
+        ]}
+        plan = SyntheticGenerationPlan(schema, 8, (ColumnRule("label", "random_string"),), seed=77)
+        self.assertEqual(plan.validate(), [])
+        contract = {item["id"]: item for item in generator_contract()}
+        self.assertIn("STRING", contract["random_string"]["types"])
+        self.assertEqual(contract["random_string"]["provider"], "duckdb")
+        with tempfile.TemporaryDirectory() as folder:
+            chunks = list(generate_parquet_chunks(plan, Path(folder), chunk_rows=8))
+            db = duckdb.connect(":memory:")
+            try:
+                rows = db.execute("SELECT label FROM read_parquet(?)", [chunks[0]["path"]]).fetchall()
+            finally:
+                db.close()
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(len({value[0] for value in rows}), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

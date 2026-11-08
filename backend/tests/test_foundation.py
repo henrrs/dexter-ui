@@ -245,6 +245,18 @@ except ImportError:
 
 @unittest.skipUnless(API_AVAILABLE, "FastAPI/httpx are not installed; API tests run after make setup")
 class ApiTests(unittest.TestCase):
+    def test_synthetic_generator_contract_is_available_without_a_workspace(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")}), Settings())
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.get("/api/synthetic/generators")
+            self.assertEqual(response.status_code, 200)
+            contract = {item["id"]: item for item in response.json()["items"]}
+            self.assertEqual(contract["random_string"]["provider"], "duckdb")
+            self.assertIn("DOUBLE", contract["decimal_range"]["types"])
+
     def test_schema_evolution_context_rejects_non_unified_identity(self):
         from dexter.config import Settings
         with tempfile.TemporaryDirectory() as temporary:

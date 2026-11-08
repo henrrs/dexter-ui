@@ -30,6 +30,10 @@ def inspect_table(workspace: Any, identity: dict[str, str]) -> tuple[Any, dict[s
         "table_type": table_type,
         "column_mapping": str(props.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"},
         "type_widening": str(props.get("delta.enableTypeWidening", "false")).casefold() == "true",
+        # Feature flags are observations only. Dexter never enables protocol features.
+        "time_type": str(props.get("delta.feature.timeType", "")).casefold() in {"supported", "enabled"},
+        "variant_type": str(props.get("delta.feature.variantType", "")).casefold() in {"supported", "enabled"},
+        "timestamp_ntz": str(props.get("delta.feature.timestampNtz", "")).casefold() in {"supported", "enabled"},
         "table_id": str(field(target, "table_id", "") or ""),
         "has_table_constraints": bool(field(target, "table_constraints", None) or field(target, "constraints", None)),
         "row_filter": bool(field(target, "row_filter", None)),

@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Check, CircleAlert, LoaderCircle, Plus, RotateCcw } from 'lucide-react'
 import { api } from './api'
 import type { CanonicalSchema, DiscoverNode, SchemaChangePlan, SchemaDraft, SchemaDraftColumn, SchemaEvolutionContext, SchemaValidation } from './api'
 import type { Operation } from './types'
-import { SchemaFieldEditor } from './SchemaFieldEditor'
+import { DatabricksTypeSelector, SchemaFieldEditor } from './SchemaFieldEditor'
 
 type Props = { node: DiscoverNode; referenceSchema?: CanonicalSchema | null; onValidated?: () => void; onCompare?: () => void }
 type Stage = 'edit' | 'review' | 'apply' | 'validate'
@@ -27,6 +27,8 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
   const [history, setHistory] = useState<SchemaDraft[]>([])
   const [newName, setNewName] = useState('')
   const [newType, setNewType] = useState('STRING')
+  const saveQueue = useRef<Promise<void>>(Promise.resolve())
+  const saveTimer = useRef<number | null>(null)
 
   useEffect(() => {
     let active = true
@@ -67,13 +69,22 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
   }, [context, uiHydrated, stage, plan, warehouseId, confirmDrop])
 
   useEffect(() => {
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: {
+      kind: 'workflow', workflow: 'Schema Evolution', stage: stages.find((item) => item.id === stage)?.label ?? stage,
+      name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: 'DEV',
+    } }))
+  }, [node.id, node.name, node.qualified_name, stage])
+
+  useEffect(() => {
     if (!context || !draft || loading) return
     const timer = window.setTimeout(() => {
       const names = draft.columns.filter((item) => !item.removed).map((item) => item.field.name.trim().toLowerCase())
       if (names.some((name) => !name) || names.length !== new Set(names).size) return
-      void api.saveSchemaDraft(node.id, context.identity, draft).catch((cause) => setError(cause instanceof Error ? cause.message : 'The draft could not be saved.'))
+      saveQueue.current = saveQueue.current.catch(() => undefined).then(() => api.saveSchemaDraft(node.id, context.identity, draft)).then(() => undefined)
+      void saveQueue.current.catch((cause) => setError(cause instanceof Error ? cause.message : 'The draft could not be saved.'))
     }, 300)
-    return () => window.clearTimeout(timer)
+    saveTimer.current = timer
+    return () => { window.clearTimeout(timer); if (saveTimer.current === timer) saveTimer.current = null }
   }, [context, draft, loading, node.id])
 
   useEffect(() => {
@@ -97,9 +108,13 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
   const fields = useMemo(() => draft?.columns ?? [], [draft])
   const changedCount = useMemo(() => {
     if (!draft) return 0
-    const proposed = draft.columns.filter((item) => !item.removed).map((item) => JSON.stringify(item.field))
-    const baseline = draft.baseline.fields.map((item) => JSON.stringify(item))
-    return proposed.filter((item) => !baseline.includes(item)).length + draft.columns.filter((item) => item.removed).length
+    const baseline = new Map(draft.baseline.fields.map((field) => [field.name.toLowerCase(), field]))
+    return draft.columns.filter((column) => {
+      if (column.removed) return column.original_name !== null
+      if (column.original_name === null) return true
+      const original = baseline.get(column.original_name.toLowerCase())
+      return !original || JSON.stringify(column.field) !== JSON.stringify(original)
+    }).length
   }, [draft])
 
   const save = async (next: SchemaDraft) => {
@@ -144,7 +159,11 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
   const review = async () => {
     setBusy(true); setError('')
     try {
-      if (draft && context) await api.saveSchemaDraft(node.id, context.identity, draft)
+      if (saveTimer.current !== null) { window.clearTimeout(saveTimer.current); saveTimer.current = null }
+      if (draft && context) {
+        saveQueue.current = saveQueue.current.catch(() => undefined).then(() => api.saveSchemaDraft(node.id, context.identity, draft)).then(() => undefined)
+        await saveQueue.current
+      }
       const next = await api.reviewSchema(node.id)
       setPlan(next); setStage('review'); setConfirmDrop(false)
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Schema changes could not be reviewed.') }
@@ -178,7 +197,20 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
     {context.drift && <div className="compare-message warning" role="alert">DEV schema changed after this draft was saved. Your edits are preserved; reset to the current schema before reviewing.</div>}
     {stage === 'edit' && <>
       {referenceSchema && <div className="compare-message" role="status">Differences from PROD are highlighted for context. No PROD values have been copied into this draft.</div>}
-      <div className="schema-evolution-toolbar"><strong>{draft.baseline.fields.length} original columns · {changedCount} draft changes</strong><div><button className="button secondary small" onClick={() => void undo()} disabled={!history.length}><RotateCcw size={13} /> Undo</button><button className="button secondary small" onClick={() => void reset()}>Reset Draft</button></div></div>
+      <div className="schema-evolution-toolbar"><strong>{draft.baseline.fields.length} original columns · {changedCount} draft changes</strong><div>{referenceSchema && <button className="button secondary small" onClick={() => {
+        let restored = 0
+        const names = new Set(draft.columns.filter((item) => !item.removed).map((item) => item.field.name.toLowerCase()))
+        const columns = draft.columns.map((item) => {
+          if (!item.removed || !referenceSchema.fields.some((field) => field.name.toLowerCase() === item.field.name.toLowerCase())) return item
+          restored += 1; names.add(item.field.name.toLowerCase()); return { ...item, removed: false }
+        })
+        const missing = referenceSchema.fields.filter((field) => !names.has(field.name.toLowerCase()))
+        const additions: SchemaDraftColumn[] = missing.map((field) => ({ column_id: crypto.randomUUID(), original_name: null,
+          field: { ...field, nullable: true, technology_properties: { ...field.technology_properties } }, removed: false }))
+        if (!restored && !additions.length) { setNotice('All PROD columns are already present in the DEV draft.'); return }
+        void save({ ...draft, columns: [...columns, ...additions] })
+        setNotice(`${additions.length} missing PROD column${additions.length === 1 ? '' : 's'} added and ${restored} removed DEV column${restored === 1 ? '' : 's'} restored. New columns are nullable; review constraints and types before applying.`)
+      }}>Add Missing PROD Columns</button>}<button className="button secondary small" onClick={() => void undo()} disabled={!history.length}><RotateCcw size={13} /> Undo</button><button className="button secondary small" onClick={() => void reset()}>Reset Draft</button></div></div>
       <div className="schema-evolution-table-wrap"><table className="schema-evolution-table"><thead><tr><th>Column</th><th>Type</th><th>Nullability</th><th>Comment</th><th>Draft</th><th /></tr></thead><tbody>{fields.map((column) => {
         const field = column.field; const removed = column.removed; const complex = /^(ARRAY|MAP|STRUCT)/i.test(field.original_type)
         const prod = referenceSchema?.fields.find((item) => item.name.toLowerCase() === field.name.toLowerCase())
@@ -191,11 +223,12 @@ export function SchemaEvolutionStudio({ node, referenceSchema, onValidated, onCo
             : change)}
           onRemove={() => remove(column)} onRestore={() => restore(column)} />
       })}</tbody></table></div>
-      <div className="schema-evolution-add"><label>New column<input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="column_name" /></label><label>Type<input value={newType} onChange={(event) => setNewType(event.target.value)} /></label><button className="button secondary small" onClick={addField}><Plus size={13} /> Add Column</button></div>
-      <footer className="schema-evolution-footer"><span>Editing a draft does not run SQL or change the table.</span><button className="button primary" onClick={() => void review()} disabled={busy || !changedCount}>{busy ? <LoaderCircle size={14} className="spin" /> : null}Review Changes <ArrowRight size={14} /></button></footer>
+      <div className="schema-evolution-add"><label>New column<input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="column_name" /></label><label>Type<DatabricksTypeSelector fieldName="new column" value={newType} onChange={setNewType} /></label><button className="button secondary small" onClick={addField}><Plus size={13} /> Add Column</button></div>
+      <footer className="schema-evolution-footer"><span>Editing a draft does not run SQL or change the table.</span><button className="button primary" onClick={() => void review()} disabled={busy}>{busy ? <LoaderCircle size={14} className="spin" /> : null}Review Changes <ArrowRight size={14} /></button></footer>
     </>}
     {stage === 'review' && plan && <>
       <div className="schema-evolution-summary"><strong>{plan.operations.length} changes</strong><span>{plan.compatibility}</span><span>{plan.target}</span></div>
+      {plan.operations.length === 0 && <div className="compare-message" role="status">No schema changes to apply. The DEV draft matches its current baseline.</div>}
       {plan.blockers.length > 0 && <div className="compare-message warning" role="alert">{plan.blockers.map((item) => <div key={item}>{item}</div>)}</div>}
       {plan.risks?.map((item) => <div className="compare-message warning" role="note" key={item}>{item}</div>)}
       {plan.operations.length > 0 && <div className="schema-evolution-review-list">{plan.operations.map((item, index) => <article key={`${item.kind}-${item.column}-${index}`}><strong>{item.kind === 'add' ? 'Add' : item.kind === 'drop' ? 'Drop' : item.kind === 'rename' ? 'Rename' : item.kind === 'type' ? 'Change type' : item.kind === 'nullability' ? 'Change nullability' : 'Change comment'} · {item.column}</strong><span>{item.kind === 'rename' ? `${item.from} → ${item.to}` : item.kind === 'type' ? `${item.field.original_type} · ${item.compatibility}` : item.kind === 'add' ? item.field.original_type : item.compatibility}</span></article>)}</div>}

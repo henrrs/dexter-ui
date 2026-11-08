@@ -14,8 +14,55 @@ from typing import Any
 MAX_ROWS = 1_000_000
 SUPPORTED_GENERATORS = {
     "sequence", "integer_range", "decimal_range", "date_range", "timestamp_range", "boolean",
-    "enum", "fixed", "name", "email", "company", "address", "phone",
+    "enum", "fixed", "random_string", "name", "email", "company", "address", "phone",
 }
+GENERATOR_REGISTRY = {
+    "sequence": {"types": ["TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG"], "provider": "duckdb", "unique": True},
+    "integer_range": {"types": ["TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG"], "provider": "duckdb", "unique": True},
+    "decimal_range": {"types": ["DECIMAL", "NUMERIC", "FLOAT", "REAL", "DOUBLE"], "provider": "duckdb", "unique": False},
+    "date_range": {"types": ["DATE"], "provider": "duckdb", "unique": False},
+    "timestamp_range": {"types": ["TIMESTAMP", "TIMESTAMP_NTZ"], "provider": "duckdb", "unique": False},
+    "boolean": {"types": ["BOOLEAN", "BOOL"], "provider": "duckdb", "unique": False},
+    "enum": {"types": ["STRING", "VARCHAR", "CHAR", "TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG", "DECIMAL", "NUMERIC", "FLOAT", "REAL", "DOUBLE", "BOOLEAN", "BOOL", "DATE", "TIMESTAMP", "TIMESTAMP_NTZ"], "provider": "duckdb", "unique": False},
+    "fixed": {"types": ["STRING", "VARCHAR", "CHAR", "TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG", "DECIMAL", "NUMERIC", "FLOAT", "REAL", "DOUBLE", "BOOLEAN", "BOOL", "DATE", "TIMESTAMP", "TIMESTAMP_NTZ"], "provider": "duckdb", "unique": False},
+    "random_string": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "duckdb", "unique": False},
+    "name": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "mimesis", "unique": False},
+    "email": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "mimesis", "unique": False},
+    "company": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "mimesis", "unique": False},
+    "address": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "mimesis", "unique": False},
+    "phone": {"types": ["STRING", "VARCHAR", "CHAR"], "provider": "mimesis", "unique": False},
+}
+
+
+def generator_contract() -> list[dict[str, Any]]:
+    return [{"id": name, **descriptor} for name, descriptor in GENERATOR_REGISTRY.items()]
+
+
+def rank_external_locations(locations: list[dict[str, Any]], *, catalog: str, schema: str,
+                            table: str, authorized_names: set[str]) -> tuple[list[dict[str, Any]], str | None]:
+    """Rank DEV locations by catalog/schema path evidence; only suggest a unique authorized match."""
+    ranked = []
+    table_hint = table.split("_", 1)[0]
+    for item in locations:
+        name, url = str(item.get("name", "")), str(item.get("url", ""))
+        read_only = bool(item.get("read_only", False))
+        searchable = f"{name} {url}".casefold()
+        has_catalog, has_schema = catalog.casefold() in searchable, schema.casefold() in searchable
+        matches = [token for token in (catalog, schema, table_hint) if token and token.casefold() in searchable]
+        score = (5 if has_catalog else 0) + (4 if has_schema else 0) + (1 if len(matches) > 2 else 0)
+        authorized = name in authorized_names and not read_only
+        ranked.append({"name": name, "url": url, "read_only": read_only, "score": score,
+                       "authorized": authorized, "reason": "Matches " + ", ".join(matches) if matches else "No catalog or schema path match"})
+    ranked.sort(key=lambda item: (-item["score"], item["name"].casefold()))
+    eligible = [item for item in ranked if item["score"] >= 9 and item["authorized"]]
+    if len(eligible) == 1:
+        return ranked, eligible[0]["name"]
+    if eligible:
+        top_score = eligible[0]["score"]
+        top = [item for item in eligible if item["score"] == top_score]
+        if len(top) == 1:
+            return ranked, top[0]["name"]
+    return ranked, None
 TABLE_STRATEGIES = {"create", "isolated", "append", "replace", "drop_recreate"}
 TABLE_STORAGE_TYPES = {"managed", "external"}
 
@@ -203,7 +250,7 @@ class SyntheticGenerationPlan:
                 params = rule.parameters
             if rule.unique and rule.null_percent:
                 errors.append(f"unique values and nulls cannot be combined for {rule.column}")
-            if rule.unique and rule.generator not in {"sequence", "integer_range"}:
+            if rule.unique and not GENERATOR_REGISTRY.get(rule.generator, {}).get("unique", False):
                 errors.append(f"unique values are not supported by the {rule.generator} generator for {rule.column}")
             field_schema = field_by_name.get(rule.column.casefold(), {})
             data_type = _base_data_type(field_schema)
@@ -212,18 +259,7 @@ class SyntheticGenerationPlan:
             string_types = {"STRING", "VARCHAR", "CHAR"}
             if not data_type or data_type not in integer_types | decimal_types | string_types | {"BOOLEAN", "BOOL", "DATE", "TIMESTAMP", "TIMESTAMP_NTZ"}:
                 errors.append(f"column {rule.column} has an unsupported scalar type")
-            compatible = {
-                "sequence": data_type in integer_types | string_types,
-                "integer_range": data_type in integer_types,
-                "decimal_range": data_type in decimal_types,
-                "date_range": data_type == "DATE",
-                "timestamp_range": data_type in {"TIMESTAMP", "TIMESTAMP_NTZ"},
-                "boolean": data_type in {"BOOLEAN", "BOOL"},
-                "name": data_type in string_types, "email": data_type in string_types,
-                "company": data_type in string_types, "address": data_type in string_types,
-                "phone": data_type in string_types,
-            }
-            if rule.generator in compatible and not compatible[rule.generator]:
+            if rule.generator in GENERATOR_REGISTRY and data_type not in GENERATOR_REGISTRY[rule.generator]["types"]:
                 errors.append(f"generator {rule.generator} is incompatible with {data_type or 'unknown'} column {rule.column}")
             if rule.generator == "fixed" and params.get("value") is None and field_schema.get("nullable") is False:
                 errors.append(f"fixed null value is not allowed for required column {rule.column}")

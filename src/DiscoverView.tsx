@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { ArrowLeftRight, ArrowRight, ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
+import { ArrowRight, ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
 import type { CanonicalSchema, DiscoverNode, DiscoverPage, SchemaCompareResult } from './api'
 import type { Operation } from './types'
@@ -12,7 +12,7 @@ type PersistedExplorerState = { loadedPaths: string[]; expandedPaths: string[] }
 const EXPLORER_STATE_KEY = 'dexter.discover.explorer-state.v1'
 type QueryEnvironment = 'local' | 'dev' | 'prod'
 type CompareEnvironment = 'prod' | 'dev'
-type CompareTabState = { referenceNodeId: string; referenceEnvironment: CompareEnvironment; compareNodeId: string | null; compareEnvironment: CompareEnvironment; changingReference: boolean; result?: SchemaCompareResult; loading: boolean; error?: string; filter: string; requestId?: number }
+type CompareTabState = { referenceNodeId: string; referenceEnvironment: CompareEnvironment; compareNodeId: string | null; compareEnvironment: CompareEnvironment; result?: SchemaCompareResult; loading: boolean; error?: string; filter: string; requestId?: number }
 type WorkbenchTab = { key: string; node: DiscoverNode; environment: QueryEnvironment; queryEnvironment?: QueryEnvironment; view: 'table' | 'local-query' | 'compare' | 'synthetic' | 'schema-evolution'; comparison?: CompareTabState; syntheticComparison?: { summary?: Record<string, number>; state?: string }; schemaReference?: CanonicalSchema | null }
 type WorkbenchSection = 'overview' | 'schema' | 'preview' | 'metadata' | 'lineage' | 'query' | 'compare' | 'synthetic' | 'schema-evolution'
 type QueryResultTab = 'results' | 'schema' | 'execution'
@@ -715,7 +715,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       referenceEnvironment: availableReferenceEnvironment,
       compareNodeId: selected.variants?.some((variant) => variant.environment === targetEnvironment) ? selected.id : null,
       compareEnvironment: targetEnvironment,
-      changingReference: false,
       loading: true,
       filter: 'all',
     }
@@ -749,45 +748,13 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     setActiveSection('synthetic')
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { kind: 'table', name: targetNode.name, qualifiedName: targetNode.qualified_name, environment: sourceEnvironment.toUpperCase() } }))
   }
-  const changeCompareObject = (key: string, side: 'reference' | 'compare', nodeId: string) => {
+  const changeCompareObject = (key: string, nodeId: string) => {
     const tab = workbenchTabs.find((item) => item.key === key && item.view === 'compare')
     if (!tab?.comparison) return
-    if (side === 'reference') {
-      const referenceNode = compareChoices.find((node) => node.id === nodeId)
-      if (!referenceNode) return
-      const targetEnvironment: CompareEnvironment = tab.comparison.referenceEnvironment === 'prod' ? 'dev' : 'prod'
-      const next: CompareTabState = {
-        ...tab.comparison, referenceNodeId: nodeId,
-        compareNodeId: referenceNode.variants?.some((variant) => variant.environment === targetEnvironment) ? nodeId : null,
-        changingReference: false, loading: true, result: undefined, error: undefined,
-      }
-      setWorkbenchTabs((tabs) => tabs.map((item) => item.key === key ? { ...item, node: referenceNode, environment: next.referenceEnvironment, comparison: next } : item))
-      setSelected(referenceNode)
-      setActiveEnvironment(next.referenceEnvironment)
-      void loadComparison(key, next)
-      return
-    }
     const compareNode = nodeId ? compareChoices.find((item) => item.id === nodeId) ?? null : null
     if (nodeId && !compareNode) return
     const next: CompareTabState = { ...tab.comparison, compareNodeId: compareNode?.id ?? null, loading: true, result: undefined, error: undefined }
     updateComparison(key, () => next)
-    void loadComparison(key, next)
-  }
-  const swapCompareObjects = (key: string) => {
-    const tab = workbenchTabs.find((item) => item.key === key && item.view === 'compare')
-    if (!tab?.comparison?.compareNodeId) return
-    const current = tab.comparison
-    const compareNodeId = current.compareNodeId
-    if (!compareNodeId) return
-    const next: CompareTabState = {
-      ...current, referenceNodeId: compareNodeId, referenceEnvironment: current.compareEnvironment,
-      compareNodeId: current.referenceNodeId, compareEnvironment: current.referenceEnvironment,
-      loading: true, result: undefined, error: undefined,
-    }
-    const referenceNode = compareChoices.find((node) => node.id === next.referenceNodeId) ?? tab.node
-    setWorkbenchTabs((tabs) => tabs.map((item) => item.key === key ? { ...item, node: referenceNode, environment: next.referenceEnvironment, comparison: next } : item))
-    setSelected(referenceNode)
-    setActiveEnvironment(next.referenceEnvironment)
     void loadComparison(key, next)
   }
   const activateTab = (tab: WorkbenchTab) => {
@@ -838,7 +805,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       setActiveEnvironment('dev')
       if (compare) {
         const key = `${tableNode.id}:compare`
-        const state: CompareTabState = { referenceNodeId: tableNode.id, referenceEnvironment: 'dev', compareNodeId: tableNode.variants?.some((variant) => variant.environment === 'prod') ? tableNode.id : null, compareEnvironment: 'prod', changingReference: false, loading: true, filter: 'all' }
+        const state: CompareTabState = { referenceNodeId: tableNode.id, referenceEnvironment: 'dev', compareNodeId: tableNode.variants?.some((variant) => variant.environment === 'prod') ? tableNode.id : null, compareEnvironment: 'prod', loading: true, filter: 'all' }
         const tab: WorkbenchTab = { key, node: tableNode, environment: 'dev', view: 'compare', comparison: state }
         setWorkbenchTabs((prior) => prior.some((item) => item.key === key) ? prior.map((item) => item.key === key ? tab : item) : [...prior, tab])
         setActiveTabKey(key); setActiveSection('compare'); void loadComparison(key, state)
@@ -975,9 +942,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         ].filter(Boolean).join(' · ')
         return <div className="compare-workspace">
           <header className="compare-header"><div><span className="eyebrow">READ-ONLY SCHEMA ANALYSIS</span><h2>Compare Tables</h2><code>Dexter / Discover / {referenceNode.name}</code>{cacheEntries.length > 0 && <small className={`compare-cache-indicator ${hasStaleSchemaCache ? 'stale' : ''}`}>{hasStaleSchemaCache ? 'Showing stale cached schema' : cacheEntries.every((item) => item.state === 'cached') ? 'Schema metadata from cache' : 'Schema metadata refreshed'}{schemaCacheTime ? ` · ${new Date(schemaCacheTime * 1000).toLocaleString()}` : ''}</small>}</div></header>
-          <div className="compare-action-bar"><div className="compare-reference-action"><button className="button secondary small" onClick={() => updateComparison(compareTab.key, (current) => ({ ...current, changingReference: !current.changingReference }))}>{comparison.changingReference ? 'Cancel reference change' : 'Change Reference Table'}</button>{comparison.changingReference && <select aria-label="Choose reference table" value={comparison.referenceNodeId} onChange={(event) => changeCompareObject(compareTab.key, 'reference', event.target.value)}>{selectChoices(comparison.referenceEnvironment)}</select>}</div><div className="compare-primary-actions">{compareTab.node.variants?.some((variant) => variant.environment === 'dev') && <button className="button secondary small" disabled={compareTab.node.variants.find((variant) => variant.environment === 'dev')?.access !== 'read'} onClick={() => openSchemaEvolution(compareTab.node, result?.prod_schema)} title="Edit this table's physical DEV schema"><Layers3 size={12} /> Edit DEV Schema</button>}{compareNode && <button className="button secondary small" onClick={() => swapCompareObjects(compareTab.key)} title="Swap reference and comparison tables"><ArrowLeftRight size={12} /> Swap</button>}<button className="icon-button subtle" aria-label="Refresh schema metadata" title="Refresh schema metadata" disabled={comparison.loading} onClick={() => void loadComparison(compareTab.key, comparison, true)}><RefreshCw size={14} className={comparison.loading ? 'spin' : ''} /></button></div></div>
+          <div className="compare-action-bar"><div className="compare-primary-actions">{compareTab.node.variants?.some((variant) => variant.environment === 'dev') && <button className="button secondary small" disabled={compareTab.node.variants.find((variant) => variant.environment === 'dev')?.access !== 'read'} onClick={() => openSchemaEvolution(compareTab.node, result?.prod_schema)} title="Edit this table's physical DEV schema"><Layers3 size={12} /> Edit DEV Schema</button>}<button className="icon-button subtle" aria-label="Refresh schema metadata" title="Refresh schema metadata" disabled={comparison.loading} onClick={() => void loadComparison(compareTab.key, comparison, true)}><RefreshCw size={14} className={comparison.loading ? 'spin' : ''} /></button></div></div>
           <div className="compare-object-selectors"><article><span>Reference Table · {comparison.referenceEnvironment.toUpperCase()}</span><strong>{referenceNode.name}</strong><code>{referenceName}</code><small className={['unavailable', 'unknown', 'access_denied'].includes(referenceSide?.state ?? '') ? 'compare-state-warning' : referenceSide?.state === 'absent' ? 'compare-state-missing' : 'compare-state-ready'}>{statusLabel(comparison.referenceEnvironment, referenceNode)}</small></article>
-            <label><span>Compare Against · {comparison.compareEnvironment.toUpperCase()}</span><select aria-label="Table to compare against" value={comparison.compareNodeId ?? ''} onChange={(event) => changeCompareObject(compareTab.key, 'compare', event.target.value)}><option value="">Same logical table in {comparison.compareEnvironment.toUpperCase()}</option>{selectChoices(comparison.compareEnvironment)}</select><code>{compareName}</code><small className={compareSide?.state === 'absent' ? 'compare-state-missing' : ['unavailable', 'unknown', 'access_denied'].includes(compareSide?.state ?? '') ? 'compare-state-warning' : 'compare-state-ready'}>{statusLabel(comparison.compareEnvironment, compareNode ?? referenceNode)}</small></label></div>
+            <article className="compare-target-card"><span>Compare Against · {comparison.compareEnvironment.toUpperCase()}</span><strong>{compareNode?.name ?? referenceNode.name}</strong><code>{compareName}</code><small className={compareSide?.state === 'absent' ? 'compare-state-missing' : ['unavailable', 'unknown', 'access_denied'].includes(compareSide?.state ?? '') ? 'compare-state-warning' : 'compare-state-ready'}>{statusLabel(comparison.compareEnvironment, compareNode ?? referenceNode)}</small><label className="compare-target-choice"><span>Choose comparison table</span><select aria-label="Table to compare against" value={comparison.compareNodeId ?? ''} onChange={(event) => changeCompareObject(compareTab.key, event.target.value)}><option value="">Same logical table in {comparison.compareEnvironment.toUpperCase()}</option>{selectChoices(comparison.compareEnvironment)}</select></label></article></div>
           <section className="compare-schema-section"><header><h3>Schema comparison</h3><span className={`compare-state-pill ${result?.state === 'matching' ? 'matching' : targetMissing ? 'missing' : result?.state === 'different' ? 'different' : ''}`}>{comparison.loading ? 'Loading schemas…' : result?.state === 'matching' ? 'Schemas match' : result?.state === 'different' ? 'Schemas differ' : targetMissing ? 'Target Table Not Found' : result ? 'Metadata unavailable' : 'Waiting for metadata'}</span></header>
             {comparison.error && <div className="compare-message error" role="alert">{comparison.error}<button className="button secondary small" onClick={() => void loadComparison(compareTab.key, comparison)}>Retry</button></div>}
             {comparison.loading && !result && <div className="compare-message"><LoaderCircle size={14} className="spin" /> Loading schema metadata from the selected Databricks profiles. No warehouse or table records are accessed.</div>}

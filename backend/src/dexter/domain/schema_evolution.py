@@ -41,27 +41,55 @@ def validate_identifier(value: str) -> str:
 
 
 def validate_type(value: str) -> str:
-    """Accept a conservative Spark SQL type grammar; never accept SQL fragments."""
-    text = " ".join(value.strip().upper().split()) if isinstance(value, str) else ""
-    if not text or len(text) > 512 or any(c in text for c in ";'\"`\n\r"):
+    """Parse safe Databricks type syntax, including nested ARRAY/MAP/STRUCT types."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
         raise ValueError("Enter a supported Databricks data type")
-    atom = r"(?:VOID|NULL|BOOLEAN|TINYINT|BYTE|SMALLINT|SHORT|INT|INTEGER|BIGINT|LONG|FLOAT|REAL|DOUBLE|DATE|TIMESTAMP_NTZ|TIMESTAMP|STRING|BINARY)"
-    primitive = re.fullmatch(atom, text)
-    decimal = re.fullmatch(r"(?:DECIMAL|NUMERIC)\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)", text)
-    char = re.fullmatch(r"(?:CHAR|VARCHAR)\s*\(\s*(\d{1,6})\s*\)", text)
-    if primitive:
-        return text
-    if decimal:
-        precision, scale = map(int, decimal.groups())
-        if not (1 <= precision <= 38 and 0 <= scale <= precision):
-            raise ValueError("DECIMAL precision must be 1–38 and scale cannot exceed precision")
-        return f"DECIMAL({precision},{scale})"
-    if char:
-        return f"{text.split('(')[0]}({int(char.group(1))})"
-    # Complex types are preserved, but editing them requires a full recursive parser.
-    if text.startswith(("ARRAY<", "MAP<", "STRUCT<")):
-        raise ValueError("Complex types are preserved from metadata; editing them is not supported yet")
-    raise ValueError("Enter a supported Databricks data type")
+    tokens = re.findall(r"[A-Za-z_][A-Za-z_0-9$]*|\d+|[<>,():]", value)
+    if "".join(tokens).casefold() != re.sub(r"\s+", "", value).casefold() or any(c in value for c in ";'\"`\n\r"):
+        raise ValueError("Enter a supported Databricks data type")
+    index = 0
+    def take(expected: str | None = None) -> str:
+        nonlocal index
+        if index >= len(tokens) or (expected is not None and tokens[index].upper() != expected):
+            raise ValueError("Enter a supported Databricks data type")
+        result = tokens[index]; index += 1; return result
+    def parse() -> str:
+        kind = take().upper()
+        if kind in {"ARRAY", "MAP", "STRUCT"}:
+            take("<")
+            if kind == "ARRAY": result = f"ARRAY<{parse()}>"
+            elif kind == "MAP":
+                key = parse(); take(","); result = f"MAP<{key},{parse()}>"
+            else:
+                fields = []
+                while True:
+                    name = take()
+                    take(":"); fields.append(f"{name}:{parse()}")
+                    if index < len(tokens) and tokens[index] == ",": take(","); continue
+                    break
+                result = f"STRUCT<{','.join(fields)}>"
+            take(">"); return result
+        if kind in {"DECIMAL", "NUMERIC"}:
+            take("("); precision = int(take()); take(","); scale = int(take()); take(")")
+            if not 1 <= precision <= 38 or not 0 <= scale <= precision:
+                raise ValueError("DECIMAL precision must be 1–38 and scale cannot exceed precision")
+            return f"DECIMAL({precision},{scale})"
+        if kind in {"CHAR", "VARCHAR"}:
+            take("("); length = int(take()); take(")")
+            if not 1 <= length <= 65535: raise ValueError("CHAR/VARCHAR length must be between 1 and 65535")
+            return f"{kind}({length})"
+        if kind in {"GEOGRAPHY", "GEOMETRY"}:
+            if index < len(tokens) and tokens[index] == "(":
+                take("("); srid = take()
+                if srid != "ANY" and not srid.isdigit(): raise ValueError("Geometry SRID must be numeric or ANY")
+                take(")"); return f"{kind}({srid})"
+            return kind
+        allowed = {"VOID", "NULL", "BOOLEAN", "TINYINT", "BYTE", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG", "FLOAT", "REAL", "DOUBLE", "DATE", "TIME", "TIMESTAMP_NTZ", "TIMESTAMP", "STRING", "BINARY", "VARIANT"}
+        if kind not in allowed: raise ValueError("Enter a supported Databricks data type")
+        return kind
+    normalized = parse()
+    if index != len(tokens): raise ValueError("Enter a supported Databricks data type")
+    return normalized
 
 
 def _supported_widening(old: str, new: str) -> bool:
@@ -76,6 +104,17 @@ def _supported_widening(old: str, new: str) -> bool:
         op, os = map(int, old_decimal.groups()); np, ns = map(int, new_decimal.groups())
         return ns >= os and np - ns >= op - os and (np, ns) != (op, os)
     return False
+
+
+def _required_feature(data_type: str) -> tuple[str, str] | None:
+    normalized = data_type.strip().upper()
+    if re.search(r"(?:^|[<,:])VARIANT(?:$|[>,])", normalized):
+        return "variant_type", "VARIANT requires the Delta variantType table feature; Dexter will not enable it automatically."
+    if re.search(r"(?:^|[<,:])TIME(?:$|[>,(])", normalized):
+        return "time_type", "TIME requires the Delta timeType table feature; Dexter will not enable it automatically."
+    if "TIMESTAMP_NTZ" in normalized:
+        return "timestamp_ntz", "TIMESTAMP_NTZ requires explicit table and runtime support; Dexter will not enable protocol features."
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +290,10 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                     blockers.append(f"RENAME COLUMN {old['name']} requires Delta column mapping; Dexter will not enable it automatically.")
                 else: ops.append({"kind": "rename", "old": old, "new": new, "compatibility": "Breaking"})
             if old.get("original_type") != new.get("original_type"):
-                if capabilities.get("type_widening") and _supported_widening(str(old.get("original_type", "")), str(new.get("original_type", ""))):
+                feature = _required_feature(str(new.get("original_type", "")))
+                if feature and not capabilities.get(feature[0]):
+                    blockers.append(f"Changing {old['name']} to {new.get('original_type')} is blocked. {feature[1]}")
+                elif capabilities.get("type_widening") and _supported_widening(str(old.get("original_type", "")), str(new.get("original_type", ""))):
                     ops.append({"kind": "type", "old": old, "new": new, "compatibility": "Requires Validation"})
                 else: blockers.append(f"Changing {old['name']} to {new.get('original_type')} is not a supported widening for this Delta table.")
             if old.get("nullable") != new.get("nullable") and new.get("nullable") is not None:
@@ -264,6 +306,10 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                 blockers.append(f"The new column name {new['name']} already exists in the DEV baseline; drop it in a separate reviewed change before reusing that name.")
             elif new.get("nullable") is False:
                 blockers.append(f"Adding {new['name']} as NOT NULL is blocked because a safe backfill strategy is not implemented.")
+            elif (feature := _required_feature(str(new.get("original_type", "")))) and not capabilities.get(feature[0]):
+                blockers.append(f"Adding {new['name']} is blocked. {feature[1]}")
+            elif new.get("constraints") or any((new.get("technology_properties") or {}).get(key) for key in ("identity_field", "generated_expression", "mask", "default_value")):
+                blockers.append(f"Adding {new['name']} with constraints, generated values, defaults, or masks requires an explicit supported migration plan.")
             else: ops.append({"kind": "add", "old": None, "new": new, "compatibility": "Compatible"})
     # Stable order respects rename-before-changes; destructive drops are last.
     order = {"add": 0, "rename": 1, "type": 2, "nullability": 3, "comment": 4, "drop": 5}

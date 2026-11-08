@@ -70,6 +70,19 @@ class SchemaEvolutionDomainTests(unittest.TestCase):
         self.assertTrue(sql.endswith("COMMENT 'owner''s value'"))
         with self.assertRaises(ValueError): validate_type("STRING); DROP TABLE users; --")
 
+    def test_recursive_databricks_types_are_validated_and_normalized(self):
+        self.assertEqual(validate_type(" array < struct < id : bigint, amount : decimal(12, 2) > > "),
+                         "ARRAY<STRUCT<id:BIGINT,amount:DECIMAL(12,2)>>")
+        self.assertEqual(validate_type("MAP<STRING, ARRAY<INT>>"), "MAP<STRING,ARRAY<INT>>")
+        for invalid in ("ARRAY<STRING; DROP TABLE x>", "MAP<STRING>", "STRUCT<a>", "DECIMAL(0,0)"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError): validate_type(invalid)
+
+    def test_protocol_types_require_explicit_existing_capability(self):
+        draft = SchemaDraft.from_schema(self.identity, self.schema).add("variant_payload", "VARIANT")
+        blocked = plan_schema_change(self.identity, draft, {"delta": True, "table_type": "MANAGED"})
+        self.assertEqual(blocked["operations"], [])
+        self.assertTrue(any("variantType" in message for message in blocked["blockers"]))
+
     def test_direct_alter_sql_covers_supported_operations_without_recreation(self):
         target = quote_qualified(self.identity)
         self.assertEqual(sql_for_operation(target, {"kind": "add", "column": "new", "field": {"original_type": "DECIMAL(12,4)", "nullable": True}}),

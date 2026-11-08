@@ -105,7 +105,6 @@ Validation on 2026-11-07:
 - `make doctor` — correctly returned status 1, reported Mimesis 22.2.0 installed and the remaining pinned packages/lockfile missing from this checkout's `.venv`, and confirmed that it made no network requests.
 
 ## F4.3 Schema Evolution
-
 Validation on 2026-11-07:
 
 - `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 132 tests passed, including F4.3 domain, SQL adapter, and API identity-rejection checks plus F1–F4.2 regressions.
@@ -113,3 +112,15 @@ Validation on 2026-11-07:
 - `npm run build` — TypeScript and Vite production build passed.
 - Python `compileall` and `git diff --check` passed.
 - Automated checks use fake SDK/SQL responses. No authenticated Databricks DEV workspace and warehouse were available for this run. Real Delta DDL, grants, protocol inspection, and end-to-end UI behavior are not DEV-certified.
+
+## F4 workflow UX and contract refinement
+
+Validation on 2026-11-08:
+
+- `npm run build` — TypeScript check and Vite production build passed.
+- `node --test scripts/ui-contract.test.mjs` — all 10 source/contract checks passed.
+- `npm run test:ui` — passed a real headless Firefox navigation through Home → Discover → Explorer collapse/reopen → Home → Discover using local Vite and geckodriver.
+- `PYTHONPATH=backend/src .venv/bin/python -m unittest backend.tests.test_schema_evolution backend.tests.test_synthetic_domain -v` — all 27 tests passed, covering recursive type validation, feature-gated types, generator registry/defaults, and schema plan rules.
+- `python3 -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
+- The complete backend suite was attempted but cannot pass in this checkout's `.venv`: `duckdb`, `pyarrow`, FastAPI, and httpx are absent. Five materialization/generation tests therefore errored or failed due missing runtime packages; seven existing tests were skipped. The new HTTP generator-contract test is also skipped until FastAPI/httpx are installed. No package install was attempted because the configured package registry is the project’s deny-by-default placeholder.
+- No live Databricks workspace or table data was accessed. Destination mapping and effective-grant ranking are covered only by code paths and domain/API contract definitions here; a configured DEV workspace is required for live certification.
