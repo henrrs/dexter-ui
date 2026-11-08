@@ -51,6 +51,17 @@ class SyntheticRuntimeTests(unittest.TestCase):
         self.assertEqual(events[-1][0], "statement-1")
         self.assertEqual(events[-1][1]["phase"], "validation")
 
+    def test_statement_failure_preserves_databricks_error_code_for_diagnostics(self):
+        def request(method, _path, body=None):
+            return ({"statement_id": "statement-failed"} if method == "POST" else {
+                "status": {"state": "FAILED", "error": {"error_code": "INSUFFICIENT_PRIVILEGES"}}
+            })
+
+        workspace = SimpleNamespace(api_client=SimpleNamespace(do=request))
+        with self.assertRaises(StatementExecutionError) as raised:
+            execute_statement(workspace, "warehouse", "DESCRIBE HISTORY `c`.`s`.`t`", poll_seconds=0.001)
+        self.assertEqual(raised.exception.error_code, "INSUFFICIENT_PRIVILEGES")
+
     def test_statement_cancellation_sends_databricks_cancel_and_stops_polling(self):
         calls = []
 

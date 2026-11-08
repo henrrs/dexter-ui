@@ -1091,6 +1091,12 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             if not reasons:
                 preflight_permissions(workspace, identity["catalog"], identity["schema"], storage_type.casefold(),
                     "drop_recreate", True, str((selected_external or {}).get("name") or "") or None)
+                # Review captures Delta history and the managed-table recovery
+                # window through SQL. These read-only checks require a running
+                # warehouse, so start the explicitly selected DEV warehouse here
+                # instead of misreporting a stopped warehouse as missing metadata.
+                from dexter.adapters.databricks import ensure_sql_warehouse_running
+                ensure_sql_warehouse_running(workspace, warehouse_id)
                 history = inspect_drop_recreate_history(workspace, warehouse_id,
                     {**destination, "storage_type": storage_type.casefold()})
                 if storage_type == "EXTERNAL":

@@ -44,6 +44,21 @@ class WorkflowDraftTests(unittest.TestCase):
         error.status_code = 404
         self.assertEqual(classify_failure(error)["code"], "destination_not_found")
 
+    def test_diagnostics_preserve_statement_privilege_and_recovery_failures(self):
+        from dexter.adapters.databricks_sql import StatementExecutionError
+
+        privilege_error = StatementExecutionError("statement failed", "INSUFFICIENT_PRIVILEGES")
+        self.assertEqual(classify_failure(privilege_error)["code"], "permission_denied")
+        recovery_error = RuntimeError("recovery metadata unavailable")
+        recovery_error.error_code = "RECOVERY_POLICY_UNAVAILABLE"
+        self.assertEqual(classify_failure(recovery_error)["code"], "recovery_policy_unavailable")
+
+    def test_permission_metadata_failure_is_distinguished_from_missing_grant(self):
+        from dexter.adapters.databricks_synthetic_publisher import SyntheticPublishError
+
+        error = SyntheticPublishError("grant API unavailable", "PUBLISH_PERMISSION_CHECK_FAILED")
+        self.assertEqual(classify_failure(error)["code"], "permission_metadata_unavailable")
+
 
 try:
     from fastapi.testclient import TestClient
