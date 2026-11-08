@@ -89,6 +89,13 @@ class SchemaEvolutionDomainTests(unittest.TestCase):
         ], "tech_dev.gold.ledger")
         ddl = create_empty_delta_table_sql(identity, schema, storage_type="MANAGED", external_location=None)
         self.assertEqual(ddl, "CREATE TABLE `tech_dev`.`gold`.`ledger` (`amount` DECIMAL(12,4), `id` BIGINT NOT NULL COMMENT 'primary key', `items` ARRAY<STRUCT<sku:STRING>>) USING DELTA")
+        with_properties = create_empty_delta_table_sql(identity, schema, storage_type="MANAGED", external_location=None,
+            properties={"delta.deletedFileRetentionDuration": "interval 7 days", "delta.enableChangeDataFeed": "true"})
+        self.assertIn("'delta.deletedFileRetentionDuration' = 'interval 7 days'", with_properties)
+        self.assertIn("'delta.enableChangeDataFeed' = 'true'", with_properties)
+        with self.assertRaisesRegex(ValueError, "explicitly supported"):
+            create_empty_delta_table_sql(identity, schema, storage_type="MANAGED", external_location=None,
+                properties={"delta.minWriterVersion": "7"})
         self.assertNotIn("dexter.synthetic", ddl)
         external = create_empty_delta_table_sql(identity, schema, storage_type="EXTERNAL", external_location="abfss://container@account.dfs.core.windows.net/new/path")
         self.assertIn("LOCATION 'abfss://container@account.dfs.core.windows.net/new/path'", external)

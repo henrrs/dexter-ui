@@ -21,18 +21,20 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
             "recreation": {"storage_type": "MANAGED", "external_location": None,
                 "assessment": {"target_fingerprint": "approved-fingerprint"}}}
 
-    def _preflight(self):
+    def _preflight(self, properties=None):
         return patch("dexter.adapters.databricks_synthetic_publisher.assess_drop_recreate", return_value={
             "status": "ready_for_confirmation", "target_fingerprint": "approved-fingerprint",
-            "new_location": None, "target": {"properties": {}}}), \
+            "new_location": None, "target": {"properties": properties or {}}}), \
             patch("dexter.adapters.databricks_synthetic_publisher.preflight_permissions"), \
             patch("dexter.adapters.databricks_synthetic_publisher.inspect_drop_recreate_history", return_value={
                 "delta_history_latest": None}), \
             patch("dexter.adapters.databricks_synthetic_publisher._read_table", return_value=(None, False))
 
     def test_checkpoints_precede_drop_and_empty_schema_is_verified(self):
+        properties = {"delta.deletedFileRetentionDuration": "interval 7 days", "delta.enableChangeDataFeed": "true"}
         created = SimpleNamespace(table_id="table-new", table_type="MANAGED", data_source_format="DELTA",
-            columns=[{"name": "id", "type_text": "BIGINT", "nullable": True}], storage_location=None)
+            columns=[{"name": "id", "type_text": "BIGINT", "nullable": True}], storage_location=None,
+            properties=properties)
         workspace = MagicMock()
         workspace.tables.get.return_value = created
         checkpoints, statements = [], []
@@ -43,7 +45,7 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
                 return {"result": {"data_array": [[0]]}}
             return {}
 
-        preflight = self._preflight()
+        preflight = self._preflight(properties)
         with preflight[0], preflight[1], preflight[2], preflight[3], \
              patch("dexter.adapters.databricks_schema_evolution.execute_statement", side_effect=execute):
             result = execute_empty_recreation(workspace, "wh-dev", self.identity, self.plan,
@@ -54,10 +56,13 @@ class EmptyRecreationAdapterTests(unittest.TestCase):
         self.assertEqual(statements[0], "DROP TABLE `tech_dev`.`gold`.`ledger`")
         create = next(statement for statement in statements if statement.startswith("CREATE TABLE"))
         self.assertIn("USING DELTA", create)
+        self.assertIn("'delta.enableChangeDataFeed' = 'true'", create)
+        self.assertIn("'delta.deletedFileRetentionDuration' = 'interval 7 days'", create)
         self.assertNotIn("dexter.synthetic", create)
         self.assertEqual(sum(statement.startswith("DROP TABLE") for statement in statements), 1)
         self.assertEqual(result["table_id"], "table-new")
         self.assertEqual(result["row_count"], 0)
+        self.assertEqual(result["reapplied_properties"], sorted(properties))
 
     def test_lost_drop_response_is_not_retried_and_absence_does_not_claim_success(self):
         workspace = MagicMock()

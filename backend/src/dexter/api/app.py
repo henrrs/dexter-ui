@@ -692,8 +692,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             recreation = {"status": "blocked", "storage_type": capabilities.get("table_type"),
                           "assessment": None, "external_location": None, "external_locations": [],
                           "block_reasons": []}
-            if capabilities.get("iceberg_compatible"):
-                reasons.append("This Delta table has Iceberg compatibility enabled; recreation cannot preserve that reader contract safely.")
             if warehouse:
                 plan["core_plan_id"] = plan["plan_id"]
                 plan["plan_id"], recreation = _schema_recreation_review(workspace, identity, plan,
@@ -1087,7 +1085,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
                 proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
                 external_location=selected_external, plan_id=plan["plan_id"],
-                new_location_prefix="dexter-schema-recreated")
+                new_location_prefix="dexter-schema-recreated", property_policy="best_effort")
             if assessment.get("status") != "ready_for_confirmation":
                 reasons.extend(assessment.get("block_reasons") or ["The current DEV table is not eligible for safe recreation."])
             if not reasons:
@@ -1097,11 +1095,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     {**destination, "storage_type": storage_type.casefold()})
                 if storage_type == "EXTERNAL":
                     verify_external_path_empty(workspace, warehouse_id, str(assessment.get("new_location") or ""))
-                retention = {key: str(value) for key, value in (assessment.get("target", {}).get("properties") or {}).items()
-                    if key in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"}}
+                table_properties = {key: str(value) for key, value in
+                    (assessment.get("target", {}).get("properties") or {}).items()}
                 create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
-                    storage_type=storage_type, external_location=assessment.get("new_location"), properties=retention)
+                    storage_type=storage_type, external_location=assessment.get("new_location"), properties=table_properties)
                 assessment["ddl"] = {"drop": f"DROP TABLE {quote_qualified(identity)}", "create": create_sql}
+                if capabilities.get("iceberg_compatible"):
+                    assessment.setdefault("risks", []).append(
+                        "Iceberg compatibility may not be preserved on the empty replacement; external Iceberg readers may need reconfiguration.")
                 assessment["history_evidence"] = history
                 recreation.update(status="ready_for_confirmation", assessment=assessment,
                     external_location=selected_external, external_locations=external_locations,

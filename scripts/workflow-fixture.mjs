@@ -111,7 +111,7 @@ export function workflowFixture() {
         ...(requestedChanges.some(change => change.classification === 'REWRITE_REQUIRED') ? ['Changing this type requires recreating the table empty.'] : []),
       ]
       const directOperations = operations.filter((item) => !requestedChanges.some(change => change.column === item.column && change.classification === 'REWRITE_REQUIRED'))
-      const recreation = strategy === 'recreate' ? { status: blockers.length ? 'blocked' : 'ready_for_confirmation', storage_type: 'MANAGED', external_locations: [], block_reasons: blockers, assessment: { risks: ['Delta history and the old table identity are not preserved.'] } } : undefined
+      const recreation = strategy === 'recreate' ? { status: blockers.length ? 'blocked' : 'ready_for_confirmation', storage_type: 'MANAGED', external_locations: [], block_reasons: blockers, assessment: { risks: ['Delta history and the old table identity are not preserved.'], property_summary: { copied: ['delta.enableChangeDataFeed'], omitted: ['delta.feature.futureFeature'], sensitive_omitted_count: 1 } } } : undefined
       const requestedCount = requestedChanges.length
       const blockedCount = requestedChanges.filter((item) => ['REWRITE_REQUIRED', 'UNSUPPORTED'].includes(item.classification)).length
       const typeClassifications = operations.filter((item) => item.kind === 'type').map((item) => ({ column: item.column, from: item.from, to: item.to,

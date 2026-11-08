@@ -9,6 +9,7 @@ from urllib.parse import quote, urlsplit
 from typing import Any, Callable
 
 from dexter.adapters.databricks_sql import StatementExecutionError, execute_statement
+from dexter.adapters.databricks_table_properties import classify_recreation_properties
 from dexter.domain.schema import canonical_schema
 from dexter.domain.synthetic import SchemaChangePlan
 
@@ -105,7 +106,8 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
                          proposed_schema: dict[str, Any], storage_type: str,
                          external_location: dict[str, Any] | None, plan_id: str,
                          progress: Callable[[str, dict], None] | None = None,
-                         new_location_prefix: str = "dexter-synthetic-recreated") -> dict[str, Any]:
+                         new_location_prefix: str = "dexter-synthetic-recreated",
+                         property_policy: str = "strict") -> dict[str, Any]:
     """Read-only preflight. It reports only lineage and grants visible to the selected identity."""
     if destination.get("environment") != "dev":
         raise SyntheticPublishError("Drop & Recreate is restricted to the configured DEV profile", "PROD_WRITE_BLOCKED")
@@ -178,31 +180,28 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
     prefix = re.sub(r"[^A-Za-z0-9_-]+", "-", new_location_prefix).strip("-") or "dexter-recreated"
     new_location = (f"{external_root}/{prefix}/{table_key}/{plan_id}/{table}"
                     if original_storage == "external" and external_root else None)
-    raw_properties = {str(key): str(value) for key, value in dict(properties).items()}
-    property_map = {}
-    unclassified_property_count = 0
-    sensitive_property_count = 0
-    for key, value in raw_properties.items():
-        if re.search(r"(?i)(password|secret|token|credential|sas|auth|private.?key)", key):
-            sensitive_property_count += 1
-        elif key in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"} and re.fullmatch(r"(?i)(?:interval\s+)?\d+\s+(?:day|days|hour|hours|minute|minutes|second|seconds)", value.strip()):
-            property_map[key] = value
-        elif key == "dexter.synthetic.created_by" and value == "dexter":
-            property_map[key] = value
-        elif key in {"dexter.synthetic.run_id", "dexter.synthetic.operation_id"} and re.fullmatch(r"[a-fA-F0-9-]{16,64}", value):
-            property_map[key] = value
-        else:
-            unclassified_property_count += 1
-    if sensitive_property_count:
-        reasons.append("The target has credential-like table properties that cannot be safely reviewed or recreated.")
-    if unclassified_property_count:
-        reasons.append("The target has table properties outside Dexter's supported retention and provenance markers.")
+    if property_policy not in {"strict", "best_effort"}:
+        raise ValueError("Unsupported table-property recreation policy")
+    classified_properties = classify_recreation_properties(properties, best_effort=True,
+        legacy_only=property_policy == "strict")
+    property_map = classified_properties["properties"]
+    property_summary = classified_properties["summary"]
+    unclassified_property_count = len(property_summary["omitted"])
+    sensitive_property_count = property_summary["sensitive_omitted_count"]
+    if property_policy == "strict":
+        if sensitive_property_count:
+            reasons.append("The target has credential-like table properties that cannot be safely reviewed or recreated.")
+        if unclassified_property_count:
+            reasons.append("The target has table properties outside Dexter's supported retention and provenance markers.")
     safe_location = location if isinstance(location, str) and external_uri_is_safe(location) else ("<redacted>" if location else None)
     current_identity = {"qualified_name": full_name, "table_id": table_id, "owner": owner,
                         "storage_type": original_storage, "location": safe_location,
                         "properties": property_map, "schema": schema, "direct_grants": direct_grants,
                         "unclassified_property_count": unclassified_property_count,
                         "sensitive_property_count": sensitive_property_count,
+                        "all_properties_fingerprint": hashlib.sha256(json.dumps(
+                            {str(key): str(value) for key, value in sorted(dict(properties).items(), key=lambda pair: str(pair[0]))},
+                            sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(),
                         "dependencies": dependencies, "table_constraints": table_constraints,
                         "row_filter_present": bool(row_filter),
                         "masked_columns": masked_columns,
@@ -218,6 +217,14 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
         risks.append(f"The old External files remain at {old_location}; the recreated table uses a separate new location.")
     if unclassified_property_count:
         risks.append(f"{unclassified_property_count} unsupported table properties will not be copied.")
+    if sensitive_property_count:
+        risks.append(f"{sensitive_property_count} credential-like table properties were omitted and will not be copied.")
+    if property_map:
+        risks.append("Supported table properties will be reapplied to the new empty table: " + ", ".join(sorted(property_map)))
+        protocol_properties = {"delta.columnMapping.mode", "delta.enableTypeWidening", "delta.enableDeletionVectors",
+                              "delta.enableRowTracking", "delta.enableIcebergCompatV2", "delta.universalFormat.enabledFormats"}
+        if set(property_map) & protocol_properties:
+            risks.append("Reapplied Delta feature properties may upgrade the new table protocol and affect reader/writer compatibility.")
     downstream = [item for item in dependencies if str(item.get("direction", "")).casefold() == "downstream"]
     if downstream:
         risks.append("Visible downstream consumers may become invalid: " + ", ".join(str(item.get("table_name") or item.get("entity_type") or "unknown") for item in downstream))
@@ -233,6 +240,7 @@ def assess_drop_recreate(workspace: Any, *, warehouse_id: str, destination: dict
     return {"status": status,
             "eligibility": "dexter_experimental" if not reasons else "blocked",
             "plan_id": plan_id, "target": current_identity, "target_fingerprint": fingerprint,
+            "property_summary": property_summary,
             "proposed_schema": proposed_schema, "storage_type": storage_type,
             "external_location": ({"name": str((external_location or {}).get("name") or ""),
                                    "url": external_url if external_url_safe else "<redacted>",

@@ -222,6 +222,33 @@ class SyntheticPublisherTests(unittest.TestCase):
         self.assertEqual(plan["external_location"]["url"], "<redacted>")
         self.assertEqual(plan["target"]["location"], "<redacted>")
 
+    def test_schema_recreation_best_effort_copies_allowlisted_properties_and_omits_unknowns(self):
+        original = SimpleNamespace(table_id="table-old", owner="dev@example.test",
+            columns=[SimpleNamespace(name="id", type_text="BIGINT", nullable=False)], table_type="MANAGED",
+            data_source_format="DELTA", storage_location=None, properties={
+                "delta.deletedFileRetentionDuration": "interval 7 days",
+                "delta.enableChangeDataFeed": "true",
+                "delta.minWriterVersion": "7",
+                "vendor.auth.token": "never-persist-this",
+            })
+        workspace = FakeWorkspace(target=original)
+        strict = assess_drop_recreate(workspace, warehouse_id="wh-dev", destination=DESTINATION,
+            proposed_schema=SCHEMA, storage_type="managed", external_location=None, plan_id="strict-review")
+        self.assertNotEqual(strict["status"], "ready_for_confirmation")
+
+        plan = assess_drop_recreate(workspace, warehouse_id="wh-dev", destination=DESTINATION,
+            proposed_schema=SCHEMA, storage_type="managed", external_location=None, plan_id="schema-review",
+            property_policy="best_effort")
+        self.assertEqual(plan["status"], "ready_for_confirmation", plan["block_reasons"])
+        self.assertEqual(plan["target"]["properties"], {
+            "delta.deletedFileRetentionDuration": "interval 7 days",
+            "delta.enableChangeDataFeed": "true",
+        })
+        self.assertEqual(plan["property_summary"]["omitted"], ["delta.minWriterVersion"])
+        self.assertEqual(plan["property_summary"]["sensitive_omitted_count"], 1)
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertNotIn("never-persist-this", serialized)
+
     def test_changed_target_fingerprint_blocks_drop_before_destructive_checkpoint(self):
         original = SimpleNamespace(table_id="table-old", owner="dev@example.test",
             columns=[SimpleNamespace(name="id", type_text="BIGINT", nullable=False)], table_type="MANAGED", data_source_format="DELTA",

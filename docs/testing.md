@@ -163,3 +163,12 @@ Validation on 2026-11-08:
 - `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed. `npm run build` — TypeScript and Vite production build passed.
 - `python3 -m compileall -q backend/src backend/tests scripts` and `git diff --check` — passed.
 - Tests use disposable local metadata/SQL fixtures and fake Databricks SDK responses. No live Databricks DDL, table recreation, Delta feature activation, or PROD operation was performed; the implementation is locally certified, not live-workspace certified. See [ADR 0013](decisions/0013-dev-schema-evolution.md) and the [Delta refinement report](schema-evolution-delta-refinement.md).
+
+## F4.3 recreation properties and schema review UX refinement
+
+Validation on 2026-11-08:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts:backend/tests ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 187 backend tests passed, including allowlisted property copying, secret-safe omission, protocol metadata handling, strict F4.2 behavior, recreation post-create property verification, and the existing schema/generation regression suite.
+- `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed. `npm run build` — TypeScript and Vite production build passed.
+- `node --test --test-concurrency=1 scripts/workflow-navigation.test.mjs` — all 8 real Firefox journeys passed with local fixtures, including selecting the strategy in Edit, one review row per operation, and recreating from a draft that removes every original column and adds three replacements.
+- Python compilation and `git diff --check` passed. No live Databricks DDL was executed; remote permissions, workspace property behavior, protocol upgrades, and external storage remain unverified against a real DEV workspace.

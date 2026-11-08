@@ -190,9 +190,8 @@ def create_empty_delta_table_sql(identity: dict[str, str], schema: dict[str, Any
             definition += f" COMMENT {_string_literal(str(comment))}"
         rendered.append(definition)
     location = f" LOCATION {_string_literal(external_location)}" if external_location else ""
-    safe_properties = properties or {}
-    if any(key not in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"} for key in safe_properties):
-        raise ValueError("Only reviewed Delta retention properties may be retained")
+    from dexter.adapters.databricks_table_properties import validate_recreation_properties
+    safe_properties = validate_recreation_properties(properties)
     property_sql = (" TBLPROPERTIES (" + ", ".join(
         f"{_string_literal(key)} = {_string_literal(str(value))}" for key, value in sorted(safe_properties.items())) + ")") if safe_properties else ""
     return f"CREATE TABLE {quote_qualified(identity)} ({', '.join(rendered)}) USING DELTA{location}{property_sql}"
@@ -200,7 +199,8 @@ def create_empty_delta_table_sql(identity: dict[str, str], schema: dict[str, Any
 
 def _confirmed_empty_table(workspace: Any, warehouse_id: str, identity: dict[str, str],
                            expected_schema: dict[str, Any], storage_type: str, old_table_id: str,
-                           external_location: str | None) -> dict[str, Any] | None:
+                           external_location: str | None,
+                           expected_properties: dict[str, str] | None = None) -> dict[str, Any] | None:
     try:
         table = workspace.tables.get(full_name=".".join(identity[key] for key in ("catalog", "schema", "table")))
     except Exception as exc:
@@ -218,6 +218,12 @@ def _confirmed_empty_table(workspace: Any, warehouse_id: str, identity: dict[str
         raise RuntimeError("The new physical table identity could not be distinguished from the old table")
     if actual_type != storage_type or actual_format != "DELTA":
         raise RuntimeError("The recreated DEV table has an unexpected storage type or format")
+    actual_properties = field(table, "properties", {}) or {}
+    for key, expected in (expected_properties or {}).items():
+        observed = actual_properties.get(key)
+        normalize = lambda value: re.sub(r"\s+", " ", re.sub(r"(?i)^interval\s+", "", str(value).strip())).casefold()
+        if observed is None or normalize(observed) != normalize(expected):
+            raise RuntimeError(f"The recreated DEV table did not retain reviewed property {key}; reconciliation is required")
     if not schemas_equivalent(expected_schema, actual_schema):
         raise RuntimeError("The recreated DEV table does not match the approved schema")
     location = str(field(table, "storage_location", "") or "")
@@ -254,7 +260,8 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
     destination = {**identity, "environment": "dev"}
     assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
         proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
-        external_location=external, plan_id=plan["plan_id"], new_location_prefix="dexter-schema-recreated")
+        external_location=external, plan_id=plan["plan_id"], new_location_prefix="dexter-schema-recreated",
+        property_policy="best_effort")
     reviewed_assessment = recreation.get("assessment") or {}
     if (assessment.get("status") != "ready_for_confirmation"
             or assessment.get("target_fingerprint") != reviewed_assessment.get("target_fingerprint")):
@@ -270,8 +277,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         **destination, "storage_type": storage_type.casefold()})
     old_table_id = str(identity["table_id"])
     properties = {key: str(value) for key, value in
-        (assessment.get("target", {}).get("properties") or {}).items()
-        if key in {"delta.deletedFileRetentionDuration", "delta.logRetentionDuration"}}
+        (assessment.get("target", {}).get("properties") or {}).items()}
     full_name = ".".join(identity[key] for key in ("catalog", "schema", "table"))
     drop_sql = f"DROP TABLE {quote_qualified(identity)}"
     create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
@@ -304,7 +310,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         # Do not submit CREATE twice. Verify a possibly committed response directly.
         create_response_lost = True
     created = _confirmed_empty_table(workspace, warehouse_id, identity, plan["proposed_dev_schema"],
-        storage_type, old_table_id, assessment.get("new_location"))
+        storage_type, old_table_id, assessment.get("new_location"), expected_properties=properties)
     if created is None:
         raise RuntimeError("The old table was dropped, but the new table is absent; reconciliation is required")
     checkpoint("CREATED", {"phase": "validate", "target": full_name, "table_id": created["table_id"],
@@ -313,6 +319,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         "retry_available": False, "reconciliation_required": False})
     progress("The empty DEV table matches the approved schema", {"phase": "validate", "state": "succeeded", "target": full_name})
     return {**created, "assessment": assessment, "history_evidence": history,
+            "reapplied_properties": sorted(properties),
             "drop_response_lost": drop_response_lost, "create_response_lost": create_response_lost}
 
 
