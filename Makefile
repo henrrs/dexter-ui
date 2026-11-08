@@ -1,4 +1,4 @@
-.PHONY: setup lock dev build test doctor stop databricks-setup
+.PHONY: setup upgrade lock dev build test doctor stop databricks-setup
 
 PYTHON ?= python3
 VENV_PYTHON := .venv/bin/python
@@ -10,13 +10,17 @@ setup:
 	@node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); const ok=(a===20&&b>=19)||(a>=22&&(a>22||b>12||(b===12&&c>=0))); if(!ok) process.exit(1)' || { echo "Node.js 20.19+ or 22.12+ is required."; exit 1; }
 	@command -v npm >/dev/null || { echo "npm is required."; exit 1; }
 	@if [ ! -f requirements.lock ] || [ ! -f package-lock.json ]; then $(PYTHON) scripts/lock_dependencies.py; fi
+	$(PYTHON) scripts/check_dependency_lock.py
 	$(PYTHON) -m venv .venv
 	.venv/bin/python scripts/dependency_tool.py python install --require-hashes -r requirements.lock
 	./scripts/dependency_tool.py npm ci
 
+upgrade: setup
+
 lock:
 	@command -v npm >/dev/null || { echo "npm is required to generate the frontend lockfile."; exit 1; }
 	$(PYTHON) scripts/lock_dependencies.py
+	$(PYTHON) scripts/check_dependency_lock.py
 
 dev:
 	@test -x $(VENV_PYTHON) || { echo "Run make setup first."; exit 1; }

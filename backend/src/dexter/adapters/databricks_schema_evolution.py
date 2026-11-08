@@ -1,0 +1,101 @@
+"""Databricks Delta schema DDL adapter; SQL is generated only from validated plans."""
+from __future__ import annotations
+
+from typing import Any
+
+from dexter.adapters.databricks_sql import execute_statement
+
+
+def field(value: Any, name: str, default=None):
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def quote_identifier(value: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError("Invalid SQL identifier")
+    return "`" + value.replace("`", "``") + "`"
+
+
+def quote_qualified(identity: dict[str, str]) -> str:
+    return ".".join(quote_identifier(identity[key]) for key in ("catalog", "schema", "table"))
+
+
+def inspect_table(workspace: Any, identity: dict[str, str]) -> tuple[Any, dict[str, Any]]:
+    target = workspace.tables.get(full_name=".".join(identity[key] for key in ("catalog", "schema", "table")))
+    props = field(target, "properties", {}) or {}
+    table_type = str(field(target, "table_type", "")).upper().split(".")[-1]
+    fmt = str(field(target, "data_source_format", "")).upper().split(".")[-1]
+    capabilities = {
+        "delta": fmt == "DELTA",
+        "table_type": table_type,
+        "column_mapping": str(props.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"},
+        "type_widening": str(props.get("delta.enableTypeWidening", "false")).casefold() == "true",
+        "table_id": str(field(target, "table_id", "") or ""),
+        "has_table_constraints": bool(field(target, "table_constraints", None) or field(target, "constraints", None)),
+        "row_filter": bool(field(target, "row_filter", None)),
+        "has_column_masks": bool(field(target, "masked_columns", None)),
+        "partition_columns": list(field(target, "partition_columns", None) or []),
+        "storage_location": field(target, "storage_location"),
+    }
+    return target, capabilities
+
+
+def describe_delta_detail(workspace: Any, warehouse_id: str, identity: dict[str, str]) -> dict[str, Any]:
+    """Read protocol evidence before DDL so constraints never upgrade it implicitly."""
+    result = execute_statement(workspace, warehouse_id, f"DESCRIBE DETAIL {quote_qualified(identity)}", phase="schema-capabilities")
+    manifest = field(result, "manifest", {}) or {}
+    schema = field(manifest, "schema", {}) or {}
+    columns = [str(field(item, "name", "")) for item in (field(schema, "columns", []) or [])]
+    rows = field(field(result, "result", {}) or {}, "data_array", []) or []
+    if not rows or not isinstance(rows[0], (list, tuple)):
+        raise RuntimeError("Delta table protocol capabilities could not be verified")
+    return {columns[index]: value for index, value in enumerate(rows[0]) if index < len(columns)}
+
+
+def count_null_values(workspace: Any, warehouse_id: str, identity: dict[str, str], column_name: str) -> int:
+    """Read only the count needed to prove a SET NOT NULL change can proceed."""
+    target = quote_qualified(identity)
+    column = quote_identifier(column_name)
+    result = execute_statement(workspace, warehouse_id,
+                              f"SELECT COUNT(*) FROM {target} WHERE {column} IS NULL",
+                              phase="schema-nullability-check")
+    rows = field(field(result, "result", {}), "data_array", []) or []
+    try:
+        count = int(rows[0][0])
+    except (IndexError, KeyError, TypeError, ValueError):
+        raise RuntimeError("Databricks did not return a verifiable NULL count; no schema changes were run") from None
+    if count < 0:
+        raise RuntimeError("Databricks returned an invalid NULL count; no schema changes were run")
+    return count
+
+
+def sql_for_operation(target_sql: str, operation: dict[str, Any]) -> str:
+    kind, name = operation["kind"], operation["column"]
+    column = quote_identifier(name)
+    if kind == "add":
+        field = operation["field"]
+        data_type = str(field["original_type"])
+        nullable = field.get("nullable")
+        # Planner blocks NOT NULL adds; defensively enforce here too.
+        if nullable is False: raise ValueError("Adding a NOT NULL column is not supported without a backfill plan")
+        comment = (field.get("technology_properties") or {}).get("comment")
+        definition = f"{column} {data_type}" + (f" COMMENT {_string_literal(str(comment))}" if comment else "")
+        return f"ALTER TABLE {target_sql} ADD COLUMNS ({definition})"
+    if kind == "drop": return f"ALTER TABLE {target_sql} DROP COLUMN {column}"
+    if kind == "rename": return f"ALTER TABLE {target_sql} RENAME COLUMN {quote_identifier(operation['from'])} TO {quote_identifier(operation['to'])}"
+    if kind == "type": return f"ALTER TABLE {target_sql} ALTER COLUMN {column} TYPE {operation['field']['original_type']}"
+    if kind == "nullability":
+        action = "DROP NOT NULL" if operation["field"].get("nullable") else "SET NOT NULL"
+        return f"ALTER TABLE {target_sql} ALTER COLUMN {column} {action}"
+    if kind == "comment":
+        comment = (operation["field"].get("technology_properties") or {}).get("comment")
+        return f"ALTER TABLE {target_sql} ALTER COLUMN {column} COMMENT {_string_literal(str(comment or ''))}"
+    raise ValueError("Unsupported schema operation")
+
+
+def _string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def execute(workspace: Any, warehouse_id: str, target: dict[str, str], operation: dict[str, Any], **kwargs) -> dict:
+    return execute_statement(workspace, warehouse_id, sql_for_operation(quote_qualified(target), operation), **kwargs)

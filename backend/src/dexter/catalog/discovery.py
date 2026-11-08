@@ -188,7 +188,7 @@ class DiscoverService:
                 row["constraints"] = _safe_metadata(_value(value, "table_constraints") or _value(value, "constraints") or [])
                 row["technology_properties"] = _safe_metadata({
                     key: _value(value, key) for key in (
-                        "table_type", "data_source_format", "properties", "partition_columns",
+                        "table_id", "table_type", "data_source_format", "properties", "partition_columns",
                         "cluster_by", "row_filter", "view_definition",
                     ) if _value(value, key) is not None
                 })

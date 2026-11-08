@@ -59,6 +59,10 @@ class OperationsService:
             row = conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             if row is None:
                 raise KeyError(operation_id)
+            if row["kind"] == "synthetic-data":
+                details = json.loads(row["details_json"] or "{}")
+                if details.get("destructive_started"):
+                    raise ValueError("Cancellation is disabled after Drop & Recreate begins; the publisher must finish or require reconciliation")
             if row["state"] == "queued":
                 stamp = now()
                 conn.execute("UPDATE operations SET state='cancelled',message='Cancelled before execution',updated_at=?,finished_at=? WHERE id=?", (stamp, stamp, operation_id))
@@ -79,6 +83,22 @@ class OperationsService:
             ensure_transition(row["state"], "queued")
             conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (operation_id,))
             conn.execute("UPDATE operations SET state='queued',message='Resuming verified local snapshot chunks',error_code=NULL,error_message=NULL,cancel_requested=0,updated_at=?,finished_at=NULL WHERE id=?", (stamp, operation_id))
+            return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
+
+    def requeue_synthetic(self, operation_id: str) -> dict:
+        stamp = now()
+        with transaction(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if row["kind"] != "synthetic-data" or row["state"] not in {"failed", "interrupted"}:
+                raise ValueError("Only failed or interrupted synthetic data operations can be resumed")
+            details = json.loads(row["details_json"] or "{}")
+            if details.get("destructive_started") or details.get("reconciliation_required"):
+                raise ValueError("A destructive synthetic run requires reconciliation and cannot be resumed automatically")
+            ensure_transition(row["state"], "queued")
+            conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (operation_id,))
+            conn.execute("UPDATE operations SET state='queued',message='Resuming verified synthetic data stages',error_code=NULL,error_message=NULL,cancel_requested=0,updated_at=?,finished_at=NULL WHERE id=?", (stamp, operation_id))
             return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
 
     def chunk_records(self, operation_id: str) -> list[dict]:
@@ -107,7 +127,7 @@ class OperationsService:
         expires = stamp + max(WORKER_LEASE_SECONDS, lease_seconds)
         with transaction(self.db_path) as conn:
             operation = conn.execute("SELECT state,kind FROM operations WHERE id=?", (operation_id,)).fetchone()
-            if not operation or operation["kind"] != "make-local" or operation["state"] not in {"queued", "running"}:
+            if not operation or operation["kind"] not in {"make-local", "synthetic-data"} or operation["state"] not in {"queued", "running"}:
                 return False
             lease = conn.execute("SELECT worker_id,expires_at FROM operation_worker_leases WHERE operation_id=?", (operation_id,)).fetchone()
             if lease and lease["worker_id"] != worker_id and lease["expires_at"] > stamp:
@@ -217,11 +237,11 @@ class OperationsService:
             rows = conn.execute(
                 "SELECT o.id,o.kind,o.state,o.details_json,l.worker_id,l.expires_at "
                 "FROM operations o LEFT JOIN operation_worker_leases l ON l.operation_id=o.id "
-                "WHERE o.state='running' OR (o.state='queued' AND o.kind='make-local')"
+                "WHERE o.state='running' OR (o.state='queued' AND o.kind IN ('make-local','synthetic-data'))"
             ).fetchall()
             recovered = 0
             for row in rows:
-                if (row["state"] == "running" and row["kind"] == "make-local"
+                if (row["state"] in {"running", "queued"} and row["kind"] in {"make-local", "synthetic-data"}
                         and row["expires_at"] and row["expires_at"] > clock):
                     continue
                 self._interrupt_row(conn, row, stamp, "PROCESS_RESTARTED")
@@ -237,7 +257,7 @@ class OperationsService:
             rows = conn.execute(
                 "SELECT o.id,o.kind,o.state,o.details_json,l.worker_id,l.expires_at "
                 "FROM operations o LEFT JOIN operation_worker_leases l ON l.operation_id=o.id "
-                "WHERE o.kind='make-local' AND o.state IN ('queued','running') "
+                "WHERE o.kind IN ('make-local','synthetic-data') AND o.state IN ('queued','running') "
                 "AND ((o.state='running' AND l.operation_id IS NULL) OR (l.operation_id IS NOT NULL AND l.expires_at<=?))",
                 (clock,),
             ).fetchall()
@@ -253,13 +273,19 @@ class OperationsService:
         except (TypeError, ValueError):
             details = {}
         submission_uncertain = details.get("submission_state") in {"submitting", "unknown"} and not details.get("statement_id")
-        can_retry = bool(details.get("materialization_request")) and not submission_uncertain
+        destructive = bool(details.get("destructive_started") or details.get("reconciliation_required"))
+        can_retry = (bool(details.get("materialization_request")) if row["kind"] == "make-local"
+                     else bool(details.get("synthetic_run_id"))) and not submission_uncertain and not destructive
         details["retry_available"] = can_retry
+        if destructive:
+            details["reconciliation_required"] = True
         error_code = "SUBMISSION_UNKNOWN" if submission_uncertain else reason
         error_message = (
             "Databricks may have accepted the query, but Dexter did not save its statement ID. "
             "Check Databricks query history before starting another copy."
-            if submission_uncertain else
+            if submission_uncertain else "The synthetic-data worker stopped after Drop & Recreate began. Automatic retry is disabled; reconcile the DEV table state before another publication."
+            if destructive else "The synthetic-data worker stopped. Verified files and manifest were retained for recovery."
+            if row["kind"] == "synthetic-data" else
             "The Make Local worker stopped. Resume is available only when the remote submission state is known."
         )
         conn.execute(

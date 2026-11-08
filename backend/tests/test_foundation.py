@@ -245,6 +245,67 @@ except ImportError:
 
 @unittest.skipUnless(API_AVAILABLE, "FastAPI/httpx are not installed; API tests run after make setup")
 class ApiTests(unittest.TestCase):
+    def test_schema_evolution_context_rejects_non_unified_identity(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")}), Settings())
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.get("/api/schema-evolution/context", params={"node_id": "not-a-unified-table"})
+            self.assertEqual(response.status_code, 422)
+
+    def test_prepare_dev_review_is_registered_and_rejects_an_invalid_unified_identity(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")}), Settings())
+            body = {"source_node_id": "not-a-unified-table", "source_environment": "prod",
+                "destination": {"environment": "dev", "catalog": "sandbox", "schema": "qa", "table": "sample_synthetic",
+                    "warehouse_id": "warehouse", "strategy": "create", "storage_type": "managed"},
+                "schema": {"qualified_name": "source", "complete": True, "constraints": [], "technology_properties": {},
+                    "fields": [{"name": "id", "canonical_type": "bigint", "original_type": "BIGINT", "nullable": False,
+                        "precision": None, "scale": None, "constraints": [], "children": [], "technology_properties": {}}]},
+                "row_count": 10, "rules": [{"column": "id", "generator": "sequence", "parameters": {}, "null_percent": 0, "unique": True}],
+                "locale": "en_US", "seed": 7}
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.post("/api/synthetic/review", json=body)
+            self.assertEqual(response.status_code, 422)
+
+    def test_prepare_dev_destinations_never_falls_back_to_prod(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = create_app(DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")}), Settings())
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.get("/api/synthetic/destinations")
+            self.assertEqual(response.status_code, 409)
+
+    def test_synthetic_preview_generates_real_bounded_rows_without_remote_access(self):
+        from dexter.config import Settings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = DexterPaths.from_env({"DEXTER_HOME": str(root / "state"), "DEXTER_CONFIG_HOME": str(root / "config")})
+            app = create_app(paths, Settings())
+            body = {
+                "schema": {"qualified_name": "dev.gold.sample", "complete": True, "fields": [
+                    {"name": "id", "original_type": "BIGINT", "canonical_type": "bigint", "nullable": False},
+                    {"name": "amount", "original_type": "DECIMAL(10,2)", "canonical_type": "decimal", "precision": 10, "scale": 2, "nullable": True},
+                ]},
+                "row_count": 5, "locale": "en_US", "seed": 31,
+                "rules": [
+                    {"column": "id", "generator": "sequence", "parameters": {"start": 1}, "unique": True},
+                    {"column": "amount", "generator": "decimal_range", "parameters": {"min": 0, "max": 10}},
+                ],
+            }
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                response = client.post("/api/synthetic/preview", json=body)
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(len(payload["rows"]), 5)
+            self.assertEqual(payload["rows"][0]["id"], 1)
+            self.assertEqual(payload["seed"], 31)
+            self.assertFalse((paths.temporary / "synthetic-preview").exists())
+
     def test_schema_compare_endpoint_is_registered_and_rejects_invalid_identity(self):
         from dexter.config import Settings
         with tempfile.TemporaryDirectory() as temporary:

@@ -10,11 +10,15 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend" / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from registry_policy import npm_custom_ca_configured, npm_registry, proxy_configured, python_certificate, python_registry, status
+from check_dependency_lock import check_lock_files
 
 
 def report(label: str, ok: bool, detail: str) -> bool:
@@ -24,6 +28,28 @@ def report(label: str, ok: bool, detail: str) -> bool:
 
 def info(label: str, detail: str) -> None:
     print(f"INFO   {label}: {detail}")
+
+
+def pinned_dependency_status(root: Path, version_lookup=package_version) -> list[tuple[str, bool, str]]:
+    """Compare installed distributions to exact pyproject pins without network access."""
+    try:
+        dependencies = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")).get("project", {}).get("dependencies", [])
+    except (OSError, tomllib.TOMLDecodeError):
+        return [("Python dependency pins", False, "pyproject.toml could not be read")]
+    results = []
+    for requirement in dependencies:
+        name, separator, expected = requirement.partition("==")
+        if not separator:
+            results.append((f"{name} pin", False, "manifest dependency is not exactly pinned"))
+            continue
+        try:
+            installed = version_lookup(name)
+        except PackageNotFoundError:
+            results.append((f"{name} pin", False, f"not installed; manifest pins {expected}"))
+        else:
+            results.append((f"{name} pin", installed == expected,
+                            f"installed {installed}; manifest pins {expected}"))
+    return results
 
 
 def main() -> int:
@@ -36,8 +62,11 @@ def main() -> int:
         checks.append(report("uv", True, "available"))
     else:
         info("uv", "not installed; lock generation bootstraps it locally from the configured Python registry")
-    for package, module in (("FastAPI", "fastapi"), ("Uvicorn", "uvicorn"), ("Databricks SDK", "databricks"), ("Azure Identity", "azure")):
+    for package, module in (("FastAPI", "fastapi"), ("Uvicorn", "uvicorn"), ("Databricks SDK", "databricks"), ("Azure Identity", "azure"),
+                            ("DuckDB", "duckdb"), ("PyArrow", "pyarrow"), ("Mimesis", "mimesis")):
         checks.append(report(package, importlib.util.find_spec(module) is not None, "installed" if importlib.util.find_spec(module) else "not installed"))
+    for label, matches, detail in pinned_dependency_status(Path.cwd()):
+        checks.append(report(label, matches, detail))
     for name, registry in status().items():
         detail = "explicitly configured and allowed" if registry.url and registry.public else "configured corporate registry detected" if registry.url else registry.blocked_reason or "not configured"
         checks.append(report(f"{name} dependency registry", registry.url is not None, detail))
@@ -50,10 +79,9 @@ def main() -> int:
         checks.append(report("Custom CA configuration", True, "present"))
     else:
         info("Custom CA configuration", "not set; system/package-manager defaults apply")
-    if Path("package-lock.json").is_file() and Path("requirements.lock").is_file():
-        checks.append(report("Dependency lockfiles", True, "npm and Python lockfiles present"))
-    else:
-        info("Dependency lockfiles", "missing; make setup generates them from the configured registries")
+    lock_errors = check_lock_files(Path.cwd())
+    checks.append(report("Dependency lockfiles", not lock_errors,
+                         " and ".join(lock_errors) if lock_errors else "manifest drift check passed; Python hashes present"))
     for label, executable in (("Databricks CLI", "databricks"), ("Azure CLI", "az")):
         if shutil.which(executable):
             checks.append(report(label, True, "available"))

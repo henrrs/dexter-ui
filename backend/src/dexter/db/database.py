@@ -97,6 +97,65 @@ MIGRATIONS = (
     );
     CREATE INDEX operation_worker_leases_expiry ON operation_worker_leases(expires_at);
     """,
+    """
+    CREATE TABLE synthetic_runs (
+      run_id TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id) ON DELETE CASCADE,
+      state TEXT NOT NULL,
+      plan_json TEXT NOT NULL,
+      destination_json TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX synthetic_runs_state_updated ON synthetic_runs(state, updated_at DESC);
+    CREATE TABLE synthetic_chunks (
+      run_id TEXT NOT NULL REFERENCES synthetic_runs(run_id) ON DELETE CASCADE,
+      chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+      file_name TEXT NOT NULL,
+      row_count INTEGER NOT NULL CHECK (row_count >= 0),
+      byte_count INTEGER NOT NULL CHECK (byte_count >= 0),
+      sha256 TEXT NOT NULL,
+      state TEXT NOT NULL,
+      remote_path TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, chunk_index),
+      UNIQUE(run_id, file_name)
+    );
+    CREATE INDEX synthetic_chunks_state ON synthetic_chunks(run_id, state, chunk_index);
+    """,
+    """
+    CREATE TABLE synthetic_destructive_locks (
+      target_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES synthetic_runs(run_id) ON DELETE CASCADE,
+      operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id) ON DELETE CASCADE,
+      state TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX synthetic_destructive_locks_run ON synthetic_destructive_locks(run_id);
+    """,
+    """
+    CREATE TABLE schema_evolution_drafts (
+      draft_key TEXT PRIMARY KEY,
+      identity_json TEXT NOT NULL,
+      draft_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE schema_evolution_plans (
+      plan_id TEXT PRIMARY KEY,
+      identity_json TEXT NOT NULL,
+      plan_json TEXT NOT NULL,
+      operation_id TEXT REFERENCES operations(id) ON DELETE SET NULL,
+      state TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX schema_evolution_plans_operation ON schema_evolution_plans(operation_id);
+    """,
 )
 
 

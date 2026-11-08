@@ -83,3 +83,33 @@ Validation on 2026-11-07:
 - `npm run build` — TypeScript and Vite production build passed.
 - `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
 - Provider fixtures only; no live workspace credentials, records, or visual browser session were used.
+
+## F4.2 synthetic generation and Prepare DEV
+
+Validation on 2026-11-07:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 105 tests passed, including real Mimesis calls for `pt_BR` and `en_US`, seeded typed Parquet generation, bounded resumable producer/uploader behavior, publisher plans, worker isolation/cancellation, Volume integrity checks, API profile isolation, and existing regression coverage. Several Databricks SDK interactions use fake workspaces; no remote writes were made.
+- `node --test scripts/ui-contract.test.mjs` — all 9 UI contract tests passed. `npm run build` — TypeScript and Vite production build passed.
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests` and `git diff --check` — passed.
+- The five-step Prepare DEV flow and managed/external Create/Isolated, Append, and Replace publication code are implemented and covered with fake-workspace tests. No live Databricks DEV profile was used, so end-to-end permissions, SQL behavior, throughput, and memory behavior on a configured workspace remain uncertified. A strict 256 MiB memory ceiling is unavailable on hosts without usable cgroup v2; there the separate worker applies a 64 MiB DuckDB cap and 220 MiB RSS guard. Drop & Recreate behavior is described below.
+
+## F4.2 finalization: Drop & Recreate and dependency locks
+
+Validation on 2026-11-07:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 119 tests passed, including Drop & Recreate preflight/fingerprint changes, managed and external recreation, post-DROP reconciliation and target locking, secret-safe metadata handling, run provenance, registry lock checks, installed dependency drift diagnostics, and existing F1–F4.2 regression coverage. Databricks calls use fake workspaces; no destructive remote statement was executed.
+- `node --test scripts/ui-contract.test.mjs` and `npm run build` — passed (TypeScript/Vite build and UI contracts).
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m compileall -q backend/src backend/tests scripts` and `git diff --check` — passed.
+- Drop & Recreate is limited to a completed Dexter experimental table with matching DEV profile/workspace, run marker, and physical table ID. Its review binds the exact table and plan, inspects visible lineage/grants and managed recovery policy, uses a unique empty path for External recreation, and repeats validation before an atomic per-target lock/no-retry DROP checkpoint. A reconciliation action can clear the lock only when Databricks confirms the target is absent or the unchanged original table survived; a recreated/partial table remains blocked for administrator investigation. Automated tests did not call a real Databricks workspace.
+- `make lock` — blocked before resolution because this checkout has no explicitly configured corporate npm or Python registry. `uv` is present, but registry policy prevents public fallback; no lock was fabricated. `requirements.lock` and clean `make setup` remain pending registry configuration.
+- `make doctor` — correctly returned status 1, reported Mimesis 22.2.0 installed and the remaining pinned packages/lockfile missing from this checkout's `.venv`, and confirmed that it made no network requests.
+
+## F4.3 Schema Evolution
+
+Validation on 2026-11-07:
+
+- `PYTHONPATH=.venv/lib/python3.12/site-packages:backend/src:scripts ../switchyard/.venv/bin/python -m unittest discover -s backend/tests -v` — all 132 tests passed, including F4.3 domain, SQL adapter, and API identity-rejection checks plus F1–F4.2 regressions.
+- `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed, including both editor entry points and reuse of the shared F4.2 field editor.
+- `npm run build` — TypeScript and Vite production build passed.
+- Python `compileall` and `git diff --check` passed.
+- Automated checks use fake SDK/SQL responses. No authenticated Databricks DEV workspace and warehouse were available for this run. Real Delta DDL, grants, protocol inspection, and end-to-end UI behavior are not DEV-certified.
