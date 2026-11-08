@@ -191,7 +191,15 @@ def create_empty_delta_table_sql(identity: dict[str, str], schema: dict[str, Any
         rendered.append(definition)
     location = f" LOCATION {_string_literal(external_location)}" if external_location else ""
     from dexter.adapters.databricks_table_properties import validate_recreation_properties
-    safe_properties = validate_recreation_properties(properties)
+    requested_properties = dict(properties or {})
+    # Column mapping enables metadata-only column renames and drops on the new
+    # Delta table. Set it after copying old properties so a saved `none` value
+    # cannot silently disable those operations.
+    requested_properties["delta.columnMapping.mode"] = "name"
+    # Type widening allows supported type changes without rewriting Delta files.
+    # The Delta engine enables the corresponding protocol feature automatically.
+    requested_properties["delta.enableTypeWidening"] = "true"
+    safe_properties = validate_recreation_properties(requested_properties)
     property_sql = (" TBLPROPERTIES (" + ", ".join(
         f"{_string_literal(key)} = {_string_literal(str(value))}" for key, value in sorted(safe_properties.items())) + ")") if safe_properties else ""
     return f"CREATE TABLE {quote_qualified(identity)} ({', '.join(rendered)}) USING DELTA{location}{property_sql}"
@@ -246,36 +254,24 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
                              plan: dict[str, Any], *,
                              checkpoint: Callable[[str, dict[str, Any]], None],
                              progress: Callable[[str, dict[str, Any]], None]) -> dict[str, Any]:
-    """F4.3 empty-table recreation, reusing F4.2 destructive assessment and no-retry checks."""
-    from dexter.adapters.databricks_synthetic_publisher import (
-        _read_table, assess_drop_recreate, external_uri_is_safe,
-    )
+    """Recreate the explicitly confirmed DEV table from the reviewed draft schema."""
     if identity.get("environment") != "dev":
         raise PermissionError("DEV table recreation is restricted to the configured DEV profile")
     recreation = plan.get("recreation") or {}
     storage_type = str(recreation.get("storage_type") or "").upper()
-    external = recreation.get("external_location")
-    external = external if isinstance(external, dict) else None
-    destination = {**identity, "environment": "dev"}
-    assessment = assess_drop_recreate(workspace, warehouse_id=warehouse_id, destination=destination,
-        proposed_schema=plan["proposed_dev_schema"], storage_type=storage_type.casefold(),
-        external_location=external, plan_id=plan["plan_id"], new_location_prefix="dexter-schema-recreated",
-        property_policy="best_effort", governance_checks=False)
-    reviewed_assessment = recreation.get("assessment") or {}
-    reviewed_target = reviewed_assessment.get("target") or {}
-    current_target = assessment.get("target") or {}
-    if (assessment.get("status") != "ready_for_confirmation"
-            or current_target.get("table_id") != identity.get("table_id")
-            or reviewed_target.get("table_id") != identity.get("table_id")
-            or current_target.get("storage_type") != reviewed_target.get("storage_type")):
-        raise RuntimeError("The reviewed DEV table identity or storage type changed; the table was not dropped")
+    assessment = recreation.get("assessment") or {}
+    reviewed_target = assessment.get("target") or {}
+    new_location = assessment.get("new_location")
+    if storage_type not in {"MANAGED", "EXTERNAL"}:
+        raise ValueError("Choose Managed or External storage in the reviewed DEV recreation plan")
+    if storage_type == "EXTERNAL" and not new_location:
+        raise ValueError("Choose a writable DEV External Location in the reviewed recreation plan")
     old_table_id = str(identity["table_id"])
-    properties = {key: str(value) for key, value in
-        (assessment.get("target", {}).get("properties") or {}).items()}
+    properties = {key: str(value) for key, value in (reviewed_target.get("properties") or {}).items()}
     full_name = ".".join(identity[key] for key in ("catalog", "schema", "table"))
     drop_sql = f"DROP TABLE {quote_qualified(identity)}"
     create_sql = create_empty_delta_table_sql(identity, plan["proposed_dev_schema"],
-        storage_type=storage_type, external_location=assessment.get("new_location"), properties=properties)
+        storage_type=storage_type, external_location=new_location, properties=properties)
 
     checkpoint("DROP_SUBMITTING", {"phase": "drop", "target": full_name, "old_table_id": old_table_id,
         "new_location": assessment.get("new_location"),
@@ -285,15 +281,9 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
     try:
         execute_statement(workspace, warehouse_id, drop_sql, phase="schema-recreate-drop")
     except Exception:
-        _table, exists = _read_table(workspace, full_name)
-        if exists:
-            raise
-        # A lost response plus a fresh confirmed absence is enough to continue CREATE;
-        # the destructive DROP is never resubmitted.
-        drop_response_lost = True
-    _old_or_new, still_exists = _read_table(workspace, full_name)
-    if still_exists:
-        raise RuntimeError("DROP did not leave the target absent; no CREATE or automatic retry was attempted")
+        # Do not query, retry, or infer the result of a failed DROP. The durable
+        # checkpoint requires explicit reconciliation before another destructive run.
+        raise
     checkpoint("DROPPED", {"phase": "create", "target": full_name, "drop_response_lost": drop_response_lost,
         "retry_available": False, "reconciliation_required": True})
     progress("Creating an empty DEV table with the approved schema", {"phase": "create", "state": "submitting", "target": full_name})
@@ -304,7 +294,7 @@ def execute_empty_recreation(workspace: Any, warehouse_id: str, identity: dict[s
         # Do not submit CREATE twice. Verify a possibly committed response directly.
         create_response_lost = True
     created = _confirmed_empty_table(workspace, warehouse_id, identity, plan["proposed_dev_schema"],
-        storage_type, old_table_id, assessment.get("new_location"), expected_properties=properties)
+        storage_type, old_table_id, new_location, expected_properties=properties)
     if created is None:
         raise RuntimeError("The old table was dropped, but the new table is absent; reconciliation is required")
     checkpoint("CREATED", {"phase": "validate", "target": full_name, "table_id": created["table_id"],
