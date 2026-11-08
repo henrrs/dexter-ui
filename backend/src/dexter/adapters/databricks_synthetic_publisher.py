@@ -326,8 +326,10 @@ def verify_external_path_empty(workspace: Any, warehouse_id: str, path: str) -> 
 
 
 def copy_into_sql(catalog: str, schema_name: str, table: str, volume_path: str) -> str:
+    # Both mergeSchema and force default to false. Keep the statement on the
+    # documented minimal syntax so option parsing cannot reject the load.
     return (f"COPY INTO {qualified_name(catalog, schema_name, table)} FROM {_sql_string(volume_path)} "
-            "FILEFORMAT = PARQUET FORMAT_OPTIONS (mergeSchema = false) COPY_OPTIONS (force = false)")
+            "FILEFORMAT = PARQUET")
 
 
 def replace_data_sql(catalog: str, schema_name: str, table: str, schema: dict[str, Any], volume_path: str) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import shutil
 import threading
 import time
@@ -160,10 +161,15 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
         error_code = str(exc.error_code or "").upper()
         if not error_code or not error_code.replace("_", "").isalnum():
             error_code = "UNKNOWN"
+        sql_state = str(exc.sql_state or "").upper()
+        if not re.fullmatch(r"[0-9A-Z]{5}", sql_state):
+            sql_state = ""
         operations.update_details(operation_id, failed_phase=exc.phase or "publication",
                                   databricks_error_code=error_code,
+                                  databricks_sql_state=sql_state or None,
                                   staged_files_retained=True)
-        message = (f"Dexter could not complete the Databricks SQL step during {phase} ({error_code}). "
+        state_detail = f", SQLSTATE {sql_state}" if sql_state else ""
+        message = (f"Dexter could not complete the Databricks SQL step during {phase} ({error_code}{state_detail}). "
                    "The verified files remain in the DEV staging Volume for recovery.")
         _fail(operations, runs, operation_id, run_id, message, "DATABRICKS_STATEMENT_FAILED")
     except Exception as exc:

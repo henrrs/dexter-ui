@@ -7,10 +7,12 @@ from typing import Any, Callable
 
 
 class StatementExecutionError(RuntimeError):
-    def __init__(self, message: str, error_code: str | None = None, phase: str | None = None):
+    def __init__(self, message: str, error_code: str | None = None, phase: str | None = None,
+                 sql_state: str | None = None):
         super().__init__(message)
         self.error_code = error_code
         self.phase = phase
+        self.sql_state = sql_state
 
 
 def execute_statement(workspace: Any, warehouse_id: str, statement: str, *,
@@ -51,10 +53,11 @@ def execute_statement(workspace: Any, warehouse_id: str, statement: str, *,
         if state in {"FAILED", "CANCELED", "CLOSED"}:
             errors = _field(status, "error")
             code = _field(errors, "error_code") if errors else None
+            sql_state = _field(errors, "sql_state") if errors else None
             # Do not leak SQL service messages or credentials into local operation logs.
             safe_code = str(code) if code else ("STATEMENT_CANCELED" if state == "CANCELED" else None)
             raise StatementExecutionError(f"Databricks {phase} statement ended in {state.lower()}" + (f" ({safe_code})" if safe_code else ""),
-                                          safe_code, phase)
+                                          safe_code, phase, str(sql_state) if sql_state else None)
         if progress:
             progress(statement_id, {"phase": phase, "statement_id": statement_id,
                                     "state": state, "elapsed_seconds": int(time.monotonic() - started)})

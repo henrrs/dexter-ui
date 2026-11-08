@@ -946,6 +946,12 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         from dexter.domain.schema import canonical_schema
         technology = detail.get("technology_properties") or {}
         safe_technology = {key: technology[key] for key in ("table_id", "table_type", "data_source_format", "partition_columns", "cluster_by") if key in technology}
+        # SDK enum instances can be serialized as `TableType.MANAGED` rather
+        # than `MANAGED`. Persist the canonical enum value in saved drafts.
+        for key in ("table_type", "data_source_format"):
+            if key in safe_technology:
+                value = getattr(safe_technology[key], "value", safe_technology[key])
+                safe_technology[key] = str(value or "").upper().rsplit(".", 1)[-1]
         if isinstance(technology.get("properties"), dict):
             from dexter.adapters.databricks_table_properties import classify_recreation_properties
             property_snapshot = classify_recreation_properties(technology["properties"], best_effort=True)
@@ -1085,8 +1091,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     def _schema_capabilities_from_saved_schema(schema: dict[str, Any], identity: dict[str, str]) -> dict[str, Any]:
         technology = schema.get("technology_properties") or {}
         properties = technology.get("properties") if isinstance(technology.get("properties"), dict) else {}
-        table_type = str(technology.get("table_type") or "").upper()
-        data_format = str(technology.get("data_source_format") or "").upper()
+        table_type_value = technology.get("table_type") or ""
+        data_format_value = technology.get("data_source_format") or ""
+        table_type = str(getattr(table_type_value, "value", table_type_value)).upper().rsplit(".", 1)[-1]
+        data_format = str(getattr(data_format_value, "value", data_format_value)).upper().rsplit(".", 1)[-1]
         capabilities = {"delta": data_format == "DELTA", "table_type": table_type or None,
             "table_id": str(technology.get("table_id") or identity.get("table_id") or ""),
             "column_mapping": str(properties.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"},
