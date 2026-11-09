@@ -286,7 +286,7 @@ export function SchemaEvolutionStudio({ active = true, node, contextTabId = node
       if (signal?.aborted) return
       setSelectedFeatures(effectiveFeatures)
       setExecutionStrategy(strategy)
-      setExternalLocationName(selectedLocation)
+      setExternalLocationName(next.recreation?.external_location?.name ?? selectedLocation)
       if (JSON.stringify(draftRef.current) !== snapshot) { setError('The draft changed during review. Review the current edits again.'); return }
       setPlan(next); setStage('review'); setConfirmDrop(false); setConfirmRecreate(false)
       if (next.drift) setContext((value) => value ? { ...value, drift: true } : value)

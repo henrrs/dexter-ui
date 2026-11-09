@@ -247,7 +247,11 @@ def classify_type_change(old: str, new: str, *, type_widening: bool = False,
 
 
 def validate_recreation_schema(schema: dict[str, Any]) -> list[str]:
-    """Validate the defined empty-table schema without inventing data-migration semantics."""
+    """Validate SQL-safe column definitions for the reviewed empty-table schema.
+
+    Recreation intentionally does not gate on source-table capabilities or
+    metadata that can be omitted during a DEV drop-and-create operation.
+    """
     reasons: list[str] = []
     fields = schema.get("fields") if isinstance(schema, dict) else None
     if not schema.get("complete") or not isinstance(fields, list) or not fields:
@@ -267,14 +271,6 @@ def validate_recreation_schema(schema: dict[str, Any]) -> list[str]:
         except ValueError:
             reasons.append(f"{name or 'A column'} has an unsupported Databricks type.")
             continue
-        if _required_feature(data_type):
-            reasons.append(f"{name} uses {data_type}, which requires a Delta feature not activated by table recreation.")
-        properties = item.get("technology_properties") or {}
-        if item.get("constraints") or any(properties.get(key) for key in
-                ("default_value", "generated_expression", "identity_field", "mask")):
-            reasons.append(f"{name} has constraints or special column properties that this recreation cannot preserve.")
-    if schema.get("constraints"):
-        reasons.append("Table-level constraints cannot be recreated by this workflow.")
     return sorted(set(reasons))
 
 
@@ -438,6 +434,15 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     """Create a stable plan; unsupported operations are explicitly blocked."""
     if execution_strategy not in {"apply", "recreate"}:
         raise ValueError("The schema execution strategy is not supported")
+    capabilities = dict(capabilities)
+    if execution_strategy == "recreate":
+        # Recreation creates a new Delta table, falling back to managed
+        # storage when the old storage type is missing or unsupported. Missing
+        # source metadata must not block review of the confirmed operation.
+        capabilities["delta"] = True
+        if capabilities.get("table_type") not in {"MANAGED", "EXTERNAL"}:
+            capabilities["table_type"] = "MANAGED"
+        capabilities.setdefault("table_id", identity.get("table_id") or "")
     proposed = draft.proposed_schema()
     diff = compare_schemas(draft.baseline, proposed)
     before = {item["name"].casefold(): item for item in draft.baseline.get("fields", [])}
@@ -500,8 +505,6 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
                 if classification != "SAME_TYPE":
                     requested_changes[-1]["classification"] = classification
                 if execution_strategy == "recreate":
-                    if classification == "UNSUPPORTED":
-                        blockers.append(f"Changing {old['name']} is incompatible with this table's Iceberg reader requirements.")
                     continue
                 feature = _required_feature(str(new.get("original_type", "")))
                 if feature and not capabilities.get(feature[0]):
@@ -588,7 +591,9 @@ def plan_schema_change(identity: dict[str, str], draft: SchemaDraft, capabilitie
     body.update(contract_version=2, physical_dev_baseline=deepcopy(draft.baseline), proposed_dev_schema=deepcopy(proposed),
                 proposed_schema=deepcopy(proposed), reference_prod_schema=None)
     body["required_capabilities"] = required_capabilities(canonical_ops, capabilities)
-    unknown = [key for key, value in body["required_capabilities"].items() if value is None or (key == "table_id" and not value)]
+    unknown = [] if execution_strategy == "recreate" else [
+        key for key, value in body["required_capabilities"].items() if value is None or (key == "table_id" and not value)
+    ]
     if unknown:
         body["blockers"] = sorted(set([*body["blockers"], "Required DEV capabilities are unavailable: " + ", ".join(unknown)]))
     body["capability_fingerprint"] = _digest(body["required_capabilities"])

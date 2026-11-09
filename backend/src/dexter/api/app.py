@@ -439,8 +439,19 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     app.add_middleware(LocalOriginGuard)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_request: Request, _exc: RequestValidationError):
-        return JSONResponse({"error": {"code": "INVALID_REQUEST", "message": "Request fields are invalid."}}, status_code=422)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        fields = []
+        for error in exc.errors()[:5]:
+            location = ".".join(str(part) for part in error.get("loc", ()) if part not in {"body", "query", "path"})
+            fields.append({"field": location or "request", "reason": str(error.get("type") or "invalid")})
+        if fields:
+            summary = ", ".join(f"{item['field']} ({item['reason']})" for item in fields)
+            message = f"Request fields are invalid: {summary}."
+            logger.info("Request validation failed method=%s path=%s fields=%s",
+                        request.method, request.url.path, summary)
+        else:
+            message = "Request fields are invalid."
+        return JSONResponse({"error": {"code": "INVALID_REQUEST", "message": message, "fields": fields}}, status_code=422)
 
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException):
@@ -925,7 +936,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 "identity_and_history_preserved": False}
         # Advisory reference only: never part of DEV concurrency or capability fingerprints.
         plan["reference_prod_schema"] = body.reference_prod_schema
-        if capabilities.get("blocker"):
+        if body.execution_strategy != "recreate" and capabilities.get("blocker"):
             plan["blockers"].append(capabilities["blocker"])
         plan["drift"] = not schemas_equivalent(current_schema, plan["physical_dev_baseline"])
         if plan["drift"]:
@@ -1022,7 +1033,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             raise HTTPException(409, detail="Resolve the blocked schema changes and review them again before applying")
         if strategy == "apply" and fresh.get("confirmation_required") and not body.confirm_drop:
             raise HTTPException(422, detail="Confirm the listed column deletion before applying")
-        if not capabilities.get("delta") or capabilities.get("table_type") not in {"MANAGED", "EXTERNAL"}:
+        if strategy != "recreate" and (not capabilities.get("delta") or capabilities.get("table_type") not in {"MANAGED", "EXTERNAL"}):
             raise HTTPException(403, detail="Schema Evolution is restricted to managed or external Delta tables")
         if strategy != "recreate":
             try:
@@ -1293,10 +1304,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         technology = schema.get("technology_properties") or {}
         properties = technology.get("properties") if isinstance(technology.get("properties"), dict) else {}
         table_type_value = technology.get("table_type") or ""
-        data_format_value = technology.get("data_source_format") or ""
         table_type = str(getattr(table_type_value, "value", table_type_value)).upper().rsplit(".", 1)[-1]
-        data_format = str(getattr(data_format_value, "value", data_format_value)).upper().rsplit(".", 1)[-1]
-        capabilities = {"delta": data_format == "DELTA", "table_type": table_type or None,
+        capabilities = {"delta": True,
+            "table_type": table_type if table_type in {"MANAGED", "EXTERNAL"} else "MANAGED",
+            "observed_table_type": table_type or None,
             "table_id": str(technology.get("table_id") or identity.get("table_id") or ""),
             "column_mapping": str(properties.get("delta.columnMapping.mode", "none")).casefold() in {"name", "id"},
             "type_widening": str(properties.get("delta.enableTypeWidening", "false")).casefold() == "true",
@@ -1310,10 +1321,6 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             "time_type": str(properties.get("delta.feature.timeType", "")).casefold() in {"supported", "enabled"},
             "variant_type": str(properties.get("delta.feature.variantType", "")).casefold() in {"supported", "enabled"},
             "timestamp_ntz": str(properties.get("delta.feature.timestampNtz", "")).casefold() in {"supported", "enabled"}}
-        if not capabilities["delta"]:
-            capabilities["blocker"] = "Schema recreation supports Delta tables only."
-        if capabilities["table_type"] not in {"MANAGED", "EXTERNAL"}:
-            capabilities["blocker"] = "Schema recreation supports Managed or External tables only."
         return capabilities
 
     def _schema_capabilities(workspace, identity):
@@ -1340,9 +1347,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         from dexter.adapters.databricks_schema_evolution import create_empty_delta_table_sql, quote_qualified
         from dexter.adapters.databricks_table_properties import classify_recreation_properties
         from dexter.adapters.databricks_synthetic_publisher import external_uri_is_safe
-        storage_type = str((plan.get("required_capabilities") or {}).get("table_type") or "").upper()
+        storage_type = str((plan.get("required_capabilities") or {}).get("table_type") or "MANAGED").upper()
+        if storage_type not in {"MANAGED", "EXTERNAL"}:
+            storage_type = "MANAGED"
         recreation["storage_type"] = storage_type
         technology = (plan.get("physical_dev_baseline") or {}).get("technology_properties") or {}
+        source_storage_value = technology.get("table_type") or ""
+        source_storage_type = str(getattr(source_storage_value, "value", source_storage_value)).upper().rsplit(".", 1)[-1]
+        recreation["source_storage_type"] = source_storage_type if source_storage_type in {"MANAGED", "EXTERNAL"} else None
         classified = classify_recreation_properties(technology.get("properties"), best_effort=True)
         table_properties = {**classified["properties"], "delta.columnMapping.mode": "name",
                             "delta.enableTypeWidening": "true"}
@@ -1358,18 +1370,22 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                     external_locations.append({"name": name, "url": url if external_uri_is_safe(url) else "<redacted>",
                         "read_only": read_only, "authorized": authorized})
             except Exception:
-                reasons.append("Dexter could not list DEV External Locations, so it could not prepare a new path for this External table.")
-            if not external_location_name:
-                reasons.append("Select a writable DEV External Location for the new empty table path.")
-            else:
-                selected_external = next((item for item in external_locations if item["name"] == external_location_name), None)
-                if not selected_external or selected_external["read_only"] or selected_external["url"] == "<redacted>":
-                    reasons.append("Select an available writable DEV External Location with a credential-backed URL.")
-        elif external_location_name:
-            reasons.append("An External Location can only be selected when recreating an External table.")
+                external_locations = []
+            eligible = sorted((item for item in external_locations
+                if not item["read_only"] and item["url"] != "<redacted>"), key=lambda item: item["name"].casefold())
+            selected_external = next((item for item in eligible if item["name"] == external_location_name), None)
+            if selected_external is None and eligible:
+                selected_external = eligible[0]
+            if selected_external is None:
+                # Optional location metadata must not strand a DEV recreation.
+                # Use managed storage when a fresh external path is unavailable.
+                storage_type = "MANAGED"
+                recreation["storage_type"] = storage_type
+        effective_location_name = selected_external["name"] if selected_external else None
+        plan["external_location_name"] = effective_location_name
         plan["plan_id"] = _hashlib.sha256(_json.dumps({
             "reviewed_plan_id": plan["plan_id"], "execution_strategy": "recreate",
-            "warehouse_id": warehouse_id, "external_location_name": external_location_name,
+            "warehouse_id": warehouse_id, "external_location_name": effective_location_name,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         recreation["external_locations"] = external_locations
         recreation["external_location"] = selected_external
@@ -1395,6 +1411,13 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                      "Databricks evaluates DROP and CREATE permissions when the confirmed statements run.",
                      "Column mapping is enabled in name mode so columns can be renamed or dropped. Databricks upgrades the Delta protocol as required (reader 2, writer 5 or later), which can affect older clients.",
                      "Type widening is enabled for supported column type changes. It requires Databricks Runtime 15.4 LTS or later and upgrades the Delta protocol to reader 3, writer 7 or later, which can affect older clients."]
+            if recreation.get("source_storage_type") == "EXTERNAL" and storage_type == "MANAGED":
+                risks.append("No writable DEV External Location was available, so the replacement will use managed storage. Existing external files are left untouched.")
+            if (plan["proposed_dev_schema"].get("constraints") or any(
+                    field.get("constraints") or any((field.get("technology_properties") or {}).get(key)
+                        for key in ("default_value", "generated_expression", "identity_field", "mask"))
+                    for field in plan["proposed_dev_schema"].get("fields", []))):
+                risks.append("Constraints, masks, defaults, generated expressions, and identity behavior are not recreated; supported comments and table properties are copied best effort.")
             if property_summary["omitted"] or property_summary["sensitive_omitted_count"]:
                 risks.append("Some unsupported or sensitive properties will be omitted; supported properties are reapplied best effort.")
             if storage_type == "EXTERNAL":

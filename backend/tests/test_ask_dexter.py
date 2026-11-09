@@ -331,6 +331,22 @@ class AskConversationTests(unittest.TestCase):
             self.assertEqual(messages.json()["last_turn_state"], "completed")
         self.assertTrue(runtime.shutdown_called)
 
+    def test_invalid_ask_request_reports_field_without_echoing_payload(self):
+        app = create_app(self.paths, Settings())
+        app.state.ask_dexter.runtime = FakeRuntime()
+        tabs = [{"tab_id": f"tab-{index}", "type": "table_workbench", "title": f"table {index}"} for index in range(6)]
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            response = client.post("/api/ask/conversations/missing/messages", json={
+                "request_id": "60000000-0000-4000-8000-000000000001",
+                "text": "hello",
+                "context": {"version": 1, "mode": "active", "active_tab_id": "tab-0", "tabs": tabs},
+            })
+        self.assertEqual(response.status_code, 422)
+        message = response.json()["error"]["message"]
+        self.assertIn("context.tabs", message)
+        self.assertIn("too_long", message)
+        self.assertNotIn("hello", message)
+
 
 class OpenCodeRuntimePolicyTests(unittest.TestCase):
     def setUp(self):

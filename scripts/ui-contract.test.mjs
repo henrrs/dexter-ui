@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import ts from 'typescript'
 
 const app = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const styles = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8')
@@ -12,6 +13,8 @@ const schemaFieldEditor = await readFile(new URL('../src/SchemaFieldEditor.tsx',
 const vite = await readFile(new URL('../vite.config.ts', import.meta.url), 'utf8')
 const askPanel = await readFile(new URL('../src/AskDexterPanel.tsx', import.meta.url), 'utf8')
 const askContext = await readFile(new URL('../src/askDexter/context.ts', import.meta.url), 'utf8')
+const askContextModuleSource = ts.transpileModule(askContext, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
+const askContextModule = await import(`data:text/javascript;base64,${Buffer.from(askContextModuleSource).toString('base64')}`)
 
 test('platform shell uses local authentication and keeps Ask Dexter in the workspace', () => {
   assert.match(app, /Home/)
@@ -158,6 +161,30 @@ test('Ask Dexter exposes automatic OpenCode startup and polls until readiness is
   assert.match(askPanel, /Retry connection/)
   assert.match(api, /attempts\?: number/)
   assert.match(styles, /ask-status-dot\.connecting/)
+})
+
+test('Ask context snapshots include only authorized tabs and honor API field limits', () => {
+  const tabs = Array.from({ length: 8 }, (_, index) => ({
+    tab_id: `tab-${index}`, type: 'query_workbench', title: `Tab ${index}`, resource: `catalog.schema.table_${index}`,
+    vendor_internal_view_state: 'must not reach the API',
+    summary: Object.fromEntries(Array.from({ length: 45 }, (_item, key) => [`summary_${key}`, 's'.repeat(240)])),
+    columns: Array.from({ length: 105 }, (_item, column) => ({ name: `column_${column}`.repeat(30), type: 'T'.repeat(180) })),
+    sql: 'S'.repeat(4_500),
+  }))
+  const active = askContextModule.buildWorkspaceContextSnapshot(tabs, 'active', 'tab-6')
+  assert.deepEqual(active.tabs.map((tab) => tab.tab_id), ['tab-6'])
+  const selected = askContextModule.buildWorkspaceContextSnapshot(tabs, 'selected_tabs', 'tab-7', tabs.map((tab) => tab.tab_id))
+  assert.equal(selected.tabs.length, 5)
+  const bounded = selected.tabs[0]
+  assert.equal('vendor_internal_view_state' in bounded, false)
+  assert.equal(Object.keys(bounded.summary).length, 40)
+  assert.ok(Object.keys(bounded.summary).every((key) => key.length <= 80))
+  assert.ok(Object.values(bounded.summary).every((value) => typeof value !== 'string' || value.length <= 200))
+  assert.equal(bounded.columns.length, 100)
+  assert.ok(bounded.columns.every((column) => column.name.length <= 256 && column.type.length <= 160))
+  assert.equal(bounded.sql.length, 4_000)
+  assert.match(askPanel, /pinned_context: pinnedValue \? normalizeWorkspaceContextTab\(pinnedValue\) : null/)
+  assert.deepEqual(askContextModule.buildWorkspaceContextSnapshot(tabs, 'pinned', 'tab-7', [], 'tab-4').tabs.map((tab) => tab.tab_id), ['tab-4'])
 })
 
 test('Synthetic Studio exposes reviewed DEV publication and bounded generation preview', async () => {

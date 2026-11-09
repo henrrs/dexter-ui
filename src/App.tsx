@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import {
   Activity, ArrowDownRight, ChevronLeft, ChevronRight,
   Cloud, Database, Gauge, Home,
@@ -24,6 +24,7 @@ function App() {
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
   const [leftWidth, setLeftWidth] = useState(252)
+  const [rightWidth, setRightWidth] = useState(320)
   const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceContextTab[]>([])
   const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState<string | null>(null)
   const [contextOverrides, setContextOverrides] = useState<Record<string, WorkspaceContextTab>>({})
@@ -88,6 +89,33 @@ function App() {
     window.addEventListener('pointerup', stop)
   }
 
+  const maxAskWidth = () => window.innerWidth <= 1000
+    ? Math.max(260, window.innerWidth - 52)
+    : Math.max(300, Math.min(560, window.innerWidth - 62 - (view === 'discover' && leftOpen ? leftWidth : 0) - 360))
+
+  const resizeAsk = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = event.clientX
+    const width = rightWidth
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const move = (moveEvent: PointerEvent) => {
+      setRightWidth(Math.min(maxAskWidth(), Math.max(260, width + start - moveEvent.clientX)))
+    }
+    const stop = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointercancel', stop)
+  }
+
+  const resizeAskByKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+    event.preventDefault()
+    setRightWidth((width) => Math.min(maxAskWidth(), Math.max(260, width + (event.key === 'ArrowLeft' ? 20 : -20))))
+  }
+
   const connectedCount = [connections?.databricks.dev, connections?.databricks.prod, connections?.purview]
     .filter((item) => item?.status === 'connected').length
   const databricksIdentity = connections?.databricks.dev.identity || connections?.databricks.prod.identity || null
@@ -126,7 +154,8 @@ function App() {
           </div>
         </main>}
 
-        <aside id="ask-dexter-panel" className={`context-panel ${rightOpen ? '' : 'context-panel-hidden'}`}>
+        <aside id="ask-dexter-panel" className={`context-panel ${rightOpen ? '' : 'context-panel-hidden'}`} style={{ '--ask-panel-width': `${rightWidth}px` } as CSSProperties}>
+          <div className="ask-resize-handle" role="separator" aria-orientation="vertical" aria-label="Resize Ask Dexter" tabIndex={0} onPointerDown={resizeAsk} onKeyDown={resizeAskByKeyboard} />
           <div className="panel-heading context-heading"><div><span className="eyebrow">CONVERSATION</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Minimize Ask Dexter" aria-expanded={rightOpen} aria-controls="ask-dexter-panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div>
           <AskDexterPanel tabs={askWorkspaceTabs} activeTabId={activeWorkspaceTabId} />
         </aside>

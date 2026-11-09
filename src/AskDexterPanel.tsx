@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Bot, Check, ChevronDown, LoaderCircle, MessageSquarePlus, Pencil, RefreshCw, Send, Settings2, Square, Trash2, X } from 'lucide-react'
+import { Bot, Check, ChevronLeft, LoaderCircle, MessageSquarePlus, Pencil, RefreshCw, Send, Settings2, Square, Trash2, X } from 'lucide-react'
 import { api } from './api'
 import type { AskConversation, AskMessage, AskStatus } from './api'
-import type { WorkspaceContextSnapshot, WorkspaceContextTab } from './askDexter/context'
+import { buildWorkspaceContextSnapshot, normalizeWorkspaceContextTab } from './askDexter/context'
+import type { WorkspaceContextTab } from './askDexter/context'
 
 type Props = { tabs: WorkspaceContextTab[]; activeTabId: string | null }
 type ContextMode = 'active' | 'pinned' | 'selected_tabs'
@@ -51,7 +52,6 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
   const [contextMenuOpen, setContextMenuOpen] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [renameValue, setRenameValue] = useState('')
-  const [endpointDraft, setEndpointDraft] = useState('')
   const [agentDraft, setAgentDraft] = useState('build')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [modelVariant, setModelVariant] = useState('')
@@ -106,6 +106,7 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
 
   const loadConversation = useCallback(async (conversationId: string | null) => {
     closeStream()
+    setConversationMenuOpen(false); setRenaming(false)
     setMessages([]); setStreamingText(''); setBusy(false); setError('')
     setLoadedConversationId(conversationId)
     setActiveConversationId(conversationId)
@@ -135,7 +136,6 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
     const [connection, saved] = await Promise.allSettled([api.askStatus(), api.askConversations()])
     if (connection.status === 'fulfilled') {
       setStatus(connection.value)
-      setEndpointDraft(connection.value.endpoint ?? '')
       setAgentDraft(connection.value.agent_id ?? connection.value.agent?.id ?? 'build')
     } else setError(connection.reason instanceof Error ? connection.reason.message : 'OpenCode is unavailable.')
     if (saved.status === 'fulfilled') {
@@ -173,6 +173,7 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
   useEffect(() => { messagesEnd.current?.scrollIntoView({ block: 'end', behavior: 'smooth' }) }, [messages, streamingText, busy])
 
   const createConversation = async () => {
+    setConversationMenuOpen(false); setRenaming(false)
     setBusy(true); setError('')
     try {
       const conversation = await api.askCreateConversation()
@@ -192,7 +193,12 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
     setContextMode(mode); setSelectedTabIds(selected); setPinnedContext(pinnedValue ?? null)
     try {
       const saved = await api.askSetContext(selectedConversation.id, {
-        mode, selected_tab_ids: selected, pinned_context: pinnedValue ?? null,
+        mode,
+        selected_tab_ids: selected.slice(0, 5).map((id) => id.slice(0, 200)),
+        // Workspace tabs may carry view-only fields and large schemas. The API
+        // accepts only the compact Ask context contract, even when the current
+        // mode is Follow active tab and a previous pin is retained.
+        pinned_context: pinnedValue ? normalizeWorkspaceContextTab(pinnedValue) : null,
       })
       setConversations((items) => items.map((item) => item.id === saved.id ? saved : item))
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Workspace context settings could not be saved.') }
@@ -224,7 +230,7 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
     if (!selectedConversation.model) { setError('Choose an OpenCode model before sending a message.'); return }
     const text = draft.trim()
     const requestId = crypto.randomUUID()
-    const snapshot: WorkspaceContextSnapshot = { version: 1, mode: contextMode, active_tab_id: activeTabId, tabs }
+    const snapshot = buildWorkspaceContextSnapshot(tabs, contextMode, activeTabId, selectedTabIds, pinnedContext?.tab_id ?? null)
     setDraft(''); setError(''); setBusy(true); setStreamingText(''); setStreamState('Sending')
     const optimistic: AskMessage = { id: `pending-${requestId}`, role: 'user', text, created_at: Date.now() }
     setMessages((items) => [...items, optimistic])
@@ -270,13 +276,13 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'The conversation could not be deleted.') }
   }
 
-  const saveEndpoint = async (event: FormEvent) => {
+  const saveAgent = async (event: FormEvent) => {
     event.preventDefault()
     try {
-      const saved = await api.askConfigureEndpoint(endpointDraft.trim() || null, agentDraft.trim())
-      setStatus(saved); setEndpointDraft(saved.endpoint ?? ''); setAgentDraft(saved.agent_id ?? saved.agent?.id ?? agentDraft); setError('')
+      const saved = await api.askConfigureEndpoint(status?.endpoint ?? null, agentDraft.trim())
+      setStatus(saved); setAgentDraft(saved.agent_id ?? saved.agent?.id ?? agentDraft); setError('')
     }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'The OpenCode endpoint could not be saved.') }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'The OpenCode agent could not be saved.') }
   }
 
   const modelValue = chosenModel ? `${chosenModel.provider_id}\u0000${chosenModel.id}` : ''
@@ -290,25 +296,25 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
       <button className="ask-toolbar-button" aria-label="Reconnect OpenCode" title="Reconnect OpenCode" onClick={() => { setLoading(true); void api.askReconnect().then(setStatus).catch((cause) => setError(cause instanceof Error ? cause.message : 'OpenCode reconnection failed.')).finally(() => setLoading(false)) }}><RefreshCw size={13} /></button>
       <button className="ask-toolbar-button" aria-label="OpenCode settings" title="OpenCode settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen((value) => !value)}><Settings2 size={14} /></button>
     </div>
-    {settingsOpen && <form className="ask-runtime-settings" onSubmit={(event) => void saveEndpoint(event)}>
+    {settingsOpen && <form className="ask-runtime-settings" onSubmit={(event) => void saveAgent(event)}>
       <label><span>OpenCode agent</span><select value={agentDraft} onChange={(event) => setAgentDraft(event.target.value)}>
         {!status?.agents.some((item) => item.id === agentDraft) && <option value={agentDraft}>{agentDraft} · unavailable</option>}
         {(status?.agents ?? []).map((item) => <option key={item.id} value={item.id}>{item.id}{item.id === 'build' ? ' · restricted assistant' : ''}</option>)}
       </select></label>
-      <label><span>Server endpoint</span><input value={endpointDraft} onChange={(event) => setEndpointDraft(event.target.value)} aria-label="OpenCode server endpoint" placeholder="Automatic local discovery" /></label>
-      <div className="ask-runtime-settings-footer"><small>Local HTTP only. Remote OpenCode servers must use HTTPS.</small><button>Save and reconnect</button></div>
+      <div className="ask-runtime-settings-footer"><small>Dexter manages the local OpenCode connection.</small><button>Save and reconnect</button></div>
     </form>}
 
     <div className="ask-conversation-bar">
-      {renaming && selectedConversation ? <form className="ask-rename-form" onSubmit={(event) => { event.preventDefault(); void rename() }}><input aria-label="Conversation title" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} autoFocus /><button aria-label="Save conversation title"><Check size={14} /></button><button type="button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={14} /></button></form> : <button className="ask-conversation-select" onClick={() => setConversationMenuOpen((value) => !value)} aria-expanded={conversationMenuOpen}><span>{selectedConversation?.title ?? 'Choose a conversation'}</span><ChevronDown size={14} /></button>}
+      <button className="ask-chat-list-button" aria-label="Back to chats" title="Back to chats" aria-expanded={conversationMenuOpen} onClick={() => setConversationMenuOpen((value) => !value)}><ChevronLeft size={13} /><span>Chats</span></button>
+      {renaming && selectedConversation ? <form className="ask-rename-form" onSubmit={(event) => { event.preventDefault(); void rename() }}><input aria-label="Conversation title" value={renameValue} onChange={(event) => setRenameValue(event.target.value)} autoFocus /><button aria-label="Save conversation title"><Check size={14} /></button><button type="button" aria-label="Cancel rename" onClick={() => setRenaming(false)}><X size={14} /></button></form> : <div className="ask-conversation-current" title={selectedConversation?.title ?? 'Choose a conversation'}><span>{selectedConversation?.title ?? 'Choose a conversation'}</span></div>}
       <button className="ask-small-action" aria-label="New chat" title="New chat" disabled={!status?.connected || busy} onClick={() => void createConversation()}><MessageSquarePlus size={14} /></button>
       {selectedConversation && <button className="ask-small-action" aria-label="Rename conversation" title="Rename conversation" onClick={() => { setRenameValue(selectedConversation.title); setRenaming(true) }}><Pencil size={13} /></button>}
       {selectedConversation && <button className="ask-small-action danger" aria-label="Delete conversation" title="Delete conversation" onClick={() => void removeConversation()}><Trash2 size={13} /></button>}
+      {conversationMenuOpen && <div className="ask-conversation-list" role="listbox" aria-label="Conversations">
+        {!conversations.length && <span className="ask-muted">No saved conversations yet.</span>}
+        {conversations.map((item) => <button key={item.id} role="option" aria-selected={item.id === activeConversationId} onClick={() => { setConversationMenuOpen(false); void loadConversation(item.id) }}><span>{item.title}</span><small>{new Date(item.last_activity_at).toLocaleDateString()}</small></button>)}
+      </div>}
     </div>
-    {conversationMenuOpen && <div className="ask-conversation-list" role="listbox" aria-label="Conversations">
-      {!conversations.length && <span className="ask-muted">No saved conversations yet.</span>}
-      {conversations.map((item) => <button key={item.id} role="option" aria-selected={item.id === activeConversationId} onClick={() => { setConversationMenuOpen(false); void loadConversation(item.id) }}><span>{item.title}</span><small>{new Date(item.last_activity_at).toLocaleDateString()}</small></button>)}
-    </div>}
 
     <div className="ask-model-row">
       <label className="ask-model-select"><span>Model</span><select aria-label="OpenCode model" value={modelValue} disabled={!selectedConversation || !status?.models.length || busy} onChange={(event) => void chooseModel(event.target.value)}>
