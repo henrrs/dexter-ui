@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
-import { ArrowRight, ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, PanelRightOpen, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
+import { ArrowRight, ChevronDown, ChevronRight, Database, Eye, FileStack, HardDrive, Layers3, LoaderCircle, LockKeyhole, Minus, PanelLeftClose, Play, RefreshCw, Search, Sparkles, Table2, Trash2, X, XCircle } from 'lucide-react'
 import { api } from './api'
 import type { CanonicalSchema, DiscoverNode, DiscoverPage, SchemaCompareResult } from './api'
 import type { Operation } from './types'
@@ -19,7 +19,7 @@ type QueryResultTab = 'results' | 'schema' | 'execution'
 type QueryExecution = { environment: QueryEnvironment; engine: 'DuckDB' | 'Databricks SQL'; warehouse: string | null; physicalObject: string | null; sql: string; executedSql?: string; state: 'running' | 'succeeded' | 'failed'; durationMs?: number; returnedRows?: number; truncated?: boolean; message?: string }
 type LineageResult = { available: boolean; items: Array<{ guid: string; name: string; qualified_name?: string; entity_type?: string; direction: 'upstream' | 'downstream' | 'related'; classifications: string[] }>; relations: Array<{ from_guid: string; to_guid: string; column_mapping?: string }>; message: string | null }
 
-export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer, rightOpen, onExpandContext }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void; rightOpen: boolean; onExpandContext: () => void }) {
+export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseExplorer, onExpandExplorer, onResizeExplorer }: { active: boolean; explorerOpen: boolean; explorerWidth: number; onCollapseExplorer: () => void; onExpandExplorer: () => void; onResizeExplorer: (event: ReactPointerEvent<HTMLDivElement>) => void }) {
   const [persistedExplorerState] = useState(readPersistedExplorerState)
   const [sources, setSources] = useState<DiscoverNode[]>([])
   const [pages, setPages] = useState<Record<string, PageState>>({})
@@ -893,7 +893,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
       </aside>}
     {active && !explorerOpen && <aside className="discover-explorer-rail" aria-label="Explorer minimized"><button onClick={onExpandExplorer} aria-label="Reopen Explorer" title="Reopen Explorer"><ChevronRight size={15} /></button></aside>}
     <main hidden={!active} style={active ? undefined : { display: 'none' }} className={`workspace discover-workspace ${explorerOpen ? '' : 'explorer-collapsed'}`}>
-      <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div><div className="toolbar-actions">{!rightOpen && <button className="icon-button subtle" onClick={onExpandContext} aria-label="Show context panel"><PanelRightOpen size={16} /></button>}</div></div>
+      <div className="workspace-toolbar"><div className="breadcrumbs"><span>Dexter</span><ChevronRight size={13} /><strong>Discover</strong>{selected?.qualified_name && <><ChevronRight size={13} /><strong>{selected.name}</strong></>}</div></div>
       {workbenchTabs.length > 0 && <div className="tab-strip"><div className="workbench-tabs">{workbenchTabs.map((tab) => {
         const label = tab.view === 'local-query' ? `Query · ${tab.node.name}` : tab.view === 'compare' ? `Compare · ${tab.node.name}` : tab.view === 'synthetic' ? `Synthetic · ${tab.node.name}` : tab.view === 'schema-evolution' ? `Schema · ${tab.node.name}` : tab.node.name
         return <div className={`workbench-tab ${activeTabKey === tab.key ? 'active' : ''}`} key={tab.key}>

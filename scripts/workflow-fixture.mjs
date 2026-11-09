@@ -15,7 +15,7 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1' }
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, extraTables: 0, syntheticFailureAt: null, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1' }
   const currentIdentity = () => ({ ...identity, table_id: state.currentTableId })
   const freshDraft = () => {
     const baseline = state.schemaPhysical ?? devSchema
@@ -41,16 +41,29 @@ export function workflowFixture() {
     if (path.startsWith('/api/connections')) return send({ databricks: { dev: { ...connection, profile: 'DEV' }, prod: { ...connection, profile: 'PROD' } }, databricks_profiles: { items: ['DEV', 'PROD'] }, purview: { ...connection, configured: false, status: 'unavailable' } })
     if (path === '/api/operations') return send([])
     if (path.endsWith('/logs')) return send({ items: [] })
+    if (path.endsWith('/retry') && req.method === 'POST') {
+      state.syntheticFailureAt = null
+      state.currentOperation = { ...clone(state.currentOperation), state: 'running', progress: 89, message: 'Resuming publication from verified files', error_message: null, details: { ...state.currentOperation.details, phase: 'materialization', failed_phase: null, retry_available: false } }
+      state.polls = 1
+      return send(state.currentOperation, 202)
+    }
     if (path.startsWith('/api/operations/')) {
       const next = clone(state.currentOperation ?? operation('synthetic-data'))
+      const pollNumber = ++state.polls
       if (next.kind === 'schema-evolution' && state.schemaPreflightFailure) {
-        if (++state.polls > 1) {
+        if (pollNumber > 1) {
           next.state = 'failed'; next.error_code = 'connection_unavailable'; next.error_message = 'Connection unavailable. Retry without resetting your draft.'
           next.details = { ...next.details, ddl_started: false, completed_operations: 0, reconciliation_required: false }
         }
         return send(next)
       }
-      if (++state.polls > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000 }
+      if (pollNumber > 1 && next.kind === 'synthetic-data' && state.syntheticFailureAt === 'materialization') {
+        next.state = 'failed'; next.progress = 88; next.message = 'Databricks could not publish the verified files.'
+        next.error_code = 'DATABRICKS_STATEMENT_FAILED'; next.error_message = 'Databricks SQL failed during materialization (BAD_REQUEST). DELTA_FAILED_TO_MERGE_FIELDS.'
+        next.details = { ...next.details, phase: 'materialization', failed_phase: 'materialization', total_rows: 1000, generated_rows: 1000, uploaded_rows: 1000, validated_rows: null, uploaded_bytes: 560, file_count: 2, retry_available: true, databricks_error_code: 'BAD_REQUEST', databricks_sql_state: 'DELTA_FAILED_TO_MERGE_FIELDS' }
+        return send(next)
+      }
+      if (pollNumber > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000; next.details.validated_rows = 1000; next.details.publication = { target: 'tech_dev.gold.ledger', row_count: 1000 } }
       if (next.kind === 'schema-evolution' && next.state === 'succeeded') {
         state.schemaPhysical = { ...devSchema, fields: clone(state.draft.columns.filter(item => !item.removed).map(item => item.field)) }
         if (state.currentOperation.details?.execution_strategy === 'recreate') { state.currentTableId = 'table-2'; next.details.destructive_started = true }
@@ -61,7 +74,11 @@ export function workflowFixture() {
     }
     if (path === '/api/local-datasets') return send({ items: [] })
     if (path === '/api/discover/catalogs') return send({ items: [catalog], cached_paths: [] })
-    if (path.endsWith('/children')) return send(page(path.includes('catalog-tech') ? [catalogSchema] : [{ ...table, id: state.rekey ? `${table.id}-refreshed` : table.id }]))
+    if (path.endsWith('/children')) {
+      if (path.includes('catalog-tech')) return send(page([catalogSchema]))
+      const items = [{ ...table, id: state.rekey ? `${table.id}-refreshed` : table.id }, ...Array.from({ length: state.extraTables }, (_, index) => ({ ...table, id: `fixture-table-${index}`, name: `fixture_table_${String(index).padStart(3, '0')}`, qualified_name: `tech.gold.fixture_table_${String(index).padStart(3, '0')}` }))]
+      return send(page(items))
+    }
     if (path.endsWith('/warehouses')) return send({ items: [{ id: 'wh-stopped', name: 'DEV SQL', state: 'STOPPED' }], message: null })
     if (path === '/api/discover/schema-compare') {
       const prod = state.schemaExtraProd ? { ...prodSchema, fields: [...prodSchema.fields, field('prod_amount', 'DECIMAL(18,2)')] } : prodSchema

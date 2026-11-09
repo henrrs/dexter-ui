@@ -2,10 +2,12 @@ import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { mkdir, writeFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
+import { freePorts } from './test-ports.mjs'
 
 export async function withBrowser(fixture, run) {
   await new Promise((resolve) => fixture.server.listen(0, '127.0.0.1', resolve))
-  const appUrl = `http://127.0.0.1:${Number(process.env.DEXTER_TEST_APP_PORT || 4179)}`, driverUrl = `http://127.0.0.1:${Number(process.env.DEXTER_TEST_DRIVER_PORT || 4448)}`
+  const [freeAppPort, freeDriverPort] = await freePorts(2)
+  const appUrl = `http://127.0.0.1:${Number(process.env.DEXTER_TEST_APP_PORT || freeAppPort)}`, driverUrl = `http://127.0.0.1:${Number(process.env.DEXTER_TEST_DRIVER_PORT || freeDriverPort)}`
   // Own Vite directly so cleanup cannot leave npm's child pointing to an expired fixture port.
   const vite = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(new URL(appUrl).port), '--strictPort'], { env: { ...process.env, DEXTER_PORT: String(fixture.server.address().port) }, stdio: 'ignore' })
   let driver, sessionId
@@ -53,7 +55,7 @@ export async function withBrowser(fixture, run) {
       if (viewport.width !== width || viewport.height !== height) await command(base + '/window/rect', { width: width + width - viewport.width, height: height + height - viewport.height })
     }
     const reset = async () => {
-      fixture.state.failure = null; fixture.state.currentOperation = null; fixture.state.reviewDrift = false; fixture.state.rekey = false
+      fixture.state.failure = null; fixture.state.currentOperation = null; fixture.state.reviewDrift = false; fixture.state.rekey = false; fixture.state.extraTables = 0; fixture.state.syntheticFailureAt = null
       await command(base + '/url', { url: appUrl })
       await execute('localStorage.clear()')
       await command(base + '/url', { url: appUrl })
@@ -72,7 +74,7 @@ export async function withBrowser(fixture, run) {
   } finally {
     if (sessionId) await command(`/session/${sessionId}`, undefined, 'DELETE').catch(() => undefined)
     try { vite.kill('SIGTERM') } catch { /* already stopped */ }
-    if (driver) try { driver.kill('SIGTERM') } catch { /* Snap may own the host process */ }
+    if (driver) try { driver.kill('SIGTERM'); driver.unref() } catch { /* Snap may own the host process */ }
     fixture.server.closeAllConnections(); await new Promise((resolve) => fixture.server.close(resolve))
   }
 }

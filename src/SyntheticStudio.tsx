@@ -11,6 +11,62 @@ type Props = { active?: boolean; node: DiscoverNode; sourceEnvironment: 'dev' | 
 type Environment = 'prod' | 'dev'
 type SchemaVersion = { schema: CanonicalSchema; rules: SyntheticRule[] }
 type Draft = { schemaBase?: Environment; versions?: Partial<Record<Environment, SchemaVersion>>; step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
+type ExecutionStage = { id: string; label: string; state: 'completed' | 'active' | 'pending' | 'failed' | 'skipped'; detail: string }
+
+function formatBytes(value: unknown): string {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '—'
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+}
+
+function syntheticExecutionStages(operation: Operation, fallbackTotal: number, destructive: boolean): ExecutionStage[] {
+  const details = operation.details ?? {}
+  const rawPhase = String(details.failed_phase ?? details.phase ?? 'queued').toLowerCase()
+  const total = Number(details.total_rows ?? fallbackTotal)
+  const generated = Number(details.generated_rows ?? 0)
+  const uploaded = Number(details.uploaded_rows ?? 0)
+  const validated = Number(details.validated_rows ?? (details.publication as Record<string, unknown> | undefined)?.row_count ?? 0)
+  const generation = [
+    { id: 'generation', label: 'Generation', detail: `${generated.toLocaleString()} / ${total.toLocaleString()} rows` },
+    { id: 'upload', label: 'Upload', detail: `${uploaded.toLocaleString()} / ${total.toLocaleString()} rows verified` },
+  ]
+  const rest = destructive ? [
+    { id: 'preflight', label: 'Final checks', detail: 'Checking the reviewed DEV destination' },
+    { id: 'drop', label: 'Replace table', detail: 'Applying the confirmed recreation' },
+    { id: 'create', label: 'Create table', detail: 'Using the reviewed schema' },
+    { id: 'materialization', label: 'Materialization', detail: 'Loading the verified files into DEV' },
+    { id: 'validation', label: 'Validation', detail: 'Checking the destination schema and row count' },
+  ] : [
+    { id: 'materialization', label: 'Materialization', detail: 'Loading the verified files into DEV' },
+    { id: 'validation', label: 'Validation', detail: 'Checking the destination schema and row count' },
+  ]
+  const definitions = [...generation, ...rest, { id: 'completed', label: 'Completed', detail: 'Snapshot is available in DEV' }]
+  const phaseStage: Record<string, string> = {
+    queued: 'generation', generation_upload: generated < total ? 'generation' : uploaded < total ? 'upload' : 'materialization',
+    generation: 'generation', upload: 'upload', preflight: 'preflight', drop: 'drop', create: 'create',
+    materialization: 'materialization', materialize: 'materialization', publication: 'materialization', publish: 'materialization',
+    validation: 'validation', validate: 'validation', completed: 'completed', complete: 'completed',
+  }
+  const inferredProgressStage = total > 0 && generated < total ? 'generation'
+    : total > 0 && uploaded < total ? 'upload'
+      : validated > 0 ? 'completed' : 'materialization'
+  const currentId = phaseStage[rawPhase] ?? inferredProgressStage
+  const currentIndex = Math.max(0, definitions.findIndex((stage) => stage.id === currentId))
+  const terminal = ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state)
+  return definitions.map((stage, index) => {
+    const countComplete = stage.id === 'generation' ? total > 0 && generated >= total
+      : stage.id === 'upload' ? total > 0 && uploaded >= total : false
+    const completed = operation.state === 'succeeded' || countComplete || index < currentIndex
+    const failed = ['failed', 'interrupted'].includes(operation.state) && index === currentIndex
+    const skipped = operation.state === 'cancelled' && index >= currentIndex
+    const active = !terminal && index === currentIndex
+    const state = failed ? 'failed' : completed ? 'completed' : skipped ? 'skipped' : active ? 'active' : 'pending'
+    const detail = stage.id === 'completed' && operation.state !== 'succeeded' ? 'Waiting for validation' : stage.detail
+    return { ...stage, state, detail }
+  })
+}
 
 function makeSchema(node: DiscoverNode): CanonicalSchema {
   return { qualified_name: node.qualified_name ?? node.name, complete: Boolean(node.columns?.length), constraints: [], technology_properties: {}, fields: (node.columns ?? []).map((column) => {
@@ -429,7 +485,7 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   }
   const navigateToStep = (target: number) => {
     setError(''); setNotice('')
-    if (target === 4) { if (operation) setStep(4); else setError('Review and approve a publication plan before Execution.'); return }
+    if (target === 4) { if (operation) setStep(4); else setError('Review the publication plan before starting execution.'); return }
     if (target <= step) { actionController.current?.abort(); setStep(target as Step); return }
     if (target === 3) { void reviewPlan(); return }
     if (target === 2) { const invalid = validateSchema(); if (invalid) { setError(invalid); return } }
@@ -487,6 +543,33 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   const cancelRun = async () => { if (!operation) return; try { setOperation(await api.cancelOperation(operation.id)); setNotice('Cancellation requested. The worker will stop at a safe checkpoint.') } catch (cause) { setError(cause instanceof Error ? cause.message : 'Cancellation could not be requested.') } }
   const resumeRun = async () => { if (!operation) return; try { setOperation(await api.retryOperation(operation.id)); setNotice('Recovery started from verified files in the saved manifest.') } catch (cause) { setError(cause instanceof Error ? cause.message : 'This run could not be resumed.') } }
   const displayedSchema = lockedSchema && schemaReference === 'prod' ? sourceSchemas.prod ?? schema : schema
+  const schemaChangeCount = review ? Object.values(review.schema_changes).reduce((total, values) => total + values.length, 0) : 0
+  const startLabel = strategy === 'drop_recreate' ? 'Recreate & Publish' : strategy === 'replace' ? 'Replace & Publish' : strategy === 'append' ? 'Generate & Append' : 'Generate & Publish'
+  const destructivePlan = review?.destructive_plan
+  const publicationBlock = review && (!review.publication_ready || review.permissions.state !== 'confirmed')
+    ? review.block_reason || review.permissions.message : ''
+  const publication = operation?.details?.publication as Record<string, unknown> | undefined
+  const generatedRows = Number(operation?.details?.generated_rows ?? 0)
+  const uploadedRows = Number(operation?.details?.uploaded_rows ?? 0)
+  const totalRows = Number(operation?.details?.total_rows ?? rowCount)
+  const validatedRowsRaw = operation?.details?.validated_rows ?? publication?.row_count
+  const validatedRows = validatedRowsRaw === undefined || validatedRowsRaw === null ? null : Number(validatedRowsRaw)
+  const failedPhase = String(operation?.details?.failed_phase ?? '')
+  const completedTransfer = Boolean(totalRows > 0 && generatedRows >= totalRows && uploadedRows >= totalRows)
+  const publicationFailedAfterUpload = Boolean(operation && ['failed', 'interrupted'].includes(operation.state)
+    && failedPhase === 'materialization'
+    && completedTransfer)
+  const validationFailedAfterMaterialization = Boolean(operation && ['failed', 'interrupted'].includes(operation.state)
+    && failedPhase === 'validation'
+    && completedTransfer)
+  const operationPhase = String(operation?.details?.failed_phase ?? operation?.details?.phase ?? 'queued')
+  const executionStages = operation ? syntheticExecutionStages(operation, rowCount, strategy === 'drop_recreate') : []
+  const failedStageLabel = executionStages.find((item) => item.state === 'failed')?.label
+  const currentStageLabel = operation?.state === 'succeeded' ? 'Completed'
+    : operation?.state === 'cancelled' ? 'Cancelled'
+      : operation?.state === 'failed' || operation?.state === 'interrupted' ? failedStageLabel ?? operationPhase.replaceAll('_', ' ')
+        : operationPhase === 'generation_upload' ? uploadedRows < generatedRows ? 'Upload' : 'Generation'
+          : operationPhase.replaceAll('_', ' ')
 
   return <section className="synthetic-studio" aria-label="Synthetic Data Studio">
     <header className="synthetic-header"><div><span className="eyebrow">PREPARE DEV · SYNTHETIC DATA</span><h2>Prepare DEV</h2><code>{node.qualified_name ?? node.name} · source {sourceEnvironment.toUpperCase()}</code></div><button className="button secondary small" onClick={onClose}><X size={13} /> Close</button></header>
@@ -547,61 +630,58 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
       <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(1)}><ArrowLeft size={13} /> Schema</button><div><button className="button secondary small" disabled={loading} onClick={() => void generatePreview()}>{busyAction === 'preview' ? <LoaderCircle size={13} className="spin" /> : <Sparkles size={13} />} {busyAction === 'preview' ? 'Generating preview…' : 'Preview ≤100 rows'}</button><button className="button primary small" disabled={loading} onClick={() => void reviewPlan()}>{busyAction === 'review' ? <><LoaderCircle size={13} className="spin" /> Checking publication…</> : 'Review Plan'} <ArrowRight size={13} /></button></div></footer>
     </section>}
 
-    {step === 3 && review && <section className="synthetic-panel"><h3>04 · Review Plan</h3><p>These details are re-read from the configured DEV profile immediately before the run begins.</p>
-      <div className="synthetic-review-grid"><article><span>Source schema</span><strong>{review.source.qualified_name}</strong><small>{review.source.environment.toUpperCase()} metadata only; no source records are read.</small></article><article><span>DEV destination</span><strong>{fullTarget}</strong><small>{review.target_exists ? `Existing ${review.target_storage_type} table` : 'New table'} · {review.strategy.replaceAll('_',' ')}</small></article><article><span>Generation plan</span><strong>{review.row_count.toLocaleString()} rows</strong><small>{review.schema.fields.length} columns · {locale} · seed {seed}</small></article><article><span>Storage</span><strong>{review.destination.storage_type === 'managed' ? 'Managed Delta' : 'External Delta'}</strong><small>{review.external_location?.url ?? 'Databricks managed storage'}</small></article></div>
-      <div className="synthetic-schema-diff"><strong>Schema change plan</strong>{Object.entries(review.schema_changes).map(([key, values]) => <span key={key}>{key}: {values.length ? values.join(', ') : 'none'}</span>)}</div>
-      <div className="synthetic-schema-diff"><strong>Publication plan</strong>{review.publication_plan.map((item, index) => <span key={`${item.stage}-${index}`}><b>{item.stage}</b> · {item.action}</span>)}</div>
-      <div className={`synthetic-runtime-note ${review.runtime.mechanism === 'systemd-user-cgroup-v2' ? 'confirmed' : 'degraded'}`}><strong>Worker resource policy · {review.runtime.mechanism}</strong><span>{review.runtime.memory_limit_message} Queue capacity {review.runtime.max_pending_files}; local staging cap {(review.runtime.staging_limit_bytes / 1024 / 1024).toFixed(0)} MiB.</span></div>
-      <div className={`synthetic-permission-note ${review.permissions.state}`}><strong>{review.permissions.state === 'confirmed' ? 'Permissions verified' : 'Publication blocked'}</strong><span>{review.permissions.message}</span>{review.permissions.state !== 'confirmed' && <button className="button secondary small" disabled={loading} onClick={() => void reviewPlan()}>Retry publication verification</button>}</div>
-      {review.warnings.filter((warning) => warning !== review.block_reason).map((warning) => <div className="synthetic-blocked-note" key={warning}>{warning}</div>)}
-      {review.block_reason && review.block_reason !== review.permissions.message && <div className="synthetic-blocked-note" role="alert">{review.block_reason}<button className="button secondary small" disabled={loading} onClick={() => void reviewPlan()}>Retry publication verification</button></div>}
-      {strategy === 'replace' && <div className="synthetic-destructive-confirm"><label><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand the existing DEV table rows will be replaced; its schema and properties will remain.</label></div>}
-      {strategy === 'drop_recreate' && review.destructive_plan && <section className="synthetic-destructive-review"><h4>Destructive preflight · {review.destructive_plan.status.replaceAll('_', ' ')}</h4><p>Plan {review.destructive_plan.plan_id} · {review.destructive_plan.eligibility}</p>
-        <div className="synthetic-schema-diff"><strong>Impact</strong><span>Remove: {review.destructive_plan.impacts.removed}</span><span>Recreate: {review.destructive_plan.impacts.recreated}</span><span>Preserved: {review.destructive_plan.impacts.preserved.join(', ') || 'none'}</span><span>Not preserved: {review.destructive_plan.impacts.not_preserved.join(', ') || 'none'}</span><span>New storage location: {review.destructive_plan.new_location ?? 'Managed storage'}</span></div>
-        <div className="synthetic-schema-diff"><strong>Planned DDL</strong><code>{review.destructive_plan.ddl.drop}</code>{review.destructive_plan.ddl.create ? <code>{review.destructive_plan.ddl.create}</code> : <span>Recreation SQL is unavailable until a safe External Location is selected.</span>}</div>
-        <div className="synthetic-schema-diff"><strong>Preflight checks</strong>{Object.entries(review.destructive_plan.validation).map(([key, result]) => <span key={key}>{result === true ? '✓' : result === false ? '○' : '◷'} {key.replaceAll('_', ' ')} · {String(result)}</span>)}</div>
-        {review.destructive_plan.detected_dependencies.map((dependency, index) => <span key={`${String(dependency.direction)}-${index}`}>{String(dependency.direction)} · {String(dependency.table_name ?? dependency.entity_type ?? 'known dependency')}</span>)}
-        {review.destructive_plan.risks.map((risk) => <div className="synthetic-blocked-note" key={risk}>{risk}</div>)}
-        {review.destructive_plan.block_reasons.map((reason) => <div className="synthetic-blocked-note" key={reason}>{reason}</div>)}
-        <div className="synthetic-destructive-confirm"><label><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand this action drops and recreates the existing DEV table after all generated files are uploaded and verified.</label><label>Type the physical target <code>{fullTarget}</code><input value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)} /></label><small>Confirmation is bound to this preflight plan and expires if table metadata or privileges change.</small></div>
+    {step === 3 && review && <section className="synthetic-panel"><h3>Review publication plan</h3>
+      <div className="synthetic-review-facts">
+        <div><span>Destination</span><strong>{fullTarget}</strong><small>{review.target_exists ? 'Existing DEV table' : 'New DEV table'} · {review.strategy.replaceAll('_', ' ')}</small></div>
+        <div><span>Data</span><strong>{review.row_count.toLocaleString()} records</strong><small>{review.schema.fields.length} columns · {locale}</small></div>
+        <div><span>Storage</span><strong>{review.destination.storage_type === 'managed' ? 'Managed Delta' : 'External Delta'}</strong><small>{review.destination.storage_type === 'external' ? review.external_location?.name ?? review.destination.external_location_name ?? 'Selected External Location' : 'Databricks managed storage'}</small></div>
+        <div><span>Schema</span><strong>{(lockedSchema ? review.target_schema?.qualified_name : review.source.qualified_name) ?? review.schema.qualified_name}</strong><small>{schemaChangeCount ? `${schemaChangeCount} schema change${schemaChangeCount === 1 ? '' : 's'}` : 'No schema changes'} · {review.schema.fields.length} columns</small></div>
+      </div>
+      {publicationBlock && <div className="synthetic-blocked-note" role="alert"><strong>Publication unavailable</strong><span>{publicationBlock}</span><button className="button secondary small" disabled={loading} onClick={() => void reviewPlan()}>Retry verification</button></div>}
+      {review.runtime.rss_guard_bytes && !review.runtime.memory_limit_bytes && <div className="synthetic-runtime-warning" role="alert"><strong>Worker memory limit is best-effort</strong><span>{review.runtime.memory_limit_message}</span></div>}
+      {strategy === 'replace' && <label className="synthetic-destructive-confirm"><span><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand this replaces the existing DEV rows; the table schema and properties remain.</span></label>}
+      {strategy === 'drop_recreate' && destructivePlan && <section className="synthetic-destructive-review"><div><h4>Recreate DEV table</h4><p>{fullTarget} will be replaced with an empty table using the reviewed schema.</p></div>
+        <div className="synthetic-recreate-impact"><strong>Impact</strong><span>All existing rows will be discarded. Table history, grants, ownership, properties and dependencies may be affected.</span></div>
+        <div className="synthetic-recreate-facts"><span>Result<strong>{review.schema.fields.length} reviewed columns · 0 rows</strong></span><span>Storage<strong>{review.destination.storage_type === 'managed' ? 'Managed' : 'External'}</strong></span></div>
+        <label className="synthetic-destructive-confirm"><span><input type="checkbox" checked={confirmDestructive} onChange={(event) => setConfirmDestructive(event.target.checked)} /> I understand this will replace the DEV table and discard its existing rows.</span>
+          <span className="synthetic-confirm-target">Type <code>{fullTarget}</code> to confirm<input aria-label={`Type ${fullTarget} to confirm`} value={typedConfirmation} onChange={(event) => setTypedConfirmation(event.target.value)} /></span>
+        </label>
       </section>}
-      {review.publication_ready && review.permissions.state === 'confirmed' && ['replace', 'drop_recreate'].includes(strategy) && !confirmDestructive && <p className="workflow-field-hint">Confirm the impact above to enable Approve &amp; Start.</p>}
-      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(2)}><ArrowLeft size={13} /> Edit plan</button><button className="button primary small" disabled={loading || !review.publication_ready || review.permissions.state !== 'confirmed' || (strategy === 'replace' && !confirmDestructive) || (strategy === 'drop_recreate' && (!confirmDestructive || typedConfirmation !== fullTarget))} onClick={() => void startRun()}>{loading ? <LoaderCircle size={13} className="spin" /> : null} Approve &amp; Start <ArrowRight size={13} /></button></footer>
+      <details className="synthetic-technical-details"><summary>Execution details</summary>
+        <section><h4>Publication steps</h4><ol>{review.publication_plan.map((item, index) => <li key={`${item.stage}-${index}`}>{item.action}</li>)}</ol></section>
+        <section><h4>Resource limits</h4><p>{review.runtime.mechanism} · {review.runtime.memory_limit_message}</p><p>Queue capacity {review.runtime.max_pending_files} · local staging limit {formatBytes(review.runtime.staging_limit_bytes)}</p></section>
+        <section><h4>Verification</h4><p>{review.permissions.message}</p>{review.warnings.filter((warning) => warning !== review.block_reason).map((warning) => <p key={warning}>{warning}</p>)}</section>
+        {destructivePlan && <section><h4>Recreation diagnostics</h4><p>Review {destructivePlan.plan_id} · {destructivePlan.status.replaceAll('_', ' ')} · {destructivePlan.eligibility}</p><p>Preserved: {destructivePlan.impacts.preserved.join(', ') || 'none'}</p><p>Not preserved: {destructivePlan.impacts.not_preserved.join(', ') || 'none'}</p><p>New storage path: {destructivePlan.new_location ?? 'Managed storage'}</p>
+          <details><summary>Planned SQL</summary><code>{destructivePlan.ddl.drop}</code>{destructivePlan.ddl.create && <code>{destructivePlan.ddl.create}</code>}</details>
+          <details><summary>Preflight checks</summary><ul>{Object.entries(destructivePlan.validation).map(([key, result]) => <li key={key}>{result === true ? 'Confirmed' : result === false ? 'Not confirmed' : 'Unavailable'} · {key.replaceAll('_', ' ')}</li>)}</ul></details>
+          {destructivePlan.detected_dependencies.length > 0 && <ul>{destructivePlan.detected_dependencies.map((dependency, index) => <li key={`${String(dependency.direction)}-${index}`}>{String(dependency.direction)} · {String(dependency.table_name ?? dependency.entity_type ?? 'known dependency')}</li>)}</ul>}
+          {[...destructivePlan.risks, ...destructivePlan.block_reasons].map((item) => <p key={item}>{item}</p>)}
+        </section>}
+      </details>
+      <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(2)}><ArrowLeft size={13} /> Edit plan</button><button className="button primary small" disabled={loading || !review.publication_ready || review.permissions.state !== 'confirmed' || (strategy === 'replace' && !confirmDestructive) || (strategy === 'drop_recreate' && (!confirmDestructive || typedConfirmation !== fullTarget))} title={!review.publication_ready ? publicationBlock || 'Publication review is not ready.' : strategy === 'drop_recreate' && (!confirmDestructive || typedConfirmation !== fullTarget) ? 'Confirm the destructive impact and type the destination.' : undefined} onClick={() => void startRun()}>{loading ? <LoaderCircle size={13} className="spin" /> : null} {startLabel} <ArrowRight size={13} /></button></footer>
     </section>}
 
-    {step === 4 && operation && <section className="synthetic-panel synthetic-execution"><h3>05 · Execution · {operation.state.toUpperCase()}</h3><p>{operation.message}</p><div className="operation-progress-track"><span style={{ width: `${operation.progress}%` }} /></div><strong>{operation.progress}% · {operation.details?.phase ?? 'queued'}</strong>
-      <div className="synthetic-stage-status">{(() => {
-        const phase = String(operation.details?.phase ?? 'queued')
-        const total = Number(operation.details?.total_rows ?? rowCount)
-        const generated = Number(operation.details?.generated_rows ?? 0)
-        const uploaded = Number(operation.details?.uploaded_rows ?? 0)
-        const destructive = strategy === 'drop_recreate'
-        const stages = destructive ? [
-          { id: 'generation', label: 'Generation', done: generated >= total, active: phase === 'generation_upload' && generated < total, detail: `${generated.toLocaleString()} / ${total.toLocaleString()} rows` },
-          { id: 'upload', label: 'Upload', done: uploaded >= total && total > 0, active: phase === 'generation_upload' && uploaded < generated, detail: `${uploaded.toLocaleString()} / ${total.toLocaleString()} rows · checksums verified` },
-          { id: 'preflight', label: 'Final preflight', done: ['drop','create','materialization','validation','completed'].includes(phase), active: phase === 'preflight', detail: 'Rechecking identity, grants, lineage, and empty location' },
-          { id: 'drop', label: 'Drop', done: ['create','materialization','validation','completed'].includes(phase), active: phase === 'drop', detail: String(operation.details?.destructive_state ?? 'Waiting') },
-          { id: 'create', label: 'Create', done: ['materialization','validation','completed'].includes(phase), active: phase === 'create', detail: String(operation.details?.destructive_state ?? 'Waiting') },
-          { id: 'materialization', label: 'Materialization', done: ['validation','completed'].includes(phase), active: phase === 'materialization', detail: 'Loading verified Parquet into DEV' },
-          { id: 'validation', label: 'Validation', done: phase === 'completed', active: phase === 'validation', detail: phase === 'completed' ? `${Number(operation.details?.validated_rows ?? 0).toLocaleString()} rows confirmed` : 'Checking schema and row count' },
-        ] : [
-          { id: 'generation', label: 'Generation', done: generated >= total, active: phase === 'generation_upload' && generated < total, detail: `${generated.toLocaleString()} / ${total.toLocaleString()} rows` },
-          { id: 'upload', label: 'Upload', done: uploaded >= total && total > 0, active: phase === 'generation_upload' && uploaded < generated, detail: `${uploaded.toLocaleString()} / ${total.toLocaleString()} rows` },
-          { id: 'materialization', label: 'Materialization', done: ['validation','completed'].includes(phase), active: phase === 'materialization', detail: String(operation.details?.statement_state ?? (phase === 'materialization' ? 'Submitting to DEV' : 'Waiting')) },
-          { id: 'validation', label: 'Validation', done: phase === 'completed', active: phase === 'validation', detail: phase === 'completed' ? `${Number(operation.details?.validated_rows ?? 0).toLocaleString()} rows confirmed` : phase === 'validation' ? 'Checking DEV schema and count' : 'Waiting' },
-          { id: 'completed', label: 'Completed', done: operation.state === 'succeeded', active: false, detail: operation.state === 'succeeded' ? 'Snapshot available in DEV' : 'Waiting' },
-        ]
-        return stages.map((item) => <div className={operation.state === 'failed' && phase !== 'completed' && !item.done && !item.active ? 'failed' : item.done ? 'done' : item.active ? 'active' : ''} key={item.id}><span>{item.done ? <Check size={13} /> : item.active ? <LoaderCircle size={13} className="spin" /> : operation.state === 'failed' && phase !== 'completed' ? '!' : '○'}</span><strong>{item.label}<small>{item.detail}</small></strong></div>)
-      })()}</div>
-      <div className="synthetic-metrics"><span>Rows generated <strong>{Number(operation.details?.generated_rows ?? 0).toLocaleString()}</strong></span><span>Rows uploaded <strong>{Number(operation.details?.uploaded_rows ?? 0).toLocaleString()}</strong></span><span>Files <strong>{run?.chunks.length ?? operation.details?.file_count ?? 0}</strong></span><span>Uploaded data <strong>{(Number(operation.details?.uploaded_bytes ?? 0)/1024/1024).toFixed(1)} MiB</strong></span><span>Local staging <strong>{(Number(operation.details?.staging_bytes ?? 0)/1024/1024).toFixed(1)} MiB</strong></span><span>Worker RSS <strong>{operation.details?.local_rss_bytes ? `${(Number(operation.details.local_rss_bytes)/1024/1024).toFixed(1)} MiB` : 'Unavailable'}</strong></span><span>Warehouse <strong>{warehouses.find((item) => item.id === destination.warehouse_id)?.name ?? 'Selected DEV warehouse'}</strong></span></div>
-      {operation.error_message && <div className="discover-error" role="alert">{operation.error_message}{operation.details?.failed_phase && <small>Stage: {String(operation.details.failed_phase).replaceAll('_', ' ')}</small>}{operation.details?.databricks_error_code && <small>Databricks error: {String(operation.details.databricks_error_code)}{operation.details.databricks_sql_state ? ` · SQLSTATE ${String(operation.details.databricks_sql_state)}` : ''}</small>}{Boolean(operation.details?.reconciliation_required) && <p>Destructive execution started. Automatic retry is disabled; inspect the current DEV table and reconcile the recorded run before any new publication.</p>}</div>}
+    {step === 4 && operation && <section className="synthetic-panel synthetic-execution">
+      <h3>{operation.state === 'succeeded' ? 'Synthetic data published successfully' : publicationFailedAfterUpload ? 'Generation completed. Publication failed.' : validationFailedAfterMaterialization ? 'Data published. Final validation failed.' : operation.state === 'failed' || operation.state === 'interrupted' ? 'Execution stopped' : operation.state === 'cancelled' ? 'Execution cancelled' : 'Generating and publishing data'}</h3>
+      {publicationFailedAfterUpload ? <p>{generatedRows.toLocaleString()} records were generated and uploaded, but they were not materialized in DEV.</p> : validationFailedAfterMaterialization ? <p>{uploadedRows.toLocaleString()} records were uploaded and materialized in DEV, but final validation was not confirmed.</p> : <p>{operation.message}</p>}
+      <div className="synthetic-progress-heading"><span>{operation.progress}% complete</span><span>Current stage · {currentStageLabel}</span></div>
+      <div className="operation-progress-track" role="progressbar" aria-label="Synthetic data progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={operation.progress}><span style={{ width: `${operation.progress}%` }} /></div>
+      <div className="synthetic-stage-status">{executionStages.map((item) => <div className={item.state} key={item.id}><span aria-hidden="true">{item.state === 'completed' ? <Check size={13} /> : item.state === 'active' ? <LoaderCircle size={13} className="spin" /> : item.state === 'failed' ? '!' : item.state === 'skipped' ? '–' : '·'}</span><strong>{item.label}<small>{item.detail}</small></strong><em>{item.state === 'completed' ? 'Completed' : item.state === 'active' ? 'Running' : item.state === 'failed' ? 'Failed' : item.state === 'skipped' ? 'Skipped' : 'Pending'}</em></div>)}</div>
+      <div className="synthetic-metrics"><span>Rows generated<strong>{generatedRows.toLocaleString()}</strong></span><span>Rows published / validated<strong>{validatedRows === null || !Number.isFinite(validatedRows) ? '—' : validatedRows.toLocaleString()}</strong></span><span>Current stage<strong>{currentStageLabel}</strong></span></div>
+      {operation.state === 'failed' || operation.state === 'interrupted' ? <div className="synthetic-failure" role="alert"><strong>{publicationFailedAfterUpload ? 'Materialization failed' : validationFailedAfterMaterialization ? 'Final validation failed' : `Failed during ${failedPhase || operationPhase}`}</strong><span>{operation.error_message ?? operation.message}</span>{Boolean(operation.details?.reconciliation_required) && <span>Reconcile the current DEV table before starting another publication.</span>}</div> : null}
       {Boolean(operation.details?.reconciliation_required) && strategy === 'drop_recreate' && <div className="synthetic-destructive-confirm"><strong>Reconcile current DEV state</strong><p>Dexter will check that the prior DROP statement is terminal and that the destination is either absent or still the unchanged original table. It will not resume the old publication.</p><label>Type {fullTarget}<input value={reconcileConfirmation} onChange={(event) => setReconcileConfirmation(event.target.value)} /></label><button className="button secondary small" disabled={loading || reconcileConfirmation !== fullTarget} onClick={() => void reconcileRun()}>Verify and release retry lock</button></div>}
-      {logs.length > 0 && <details className="synthetic-log-details"><summary>Execution log · {logs.length} entries</summary><ol>{logs.map((item, index) => <li key={`${item.created_at}-${index}`}><time>{new Date(item.created_at).toLocaleTimeString()}</time><span>{item.message}</span></li>)}</ol></details>}
-      {operation.state === 'succeeded' && <div className="synthetic-complete"><Check size={17} /><span><strong>DEV snapshot validated</strong>{operation.details?.publication && ` · ${Number((operation.details.publication as Record<string, unknown>).row_count ?? 0).toLocaleString()} rows in ${String((operation.details.publication as Record<string, unknown>).target ?? fullTarget)}`}</span><div><button className="button secondary small" onClick={() => onOpenTable?.(review?.destination ?? request.destination)}>Open Table</button><button className="button secondary small" onClick={() => onCompare?.(review?.destination ?? request.destination)}>Compare Tables</button></div></div>}
+      {operation.state === 'succeeded' && <div className="synthetic-complete"><Check size={17} /><span><strong>{Number(validatedRows ?? 0).toLocaleString()} records published and validated</strong><small>{String(publication?.target ?? fullTarget)}</small></span><div><button className="button secondary small" onClick={() => onOpenTable?.(review?.destination ?? request.destination)}>Open Table</button>{onCompare && <button className="button secondary small" onClick={() => onCompare?.(review?.destination ?? request.destination)}>Compare DEV × PROD</button>}</div></div>}
+      {['failed','interrupted'].includes(operation.state) && operation.details?.retry_available && <div className="synthetic-recovery"><div><strong>Resume Execution</strong><span>Continue using files already uploaded.</span></div><button className="button secondary small" onClick={() => void resumeRun()}><RefreshCw size={12} /> Resume Execution</button></div>}
       {Boolean(operation.details?.reconciled_state) && <button className="button secondary small" onClick={() => { setOperation(null); setRun(null); setReview(null); setStep(0); setConfirmDestructive(false); setTypedConfirmation('') }}>Start a new reviewed publication</button>}
       {['queued','running'].includes(operation.state) && !operation.details?.destructive_started && <button className="button secondary small" onClick={() => void cancelRun()}>Cancel safely</button>}
-      {['failed','interrupted'].includes(operation.state) && operation.details?.retry_available && <button className="button secondary small" onClick={() => void resumeRun()}><RefreshCw size={12} /> Resume from manifest</button>}
-      <footer className="synthetic-actions"><small>{operation.details?.memory_limit_bytes ? 'OS cgroup limit active · 256 MiB aggregate worker budget' : operation.details?.rss_guard_bytes ? `RSS guard · ${(Number(operation.details.rss_guard_bytes)/1024/1024).toFixed(0)} MiB; hard ceiling not guaranteed` : 'Resource policy not reported'}</small>{operation.state === 'succeeded' && <button className="button primary small" onClick={onClose}>Finish</button>}</footer>
+      <details className="synthetic-technical-details"><summary>Execution details</summary>
+        <section><h4>Transfer and resources</h4><dl className="synthetic-technical-metrics"><div><dt>Rows uploaded</dt><dd>{uploadedRows.toLocaleString()}</dd></div><div><dt>Files</dt><dd>{run?.chunks.length ?? operation.details?.file_count ?? '—'}</dd></div><div><dt>Uploaded data</dt><dd>{formatBytes(operation.details?.uploaded_bytes)}</dd></div><div><dt>Local staging</dt><dd>{formatBytes(operation.details?.staging_bytes)}</dd></div><div><dt>Worker memory</dt><dd>{formatBytes(operation.details?.local_rss_bytes)}</dd></div><div><dt>SQL warehouse</dt><dd>{warehouses.find((item) => item.id === destination.warehouse_id)?.name ?? 'Selected DEV warehouse'}</dd></div></dl>
+          <p>{operation.details?.memory_limit_bytes ? 'An operating-system memory limit was applied.' : operation.details?.rss_guard_bytes ? `A ${formatBytes(operation.details.rss_guard_bytes)} process memory guard was used; this is not a hard operating-system limit.` : 'Resource policy was not reported.'}</p>
+        </section>
+        {Boolean(operation.details?.databricks_error_code || operation.details?.failed_phase || operation.details?.databricks_sql_state) && <section><h4>Failure diagnostics</h4><p>Stage: {String(operation.details?.failed_phase ?? operation.details?.phase ?? 'unknown').replaceAll('_', ' ')}</p>{Boolean(operation.details?.databricks_error_code) && <p>Databricks: {String(operation.details?.databricks_error_code)}{operation.details?.databricks_sql_state ? ` · SQLSTATE ${String(operation.details?.databricks_sql_state)}` : ''}</p>}</section>}
+        {logs.length > 0 && <details className="synthetic-log-details"><summary>Execution log · {logs.length} entries</summary><ol>{logs.map((item, index) => <li key={`${item.created_at}-${index}`}><time>{new Date(item.created_at).toLocaleTimeString()}</time><span>{item.message}</span></li>)}</ol></details>}
+      </details>
+      <footer className="synthetic-actions">{operation.state === 'succeeded' && <button className="button primary small" onClick={onClose}>Finish</button>}</footer>
     </section>}
 
   </section>

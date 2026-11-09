@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "test:ui": "node --test --test-concurrency=1 scripts/ui-navigation.test.mjs scripts/workflow-navigation.test.mjs",
+    "test:ui": "node --test --test-force-exit --test-concurrency=1 scripts/ui-navigation.test.mjs scripts/workflow-navigation.test.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

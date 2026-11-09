@@ -34,5 +34,5 @@ export type Operation = {
   cancel_requested: boolean
   created_at: string
   updated_at: string
-  details?: { [key: string]: unknown; phase?: string; rows?: number; bytes?: number; files?: number; total_chunks?: number; environment?: string; qualified_name?: string; synthetic_run_id?: string; generated_rows?: number; uploaded_rows?: number; file_count?: number; staging_bytes?: number; local_rss_bytes?: number | null; memory_limit_bytes?: number | null; rss_guard_bytes?: number | null; retry_available?: boolean; resume_available?: boolean; publication?: Record<string, unknown>; materialization_request?: { catalog?: string; schema?: string; table?: string } }
+  details?: { [key: string]: unknown; phase?: string; rows?: number; bytes?: number; files?: number; total_chunks?: number; environment?: string; qualified_name?: string; synthetic_run_id?: string; generated_rows?: number; uploaded_rows?: number; file_count?: number; staging_bytes?: number; local_rss_bytes?: number | null; memory_limit_bytes?: number | null; rss_guard_bytes?: number | null; retry_available?: boolean; resume_available?: boolean; publication?: Record<string, unknown>; materialization_request?: { catalog?: string; schema?: string; table?: string; environment?: string } }
 }

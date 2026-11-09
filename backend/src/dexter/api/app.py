@@ -1981,10 +1981,15 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         operation = operations.create("synthetic-data", "Synthetic data run queued")
         worker_id = uuid.uuid4().hex
         repository.create(run_id, operation["id"], plan.to_dict(), reviewed["destination"], review=reviewed)
+        synthetic_destination = reviewed["destination"]
+        synthetic_qualified_name = ".".join(str(synthetic_destination.get(key) or "")
+                                             for key in ("catalog", "schema", "table")).strip(".")
         operations.update_details(operation["id"], synthetic_run_id=run_id, plan_digest=body.plan_digest,
                                   review_id=body.review_id,
                                   source=reviewed["source"], runtime_capability=capability.mechanism,
-                                  retry_available=True, phase="queued")
+                                  qualified_name=synthetic_qualified_name, environment="dev",
+                                  destination_strategy=synthetic_destination.get("strategy"),
+                                  total_rows=body.row_count, retry_available=True, phase="queued")
         if not operations.acquire_worker_lease(operation["id"], worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS):
             raise HTTPException(409, detail="The synthetic worker could not claim the queued operation")
         try:
@@ -2410,7 +2415,23 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     @app.get("/api/operations")
     def list_operations(limit: int = 50):
-        return operations.list(limit)
+        items = operations.list(limit)
+        from dexter.services.synthetic_runs import SyntheticRunRepository
+        synthetic_runs = SyntheticRunRepository(paths.database)
+        for item in items:
+            details = item.get("details") or {}
+            run_id = details.get("synthetic_run_id")
+            if item.get("kind") != "synthetic-data" or details.get("qualified_name") or not isinstance(run_id, str):
+                continue
+            run = synthetic_runs.get(run_id)
+            destination = (run or {}).get("destination") or {}
+            qualified_name = ".".join(str(destination.get(key) or "") for key in ("catalog", "schema", "table")).strip(".")
+            if qualified_name:
+                details["qualified_name"] = qualified_name
+                details["environment"] = "dev"
+                details["total_rows"] = (run or {}).get("plan", {}).get("row_count")
+                item["details"] = details
+        return items
 
     @app.get("/api/operations/{operation_id}")
     def get_operation(operation_id: str):

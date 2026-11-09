@@ -2,11 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
-
-const appPort = Number(process.env.DEXTER_TEST_NAV_PORT || 4178)
-const driverPort = Number(process.env.DEXTER_TEST_DRIVER_PORT || 4448)
-const appUrl = `http://127.0.0.1:${appPort}`
-const driverUrl = `http://127.0.0.1:${driverPort}`
+import { freePorts } from './test-ports.mjs'
 
 async function waitFor(url, child, timeout = 20000) {
   const end = Date.now() + timeout
@@ -26,7 +22,12 @@ async function command(url, method, body) {
 }
 
 test('Firefox navigates into Discover and collapses/reopens the Explorer', { timeout: 90000 }, async () => {
-  const vite = spawn('npm', ['run', 'dev', '--', '--host', '127.0.0.1', '--port', String(appPort), '--strictPort'], { stdio: 'ignore' })
+  const [freeAppPort, freeDriverPort] = await freePorts(2)
+  const appPort = Number(process.env.DEXTER_TEST_NAV_PORT || freeAppPort)
+  const driverPort = Number(process.env.DEXTER_TEST_DRIVER_PORT || freeDriverPort)
+  const appUrl = `http://127.0.0.1:${appPort}`
+  const driverUrl = `http://127.0.0.1:${driverPort}`
+  const vite = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(appPort), '--strictPort'], { stdio: 'ignore' })
   let driver = null
   try { const status = await fetch(`${driverUrl}/status`); if (!status.ok) throw new Error('geckodriver unavailable') }
   catch { driver = spawn('geckodriver', ['--host', '127.0.0.1', '--port', String(driverPort)], { stdio: 'ignore' }) }
@@ -60,6 +61,6 @@ test('Firefox navigates into Discover and collapses/reopens the Explorer', { tim
   } finally {
     if (sessionId) await fetch(`${driverUrl}/session/${sessionId}`, { method: 'DELETE' }).catch(() => undefined)
     try { vite.kill('SIGTERM') } catch { /* process already exited */ }
-    if (driver) { try { driver.kill('SIGTERM') } catch { /* Snap may own the geckodriver host process */ } }
+    if (driver) { try { driver.kill('SIGTERM'); driver.unref() } catch { /* Snap may own the geckodriver host process */ } }
   }
 })
