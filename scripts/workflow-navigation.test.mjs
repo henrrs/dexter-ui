@@ -20,6 +20,7 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
       await click('button[aria-label="Expand gold"]'); await wait(`return !!document.querySelector('.discover-tree button[title^="PROD"]')`)
       await click('.discover-tree button[title^="PROD"]')
       await wait(`return !!document.querySelector('.workbench-variant .active') && document.querySelector('.workbench-variant .active').textContent.includes('PROD') && !!document.querySelector('.operation-card:not([disabled]) strong')`)
+      await wait(`return document.querySelector('#ask-dexter-panel .ask-context-summary')?.textContent.includes('ledger · PROD')`)
       await wait(`return [...document.querySelectorAll('.operation-card')].some(b => b.querySelector('strong')?.textContent === 'Generate Synthetic Data' && !b.disabled)`)
     }
     const waitTarget = () => wait(`return document.querySelector(arguments[0] + ' .workflow-verification')?.dataset.state === 'present'`, synthetic)
@@ -251,7 +252,7 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-review-facts')`, synthetic); await capture('synthetic-04-review')
         await clickText('ledger', '.workbench-tabs'); await clickText('Synthetic · ledger', '.workbench-tabs')
         await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-review-facts')`, synthetic)
-        assert.match(await execute('return document.querySelector(".context-panel").textContent'), /Prepare DEV[\s\S]*Review/)
+        assert.match(await execute('return document.querySelector("#ask-dexter-panel .ask-context-summary").textContent'), /ledger.*PROD/)
         await clickText('Destination', `${synthetic} .synthetic-step-strip`)
         await set(`${synthetic} select[aria-label="Publication strategy"]`, 'append')
         await clickText('Schema', `${synthetic} .synthetic-panel`); await clickText('Generation Rules', `${synthetic} footer`); await clickText('Review Plan', synthetic)

@@ -6,6 +6,8 @@ import type { CanonicalSchema, DiscoverNode, DiscoverPage, SchemaCompareResult }
 import type { Operation } from './types'
 import { SyntheticStudio } from './SyntheticStudio'
 import { SchemaEvolutionStudio } from './SchemaEvolutionStudio'
+import { workspaceContextProviders } from './askDexter/context'
+import type { WorkspaceContextTab } from './askDexter/context'
 
 type PageState = { items: DiscoverNode[]; stale: boolean; error: string | null }
 type PersistedExplorerState = { loadedPaths: string[]; expandedPaths: string[] }
@@ -68,6 +70,43 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
   const [previewing, setPreviewing] = useState(false)
   const [lineage, setLineage] = useState<LineageResult | null>(null)
   const [lineageLoading, setLineageLoading] = useState(false)
+
+  const workspaceContextTabs = useMemo<WorkspaceContextTab[]>(() => workbenchTabs.map((tab) => {
+    const columns = (tab.node.columns ?? []).slice(0, 100).map((column) => ({ name: column.name, type: String(column.type_text ?? column.type ?? column.type_name ?? '') }))
+    const environment = (tab.queryEnvironment ?? tab.environment).toUpperCase()
+    const base = {
+      tab_id: tab.key,
+      title: tab.view === 'local-query' ? `${tab.node.name} · Query` : tab.view === 'compare' ? `${tab.node.name} · Compare Tables` : tab.view === 'schema-evolution' ? `${tab.node.name} · Schema Evolution` : tab.view === 'synthetic' ? `${tab.node.name} · Synthetic Data` : tab.node.name,
+      environment,
+      resource: tab.node.qualified_name ?? tab.node.name,
+      columns,
+      state: tab.node.access === 'restricted' ? 'access_restricted' : tab.node.access === 'read' ? 'readable' : 'metadata_only',
+    }
+    if (tab.view === 'local-query') {
+      const isActiveQuery = tab.key === activeTabKey
+      return workspaceContextProviders.build({ ...base, type: 'query_workbench', step: 'query',
+        environment: (isActiveQuery ? queryEnvironment : tab.queryEnvironment ?? tab.environment).toUpperCase(),
+        summary: { engine: (isActiveQuery ? queryEnvironment : tab.queryEnvironment) === 'local' ? 'DuckDB' : 'Databricks SQL', status: isActiveQuery ? queryExecution?.state ?? 'ready' : 'ready' },
+        ...(isActiveQuery && localSql.trim() ? { sql: localSql.slice(0, 4000) } : {}) })
+    }
+    if (tab.view === 'compare') {
+      const comparison = tab.comparison
+      const result = comparison?.result
+      return workspaceContextProviders.build({ ...base, type: 'compare_tables', step: 'schema_comparison',
+        summary: { state: comparison?.error ? 'error' : result?.state ?? (comparison?.loading ? 'loading' : 'metadata_unavailable'), ...(result?.summary ?? {}) },
+        columns: result?.differences.slice(0, 100).map((field) => ({ name: field.name, type: [field.prod?.original_type, field.dev?.original_type].filter(Boolean).join(' ↔ ') })) ?? columns })
+    }
+    if (tab.view === 'schema-evolution') return workspaceContextProviders.build({ ...base, type: 'schema_evolution', step: 'edit_schema', summary: { pending_changes: 0, state: 'workspace_tab_open' } })
+    if (tab.view === 'synthetic') return workspaceContextProviders.build({ ...base, type: 'synthetic_data', step: 'destination', summary: { source_environment: tab.environment.toUpperCase(), state: 'workspace_tab_open', ...(tab.syntheticComparison?.summary ?? {}) } })
+    return workspaceContextProviders.build({ ...base, type: 'table_workbench', step: tab.key === activeTabKey ? activeSection : 'overview', summary: { availability_local: tab.node.availability?.local ?? 'unknown', availability_dev: tab.node.availability?.dev ?? 'unknown', availability_prod: tab.node.availability?.prod ?? 'unknown', local_snapshot: Boolean(tab.node.variants?.some((variant) => variant.environment === 'local' && variant.dataset_id)) } })
+  }), [workbenchTabs, activeTabKey, activeSection, queryEnvironment, queryExecution?.state, localSql])
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('dexter:workspace-tabs', { detail: {
+      active_tab_id: active ? activeTabKey : null,
+      tabs: workspaceContextTabs,
+    } }))
+  }, [active, activeTabKey, workspaceContextTabs])
 
   const warehouseEnvironment: 'dev' | 'prod' | null = activeSection === 'query'
     ? makeLocalOpen ? 'prod' : queryEnvironment === 'local' ? null : queryEnvironment
@@ -348,7 +387,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     try {
       const detail = await api.discoverCatalogDetail(node.id, preferred)
       if (requestId !== selectionRequestSequence.current) return
-      setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
+      const hydrated = { ...detail, id: node.id, availability: node.availability, variants: node.variants }
+      setSelected(hydrated)
+      setWorkbenchTabs((items) => items.map((item) => item.key === tab.key ? { ...item, node: hydrated } : item))
       setSelectedColumns((detail.columns ?? []).map((column) => column.name))
     }
     catch { /* Keep the list metadata visible when a detail endpoint is unavailable. */ }
@@ -387,7 +428,9 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { name: node.name, qualifiedName: node.qualified_name ?? node.name, environment: 'local' } }))
     try {
       const detail = await api.discoverCatalogDetail(node.id, 'local')
-      setSelected({ ...detail, id: node.id, availability: node.availability, variants: node.variants })
+      const hydrated = { ...detail, id: node.id, availability: node.availability, variants: node.variants }
+      setSelected(hydrated)
+      setWorkbenchTabs((items) => items.map((item) => item.key === key ? { ...item, node: hydrated } : item))
       setSelectedColumns((detail.columns ?? []).map((column) => column.name))
     } catch { /* Keep the available local asset in the query workspace. */ }
   }
@@ -677,6 +720,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const compareSide = comparison.compareEnvironment === 'prod' ? comparison.result?.sides.prod : comparison.result?.sides.dev
     window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: {
       kind: 'comparison', name: `${referenceNode.name} comparison`, qualifiedName: `${referenceName} → ${compareName}`,
+      tab_id: activeCompareTab.key,
       environment: `${comparison.referenceEnvironment.toUpperCase()} → ${comparison.compareEnvironment.toUpperCase()}`,
       reference: { name: referenceName, environment: comparison.referenceEnvironment },
       compareAgainst: { name: compareName, environment: comparison.compareEnvironment },
@@ -740,7 +784,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     const tab: WorkbenchTab = { key, node: targetNode, environment: 'dev', view: 'schema-evolution', schemaReference: schemaReference ?? previous?.schemaReference ?? null }
     setWorkbenchTabs((items) => items.some((item) => item.key === key) ? items.map((item) => item.key === key ? tab : item) : [...items, tab])
     setSelected(targetNode); setActiveEnvironment('dev'); setActiveTabKey(key); setActiveSection('schema-evolution')
-    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { kind: 'table', name: targetNode.name, qualifiedName: variantQualifiedName(variant) ?? targetNode.qualified_name, environment: 'DEV' } }))
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { kind: 'table', tab_id: key, name: targetNode.name, qualifiedName: variantQualifiedName(variant) ?? targetNode.qualified_name, environment: 'DEV' } }))
   }
   const openSynthetic = (sourceEnvironment: 'dev' | 'prod' = activeEnvironment === 'prod' ? 'prod' : 'dev', comparisonContext?: { summary?: Record<string, number>; state?: string }, sourceNode?: DiscoverNode) => {
     const targetNode = sourceNode ?? selected
@@ -754,7 +798,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     setSelected(targetNode)
     setActiveTabKey(key)
     setActiveSection('synthetic')
-    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { kind: 'table', name: targetNode.name, qualifiedName: targetNode.qualified_name, environment: sourceEnvironment.toUpperCase() } }))
+    window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: { kind: 'table', tab_id: key, name: targetNode.name, qualifiedName: targetNode.qualified_name, environment: sourceEnvironment.toUpperCase() } }))
   }
   const changeCompareObject = (key: string, nodeId: string) => {
     const tab = workbenchTabs.find((item) => item.key === key && item.view === 'compare')
@@ -903,14 +947,14 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
         </div>
       })}</div></div>}
       <div className="workspace-scroll discover-workspace-scroll"><section className="discover-details">{workbenchTabs.filter((tab) => tab.view === 'schema-evolution' || tab.view === 'synthetic').map((tab) => <div key={tab.key} hidden={activeTabKey !== tab.key} data-workflow-tab={tab.key}>
-        {tab.view === 'schema-evolution' ? <SchemaEvolutionStudio active={active && activeTabKey === tab.key} node={tab.node} referenceSchema={tab.schemaReference} onValidated={() => {
+        {tab.view === 'schema-evolution' ? <SchemaEvolutionStudio active={active && activeTabKey === tab.key} contextTabId={tab.key} node={tab.node} referenceSchema={tab.schemaReference} onValidated={() => {
             void refreshOpenHierarchy(true)
             for (const item of workbenchTabs) {
               if (item.comparison && [item.comparison.referenceNodeId, item.comparison.compareNodeId].includes(tab.node.id)) void loadComparison(item.key, item.comparison, true)
               if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current))).catch(() => undefined)
             }
           }} onCompare={openCompare} />
-          : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => closeSyntheticTab(tab)} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
+          : <SyntheticStudio active={active && activeTabKey === tab.key} contextTabId={tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => closeSyntheticTab(tab)} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
       </div>)}{selected ? <>{activeSection === 'schema-evolution' || activeSection === 'synthetic' ? null : activeSection === 'compare' ? (() => {
         const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')
         const comparison = compareTab?.comparison

@@ -156,6 +156,44 @@ MIGRATIONS = (
     );
     CREATE INDEX schema_evolution_plans_operation ON schema_evolution_plans(operation_id);
     """,
+    """
+    CREATE TABLE ask_conversations (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      opencode_session_id TEXT NOT NULL UNIQUE,
+      agent_id TEXT NOT NULL,
+      model_provider_id TEXT,
+      model_id TEXT,
+      model_variant TEXT,
+      title TEXT NOT NULL,
+      context_mode TEXT NOT NULL DEFAULT 'active' CHECK (context_mode IN ('active','pinned','selected_tabs')),
+      context_json TEXT NOT NULL DEFAULT '{}',
+      sync_state TEXT NOT NULL DEFAULT 'ready',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_activity_at TEXT NOT NULL
+    );
+    CREATE INDEX ask_conversations_workspace_activity ON ask_conversations(workspace_id,last_activity_at DESC);
+    CREATE TABLE ask_turns (
+      request_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES ask_conversations(id) ON DELETE CASCADE,
+      state TEXT NOT NULL CHECK (state IN ('sending','running','completed','failed','interrupted','cancelled')),
+      context_json TEXT NOT NULL,
+      error_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+    CREATE INDEX ask_turns_conversation_state ON ask_turns(conversation_id,state,created_at DESC);
+    CREATE TABLE ask_preferences (
+      workspace_id TEXT PRIMARY KEY,
+      active_conversation_id TEXT,
+      updated_at TEXT NOT NULL
+    );
+    """,
+    """
+    ALTER TABLE ask_turns ADD COLUMN opencode_baseline_message_ids_json TEXT NOT NULL DEFAULT '[]';
+    """,
 )
 
 

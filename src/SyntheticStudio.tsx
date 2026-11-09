@@ -7,7 +7,7 @@ import { SchemaFieldEditor } from './SchemaFieldEditor'
 
 const steps = ['Destination', 'Schema', 'Generation Rules', 'Review', 'Execution'] as const
 type Step = 0 | 1 | 2 | 3 | 4
-type Props = { active?: boolean; node: DiscoverNode; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
+type Props = { active?: boolean; node: DiscoverNode; contextTabId?: string; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
 type Environment = 'prod' | 'dev'
 type SchemaVersion = { schema: CanonicalSchema; rules: SyntheticRule[] }
 type Draft = { schemaBase?: Environment; versions?: Partial<Record<Environment, SchemaVersion>>; step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
@@ -106,7 +106,7 @@ function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
   }
 }
 
-export function SyntheticStudio({ active = true, node, sourceEnvironment, onClose, onOpenTable, onCompare, onPublished, comparison }: Props) {
+export function SyntheticStudio({ active = true, node, contextTabId = node.id, sourceEnvironment, onClose, onOpenTable, onCompare, onPublished, comparison }: Props) {
   const sourceKey = node.variants?.find((item) => item.environment === sourceEnvironment)?.node_id ?? node.id
   const initialSchema = useMemo(() => makeSchema(node), [node])
   const [initial] = useState(() => loadDraft(node, initialSchema))
@@ -218,6 +218,30 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   const strategyUnavailableReason = strategyReason(strategy)
   const locationOptions = destinationSuggestion?.external_locations?.length ? destinationSuggestion.external_locations : externalLocations
   const terminal = Boolean(operation && ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state))
+
+  useEffect(() => {
+    if (!active) return
+    window.dispatchEvent(new CustomEvent('dexter:workspace-tab-context', { detail: {
+      tab_id: contextTabId,
+      type: 'synthetic_data',
+      title: `${node.name} · Synthetic Data`,
+      environment: sourceEnvironment.toUpperCase(),
+      resource: node.qualified_name ?? node.name,
+      step: steps[step],
+      state: operation?.state ?? (error ? 'error' : busyAction || 'ready'),
+      summary: {
+        source_environment: sourceEnvironment.toUpperCase(),
+        destination: [destination.catalog, destination.schema, destination.table].filter(Boolean).join('.'),
+        destination_strategy: strategy,
+        row_count: rowCount,
+        locale,
+        schema_columns: schema.fields.length,
+        generator_rules: rules.length,
+        execution_phase: String(operation?.details?.failed_phase ?? operation?.details?.phase ?? ''),
+      },
+      columns: schema.fields.slice(0, 100).map((field) => ({ name: field.name, type: field.original_type })),
+    } }))
+  }, [active, contextTabId, node.id, node.name, node.qualified_name, sourceEnvironment, step, operation?.state, operation?.details, error, busyAction, destination.catalog, destination.schema, destination.table, strategy, rowCount, locale, schema.fields, rules.length])
 
   useEffect(() => {
     alive.current = true

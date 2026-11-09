@@ -130,11 +130,17 @@ Version 2 review plans explicitly separate immutable physical DEV baseline, prop
 
 Workflow stabilization keeps an open React session per workspace tab, with only the active tab publishing Ask Dexter context. Synthetic editing/preview is independent of DEV publication verification; Append/Replace bind the effective schema and storage to observed physical DEV metadata. Editable PROD/DEV drafts retain separate schema/rule snapshots. Requests are bounded and obsolete metadata, preview, and review responses cannot advance a newer draft. Verification classifies confirmed absence/denial separately from connectivity and unknown metadata failures. Schema draft columns persist their editing origin without changing canonical schema diff semantics. Retried synthetic starts reuse the durable run associated with the same review ID. See [workflow stabilization evidence](workflow-stabilization.md).
 
+## Ask Dexter conversations and OpenCode (F4.4)
+
+Ask Dexter now uses the installed OpenCode Server through a loopback-only Dexter API. `adapters/opencode.py` isolates the server protocol; `services/opencode_runtime.py` discovers or starts a private server and resolves agent/model policy; `services/ask_dexter.py` validates turns, context and recovery; SQLite stores native-session references, model/context preferences and idempotent turn metadata. OpenCode remains the transcript source of truth. Dexter does not persist the transcript or provider credentials. The React panel is an always-mounted right-side workspace panel, so minimizing it does not discard the active conversation or stream.
+
+New sessions default to the configurable native `build` agent with disabled tools and deny-all permissions at managed-profile, session and prompt layers. The model selector lists only connected OpenCode providers/models and prefers a discovered Luna 6 label without fixing a model ID. Each turn receives a versioned, bounded context snapshot from Table Workbench, Query Workbench, Compare Tables, Schema Evolution or Synthetic Data Studio. Active, pinned and selected-tab policies are resolved server-side by exact tab IDs. SQL literals/comments and token-like content are redacted; records/previews are not sent. Dexter filters native stream events by the session and reconciles history on reload. See the [F4.4 architecture and operations guide](ask-dexter-opencode.md) and [ADR 0015](decisions/0015-ask-dexter-opencode-integration.md).
+
 ## Future module contracts
 
 The `domain/future_contracts.py` module records typed seams only:
 
-- **F4 Ask Dexter:** `ChatSessionReference` associates conversations with workspace IDs and a pinned or active-tab context. `AskSessionRepository` supports multiple sessions/conversations; no chat UI, OpenCode client, or conversation persistence is included.
+- Ask Dexter/OpenCode is implemented for F4.4 as described above. `domain/future_contracts.py` still contains typed `ChatSessionReference` and `AskSessionRepository` seams for later domain-level composition; it is not the implementation of the current UI, adapter or SQLite repository.
 - Later capabilities can add focused providers/services for row-level table comparison, labs, notebooks, orchestration, data products, and repository workflows without moving integration concerns into the core domain. F4.1's structural schema comparison is implemented separately in [ADR 0011](decisions/0011-canonical-schema-and-compare.md). Synthetic generation's reusable plan and engine are in [ADR 0012](decisions/0012-synthetic-generation-core.md).
 - Cross-cutting UX and safety refinements for Compare Tables, Prepare DEV, and Schema Evolution are recorded in [ADR 0014](decisions/0014-workflow-refinement-contracts.md).
 

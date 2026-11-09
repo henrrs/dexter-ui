@@ -10,13 +10,18 @@ const schemaStudio = await readFile(new URL('../src/SchemaEvolutionStudio.tsx', 
 const syntheticStudio = await readFile(new URL('../src/SyntheticStudio.tsx', import.meta.url), 'utf8')
 const schemaFieldEditor = await readFile(new URL('../src/SchemaFieldEditor.tsx', import.meta.url), 'utf8')
 const vite = await readFile(new URL('../vite.config.ts', import.meta.url), 'utf8')
+const askPanel = await readFile(new URL('../src/AskDexterPanel.tsx', import.meta.url), 'utf8')
+const askContext = await readFile(new URL('../src/askDexter/context.ts', import.meta.url), 'utf8')
 
-test('platform shell uses automatic local authentication without a settings screen', () => {
+test('platform shell uses local authentication and keeps Ask Dexter in the workspace', () => {
   assert.match(app, /Home/)
   assert.match(app, /Discover/)
-  assert.match(app, /Planned for F4/)
-  assert.match(app, /Detect local access/)
-  assert.match(app, /onRefreshConnections/)
+  assert.match(app, /AskDexterPanel tabs=\{askWorkspaceTabs\}/)
+  assert.match(app, /dexter:workspace-tabs/)
+  assert.match(app, /dexter:workspace-tab-context/)
+  assert.match(app, /aria-label="Minimize Ask Dexter"/)
+  assert.match(app, /aria-label="Reopen Ask Dexter"/)
+  assert.match(app, /refreshConnections/)
   assert.match(api, /\/connections\/refresh/)
   assert.doesNotMatch(app, /Settings|Configure connections|Manage connections/)
   assert.doesNotMatch(api, /saveDatabricks|savePurview|discoverPurview|selectPurview|validateDatabricks|validatePurview/)
@@ -77,7 +82,7 @@ test('SQL Workspace exposes explicit destinations and the shared local snapshot 
 
 test('Compare Tables opens a reusable read-only schema comparison tab', () => {
   assert.match(api, /compareSchemas: .*\/discover\/schema-compare/)
-  assert.match(discover, /view: 'table' \| 'local-query' \| 'compare'/)
+  assert.match(discover, /view: 'table' \| 'local-query' \| 'compare' \| 'synthetic' \| 'schema-evolution'/)
   assert.match(discover, /Compare Tables/)
   assert.match(discover, /Schema comparison/)
   assert.match(discover, /PROD-only/)
@@ -90,7 +95,7 @@ test('Compare Tables opens a reusable read-only schema comparison tab', () => {
   assert.match(discover, /Target Table Not Found/)
   assert.match(discover, /Prepare DEV/)
   assert.match(discover, /syntheticComparison/)
-  assert.match(app, /kind === 'comparison'/)
+  assert.match(discover, /kind: 'comparison'/)
   assert.match(discover, /localSqlWasGenerated/)
   assert.match(discover, /qualifiedTableIdentifier\(selected, environment\)/)
 })
@@ -131,12 +136,19 @@ test('Explorer restores previously cached catalog and table pages after reload',
   assert.match(discover, /dexter\.discover\.explorer-state\.v1/)
 })
 
-test('Ask Dexter context follows the active comparison without table records', () => {
+test('Ask Dexter selects versioned workspace context without table records', () => {
   assert.match(discover, /kind: 'comparison'/)
   assert.match(discover, /comparisonState:/)
   assert.match(discover, /summary: comparison\.result\?\.summary/)
-  assert.match(app, /Schema metadata only · no record samples included/)
-  assert.match(app, /Workflow and schema metadata only · no record samples/)
+  assert.match(app, /AskDexterPanel tabs=\{askWorkspaceTabs\}/)
+  assert.match(app, /activeTabId=\{activeWorkspaceTabId\}/)
+  assert.match(askPanel, /Follow active tab/)
+  assert.match(askPanel, /Pin this context/)
+  assert.match(askPanel, /Select tabs/)
+  assert.match(askPanel, /Workspace context/)
+  assert.match(askContext, /version: 1/)
+  assert.match(askContext, /\['table_workbench', 'query_workbench', 'compare_tables', 'schema_evolution', 'synthetic_data'\]/)
+  assert.match(askPanel, /api\.askSend\(/)
 })
 
 test('Synthetic Studio exposes reviewed DEV publication and bounded generation preview', async () => {

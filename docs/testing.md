@@ -180,3 +180,16 @@ Validation on 2026-11-08:
 - `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed. `npm run build` — TypeScript and Vite production build passed.
 - `node --test --test-concurrency=1 scripts/workflow-navigation.test.mjs` — all 8 real Firefox journeys passed with local fixtures, including selecting the strategy in Edit, one review row per operation, and recreating from a draft that removes every original column and adds three replacements.
 - Python compilation and `git diff --check` passed. No live Databricks DDL was executed; remote permissions, workspace property behavior, protocol upgrades, and external storage remain unverified against a real DEV workspace.
+
+## F4.4 Ask Dexter and OpenCode
+
+Validation on 2026-11-09:
+
+- `npm run build` — TypeScript check and Vite production build passed.
+- `npm run test:ui` — all 12 real headless Firefox journeys passed. The workflow assertions verify that opening a table and switching to Compare Tables updates the Ask context summary, and that Synthetic Studio publishes its own active context.
+- `node --test scripts/ui-contract.test.mjs` — all 10 UI contracts passed, including Ask panel mounting, minimize/reopen behavior, context modes, and provider registration.
+- `PYTHONPATH=backend/src:.venv/lib/python3.12/site-packages ../switchyard/.venv/bin/python -m unittest backend.tests.test_ask_dexter -v` — all 13 focused tests passed, covering native session lifecycle, conversation isolation, idempotent turns, model discovery, active/pinned/selected context, SQL/token redaction, SSE recovery, stop/delete, endpoint validation, and deny-all tool policy.
+- `python -m compileall -q backend/src backend/tests` and `git diff --check` passed.
+- Live interface certification used installed OpenCode **1.19.5**, its native `build` agent, and connected **GPT-6 Luna**, through a loopback server endpoint configured in Dexter. In Firefox, the user selected `tech.gold.ledger` in PROD, opened Compare Tables, created a conversation, and sent a prompt referring to the visible context. The model streamed a response identifying `tech.gold.ledger` and `PROD`; the native OpenCode session recorded the same resource/environment and the session's `*` permission was `deny`. This verified that the React panel, Dexter API, context projection, OpenCode native session, selected model, and streamed response work together. The workspace was a local UI fixture; no Databricks/Purview request, table read or DDL/DML was made.
+- The managed-server auto-start path was also probed on this host, but did not pass: OpenCode logged that it was listening on its random loopback port, while Dexter's readiness probe continued to receive connection failures. The verified UI path therefore used an explicitly configured local endpoint. Automatic discovery/startup needs a separate fix or environment-specific investigation before it can be certified.
+- Full backend regression: 220 tests ran; four failures/errors remain outside the F4.4 files. They concern two schema-recreation SQL/property expectations, a lost DROP response timeout expectation, and an existing partial-warehouse warning expectation. Focused F4.4 tests and the full UI suite pass.

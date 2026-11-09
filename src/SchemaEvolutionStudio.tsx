@@ -5,7 +5,7 @@ import type { CanonicalSchema, DiscoverNode, SchemaChangePlan, SchemaDraft, Sche
 import type { Operation } from './types'
 import { DatabricksTypeSelector, SchemaFieldEditor } from './SchemaFieldEditor'
 
-type Props = { active?: boolean; node: DiscoverNode; referenceSchema?: CanonicalSchema | null; onValidated?: () => void; onCompare?: () => void }
+type Props = { active?: boolean; node: DiscoverNode; contextTabId?: string; referenceSchema?: CanonicalSchema | null; onValidated?: () => void; onCompare?: () => void }
 type Stage = 'edit' | 'review' | 'apply' | 'validate'
 const stages: Array<{ id: Stage; label: string }> = [{ id: 'edit', label: 'Edit Schema' }, { id: 'review', label: 'Review Changes' }, { id: 'apply', label: 'Apply Changes' }, { id: 'validate', label: 'Validate' }]
 
@@ -18,7 +18,7 @@ function fieldSignature(field: SchemaDraftColumn['field']) {
       ? field.technology_properties[key] || null : field.technology_properties[key] ?? null)])
 }
 
-export function SchemaEvolutionStudio({ active = true, node, referenceSchema: providedReference, onValidated, onCompare }: Props) {
+export function SchemaEvolutionStudio({ active = true, node, contextTabId = node.id, referenceSchema: providedReference, onValidated, onCompare }: Props) {
   const physicalNodeId = node.variants?.find((item) => item.environment === 'dev')?.node_id ?? node.id
   const [loadedReference, setLoadedReference] = useState<CanonicalSchema | null>(null)
   const referenceSchema = loadedReference ?? providedReference
@@ -146,6 +146,29 @@ export function SchemaEvolutionStudio({ active = true, node, referenceSchema: pr
       return !original || fieldSignature(column.field) !== fieldSignature(original)
     }).length
   }, [draft])
+
+  useEffect(() => {
+    if (!active) return
+    window.dispatchEvent(new CustomEvent('dexter:workspace-tab-context', { detail: {
+      tab_id: contextTabId,
+      type: 'schema_evolution',
+      title: `${node.name} · Schema Evolution`,
+      environment: 'DEV',
+      resource: context?.schema.qualified_name ?? node.qualified_name ?? node.name,
+      step: stage,
+      state: loading ? 'loading' : error ? 'error' : operation?.state ?? context?.target_state ?? 'ready',
+      summary: {
+        pending_changes: changedCount,
+        draft_columns: draft?.columns.filter((column) => !column.removed).length ?? 0,
+        removed_columns: draft?.columns.filter((column) => column.removed).length ?? 0,
+        baseline_columns: draft?.baseline.fields.length ?? context?.schema.fields.length ?? 0,
+        execution_strategy: executionStrategy,
+        validation: validation?.state ?? null,
+      },
+      columns: draft?.columns.filter((column) => !column.removed).slice(0, 100).map((column) => ({ name: column.field.name, type: column.field.original_type }))
+        ?? context?.schema.fields.slice(0, 100).map((field) => ({ name: field.name, type: field.original_type })) ?? [],
+    } }))
+  }, [active, contextTabId, node.id, node.name, node.qualified_name, context, draft, stage, loading, error, operation?.state, changedCount, executionStrategy, validation?.state])
 
   const save = async (next: SchemaDraft) => {
     if (!context) return

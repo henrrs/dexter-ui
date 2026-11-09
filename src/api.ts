@@ -7,7 +7,7 @@ export class ApiError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const bounded = /^\/(synthetic|schema-evolution|operations)(?:\/|\?|$)/.test(path) || path === '/discover/schema-compare'
+  const bounded = /^\/(synthetic|schema-evolution|operations|ask)(?:\/|\?|$)/.test(path) || path === '/discover/schema-compare'
   const timeout = bounded ? AbortSignal.timeout(60000) : null
   let response: Response
   try { response = await fetch(`/api${path}`, {
@@ -70,7 +70,29 @@ export const api = {
   localDatasets: () => request<{ items: LocalDataset[] }>('/local-datasets'),
   queryLocal: (datasetId: string, sql: string, limit = 500) => request<{ columns: string[]; schema?: Array<{ name: string; type: string }>; rows: Record<string, unknown>[]; truncated: boolean; executed_sql?: string }>(`/local-datasets/${datasetId}/query`, { method: 'POST', body: JSON.stringify({ sql, limit }) }),
   deleteLocal: (datasetId: string) => request<{ deleted: boolean }>(`/local-datasets/${datasetId}`, { method: 'DELETE' }),
+  askStatus: () => request<AskStatus>('/ask/status'),
+  askReconnect: () => request<AskStatus>('/ask/reconnect', { method: 'POST' }),
+  askConfigureEndpoint: (endpoint: string | null, agent_id: string) => request<AskStatus>('/ask/config', { method: 'PUT', body: JSON.stringify({ endpoint, agent_id }) }),
+  askConversations: () => request<AskConversationList>('/ask/conversations'),
+  askCreateConversation: () => request<AskConversation>('/ask/conversations', { method: 'POST' }),
+  askActivateConversation: (id: string) => request<{ active_conversation_id: string }>(`/ask/conversations/${encodeURIComponent(id)}/active`, { method: 'POST' }),
+  askRenameConversation: (id: string, title: string) => request<AskConversation>(`/ask/conversations/${encodeURIComponent(id)}/title`, { method: 'PUT', body: JSON.stringify({ title }) }),
+  askDeleteConversation: (id: string) => request<{ deleted: boolean; remote_session_deleted: boolean }>(`/ask/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  askSetContext: (id: string, preferences: AskContextPreferences) => request<AskConversation>(`/ask/conversations/${encodeURIComponent(id)}/context`, { method: 'PUT', body: JSON.stringify(preferences) }),
+  askSetModel: (id: string, model: AskModel) => request<AskConversation>(`/ask/conversations/${encodeURIComponent(id)}/model`, { method: 'PUT', body: JSON.stringify(model) }),
+  askMessages: (id: string) => request<AskMessages>(`/ask/conversations/${encodeURIComponent(id)}/messages`),
+  askSend: (id: string, requestId: string, text: string, context: import('./askDexter/context').WorkspaceContextSnapshot) => request<{ request_id: string; state: string; accepted: boolean; duplicate: boolean }>(`/ask/conversations/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify({ request_id: requestId, text, context }) }),
+  askStop: (id: string) => request<{ stopped: boolean; state: string }>(`/ask/conversations/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  askStreamUrl: (id: string, requestId: string) => `/api/ask/conversations/${encodeURIComponent(id)}/stream?${new URLSearchParams({ request_id: requestId })}`,
 }
+
+export type AskModel = { provider_id: string; provider_name?: string; id: string; name?: string; variant?: string; variants?: string[]; reasoning?: boolean }
+export type AskConversation = { id: string; workspace_id: string; opencode_session_id: string; agent_id: string; title: string; context_mode: 'active' | 'pinned' | 'selected_tabs'; context: { mode?: 'active' | 'pinned' | 'selected_tabs'; selected_tab_ids?: string[]; pinned_context?: import('./askDexter/context').WorkspaceContextTab | null }; sync_state: string; created_at: string; updated_at: string; last_activity_at: string; model: AskModel | null }
+export type AskConversationList = { items: AskConversation[]; active_conversation_id: string | null }
+export type AskStatus = { connected: boolean; state: string; version?: string | null; agent_id: string; agent?: { id: string; description?: string; mode: string } | null; agents: Array<{ id: string; description?: string; mode: string }>; models: AskModel[]; default_model: AskModel | null; preferred_model_available: boolean; managed: boolean; endpoint_mode: string; endpoint: string | null; message?: string | null; error_code?: string; retryable?: boolean }
+export type AskContextPreferences = { mode: 'active' | 'pinned' | 'selected_tabs'; pinned_context?: import('./askDexter/context').WorkspaceContextTab | null; selected_tab_ids?: string[] }
+export type AskMessage = { id: string; role: 'user' | 'assistant'; text: string; created_at?: number | string; complete?: boolean; agent?: string; model?: { provider_id: string; id: string } | null }
+export type AskMessages = { items: AskMessage[]; status: { type: string }; active_request: { request_id: string; state: string } | null; last_turn_state?: string | null }
 
 export type DiscoverNode = {
   id: string; name: string; kind: 'source' | 'catalog' | 'schema' | 'table' | 'view'

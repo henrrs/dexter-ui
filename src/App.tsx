@@ -2,29 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
 import {
   Activity, ArrowDownRight, ChevronLeft, ChevronRight,
-  Cloud, Database, FileStack, Gauge, Home, Layers3,
-  LoaderCircle, LockKeyhole, PanelRightClose, Plus,
-  RefreshCw, Search, ShieldCheck, Sparkles, X,
+  Cloud, Database, Gauge, Home,
+  LoaderCircle, PanelRightClose, Plus,
+  RefreshCw, Search, ShieldCheck, Sparkles,
 } from 'lucide-react'
 import { api } from './api'
 import type { Connection, Connections, Operation } from './types'
 import { DiscoverView } from './DiscoverView'
+import { AskDexterPanel } from './AskDexterPanel'
+import type { WorkspaceContextTab } from './askDexter/context'
 
 type View = 'home' | 'discover'
-type DiscoverContext = {
-  kind?: 'comparison' | 'workflow'
-  name: string
-  qualifiedName: string
-  environment: string
-  workflow?: string
-  stage?: string
-  reference?: { name: string; environment: string }
-  compareAgainst?: { name: string; environment: string }
-  comparisonState?: string
-  summary?: Record<string, number>
-  referenceColumnCount?: number | null
-  compareColumnCount?: number | null
-}
 
 function App() {
   const [view, setView] = useState<View>('home')
@@ -36,7 +24,9 @@ function App() {
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
   const [leftWidth, setLeftWidth] = useState(252)
-  const [discoverContext, setDiscoverContext] = useState<DiscoverContext | null>(null)
+  const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceContextTab[]>([])
+  const [activeWorkspaceTabId, setActiveWorkspaceTabId] = useState<string | null>(null)
+  const [contextOverrides, setContextOverrides] = useState<Record<string, WorkspaceContextTab>>({})
   const connectionRefreshStarted = useRef(false)
 
   const refresh = useCallback(async (initial = false) => {
@@ -62,11 +52,28 @@ function App() {
   }, [refresh])
 
   useEffect(() => {
-    const update = (event: Event) => setDiscoverContext((event as CustomEvent<typeof discoverContext>).detail)
-    window.addEventListener('dexter:discover-context', update)
-    return () => window.removeEventListener('dexter:discover-context', update)
+    const updateTabs = (event: Event) => {
+      const detail = (event as CustomEvent<{ active_tab_id: string | null; tabs: WorkspaceContextTab[] }>).detail
+      if (!detail || !Array.isArray(detail.tabs)) return
+      const ids = new Set(detail.tabs.map((tab) => tab.tab_id))
+      setWorkspaceTabs(detail.tabs)
+      setActiveWorkspaceTabId(detail.active_tab_id)
+      setContextOverrides((prior) => Object.fromEntries(Object.entries(prior).filter(([id]) => ids.has(id))))
+    }
+    const updateContext = (event: Event) => {
+      const context = (event as CustomEvent<WorkspaceContextTab>).detail
+      if (!context?.tab_id) return
+      setContextOverrides((prior) => ({ ...prior, [context.tab_id]: context }))
+    }
+    window.addEventListener('dexter:workspace-tabs', updateTabs)
+    window.addEventListener('dexter:workspace-tab-context', updateContext)
+    return () => {
+      window.removeEventListener('dexter:workspace-tabs', updateTabs)
+      window.removeEventListener('dexter:workspace-tab-context', updateContext)
+    }
   }, [])
-  useEffect(() => { if (view !== 'discover') setDiscoverContext(null) }, [view])
+
+  const askWorkspaceTabs = workspaceTabs.map((tab) => ({ ...tab, ...(contextOverrides[tab.tab_id] ?? {}) }))
 
   const resizeExplorer = (event: ReactPointerEvent<HTMLDivElement>) => {
     const start = event.clientX
@@ -119,25 +126,10 @@ function App() {
           </div>
         </main>}
 
-        {rightOpen && <aside id="ask-dexter-panel" className="context-panel">
-          <div className="panel-heading context-heading"><div><span className="eyebrow">CONTEXT</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Minimize Ask Dexter" aria-expanded="true" aria-controls="ask-dexter-panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div>
-          {view === 'discover' && discoverContext ? <div className="discover-ask-context">
-            {discoverContext.kind === 'comparison' ? <div className="discover-comparison-context">
-              <div className="discover-context-card"><Layers3 size={17} /><div><strong>Table comparison</strong><small>{discoverContext.comparisonState === 'loading' ? 'Loading schema metadata…' : discoverContext.comparisonState ?? 'Waiting for metadata'}</small></div><button className="icon-button tiny" aria-label="Clear selected context" onClick={() => { setDiscoverContext(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) }}><X size={13} /></button></div>
-              <div className="comparison-context-side"><span>REFERENCE · {discoverContext.reference?.environment.toUpperCase()}</span><strong>{discoverContext.reference?.name}</strong><small>{discoverContext.referenceColumnCount == null ? 'Schema size unavailable' : `${discoverContext.referenceColumnCount} columns`}</small></div>
-              <div className="comparison-context-side"><span>COMPARE AGAINST · {discoverContext.compareAgainst?.environment.toUpperCase()}</span><strong>{discoverContext.compareAgainst?.name}</strong><small>{discoverContext.compareColumnCount == null ? 'No schema loaded' : `${discoverContext.compareColumnCount} columns`}</small></div>
-              <div className="comparison-context-summary">{Object.entries(discoverContext.summary ?? {}).filter(([, count]) => count > 0).map(([name, count]) => <span key={name}>{count} {name.replaceAll('_', '-')}</span>)}</div>
-              <small className="comparison-context-privacy">Schema metadata only · no record samples included</small>
-            </div> : discoverContext.kind === 'workflow' ? <div className="discover-comparison-context">
-              <div className="discover-context-card"><Layers3 size={17} /><div><strong>{discoverContext.workflow}</strong><small>{discoverContext.stage}</small></div><button className="icon-button tiny" aria-label="Clear selected context" onClick={() => { setDiscoverContext(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) }}><X size={13} /></button></div>
-              <div className="comparison-context-side"><span>ACTIVE TABLE · {discoverContext.environment.toUpperCase()}</span><strong>{discoverContext.name}</strong><small>{discoverContext.qualifiedName}</small></div>
-              <small className="comparison-context-privacy">Workflow and schema metadata only · no record samples or sensitive values included</small>
-            </div> : <>
-              <div className="discover-context-card"><Database size={17} /><div><strong>{discoverContext.name}</strong><small>{discoverContext.qualifiedName}</small><span>{discoverContext.environment.toUpperCase()} context</span></div><button className="icon-button tiny" aria-label="Clear selected context" onClick={() => { setDiscoverContext(null); window.dispatchEvent(new CustomEvent('dexter:discover-context', { detail: null })) }}><X size={13} /></button></div>
-              <div className="context-quick-actions"><button disabled><Activity size={14} /> Summarize this table</button><button disabled><FileStack size={14} /> Explain the columns</button><button disabled><span>SQL</span> Generate a query</button><button disabled><Layers3 size={14} /> Compare with another table</button></div><div className="phase-lock"><LockKeyhole size={13} /><span>Context actions planned for F4</span></div>
-            </>}
-          </div> : <><div className="context-content"><div className="context-orbit"><div className="orbit-ring ring-one" /><div className="orbit-ring ring-two" /><div className="orbit-core"><Sparkles size={20} /></div><span className="orbit-node node-a" /><span className="orbit-node node-b" /><span className="orbit-node node-c" /></div><div className="context-title">Your workspace,<br /><em>in conversation.</em></div><p>Ask Dexter will help you explore and understand your data assets.</p><div className="phase-lock"><LockKeyhole size={13} /><span>Planned for F4</span></div></div><div className="context-bottom"><div className="context-bottom-title"><span>ACTIVE CONTEXT</span><span className="context-none">NONE</span></div><div className="context-empty"><FileStack size={15} /><span>Select an asset to add context</span></div></div></>}
-        </aside>}
+        <aside id="ask-dexter-panel" className={`context-panel ${rightOpen ? '' : 'context-panel-hidden'}`}>
+          <div className="panel-heading context-heading"><div><span className="eyebrow">CONVERSATION</span><h2><Sparkles size={15} /> Ask Dexter</h2></div><button className="icon-button subtle" aria-label="Minimize Ask Dexter" aria-expanded={rightOpen} aria-controls="ask-dexter-panel" onClick={() => setRightOpen(false)}><PanelRightClose size={16} /></button></div>
+          <AskDexterPanel tabs={askWorkspaceTabs} activeTabId={activeWorkspaceTabId} />
+        </aside>
         {!rightOpen && <aside className="context-panel-rail" aria-label="Ask Dexter minimized"><button onClick={() => setRightOpen(true)} aria-label="Reopen Ask Dexter" title="Reopen Ask Dexter" aria-expanded="false"><ChevronLeft size={15} /></button></aside>}
       </div>
     </div>

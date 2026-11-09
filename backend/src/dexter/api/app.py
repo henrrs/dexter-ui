@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,8 @@ from dexter.services.operations import OperationsService, SettingsRepository, QU
 from dexter.services.local_data import LocalDataService, LocalDatasetBusy
 from dexter.services.materialize import make_local_worker
 from dexter.services.analytics_config import load_limits
+from dexter.adapters.opencode import OpenCodeError
+from dexter.services.ask_dexter import AskDexterService
 
 logger = logging.getLogger("dexter.api")
 
@@ -188,6 +190,83 @@ class SyntheticReconcileRequest(BaseModel):
     typed_confirmation: str = Field(min_length=1, max_length=512)
 
 
+class AskContextColumn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=256)
+    type: str = Field(default="", max_length=160)
+
+
+class AskContextTab(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tab_id: str = Field(min_length=1, max_length=200)
+    type: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=200)
+    environment: str | None = Field(default=None, max_length=24)
+    resource: str | None = Field(default=None, max_length=512)
+    step: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=80)
+    summary: dict[str, str | int | float | bool | None] = Field(default_factory=dict, max_length=40)
+    columns: list[AskContextColumn] = Field(default_factory=list, max_length=100)
+    sql: str | None = Field(default=None, max_length=4_000)
+
+
+class AskWorkspaceContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int = Field(default=1, ge=1, le=1)
+    mode: Literal["active", "pinned", "selected_tabs"] = "active"
+    active_tab_id: str | None = Field(default=None, max_length=200)
+    tabs: list[AskContextTab] = Field(default_factory=list, max_length=5)
+
+
+class AskContextPreferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["active", "pinned", "selected_tabs"]
+    pinned_context: AskContextTab | None = None
+    selected_tab_ids: list[str] = Field(default_factory=list, max_length=5)
+
+
+class AskMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(pattern="^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+    text: str = Field(min_length=1, max_length=8_000)
+    context: AskWorkspaceContext
+
+
+class AskModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_id: str = Field(min_length=1, max_length=120)
+    id: str = Field(min_length=1, max_length=240)
+    variant: str | None = Field(default=None, max_length=80)
+
+
+class AskTitleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=120)
+
+
+class AskEndpointRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint: str | None = Field(default=None, max_length=512)
+    agent_id: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+def _ask_http_error(exc: OpenCodeError) -> HTTPException:
+    status_by_code = {
+        "OPENCODE_TIMEOUT": 504,
+        "OPENCODE_BUSY": 409,
+        "OPENCODE_RESOURCE_MISSING": 404,
+        "OPENCODE_PROVIDER_FAILED": 502,
+        "ASK_MODEL_REQUIRED": 422,
+        "ASK_MODEL_UNAVAILABLE": 422,
+        "OPENCODE_NOT_INSTALLED": 503,
+        "OPENCODE_START_FAILED": 503,
+        "OPENCODE_AUTH_REQUIRED": 503,
+        "OPENCODE_UNAVAILABLE": 503,
+    }
+    status_code = status_by_code.get(exc.code, 502)
+    return HTTPException(status_code, detail={"code": exc.code, "message": str(exc)})
+
+
 def _read_only_select(sql: str) -> str:
     statement = sql.strip()
     if statement.endswith(";"):
@@ -297,6 +376,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     migrate(paths.database)
     operations = OperationsService(paths.database)
     settings_repo = SettingsRepository(paths.database)
+    ask_dexter = AskDexterService(paths, settings_repo)
     discover = DiscoverService(paths, settings_repo, settings)
     local_data = LocalDataService(paths)
     unified = UnifiedDiscoverService(discover, settings_repo, local_data, paths)
@@ -352,6 +432,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             lease_monitor.join(timeout=11)
             materializers.shutdown(wait=False, cancel_futures=False)
             schema_evolution_workers.shutdown(wait=False, cancel_futures=False)
+            ask_dexter.shutdown()
 
     app = FastAPI(title="Dexter Local API", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:4173", "http://localhost:4173"], allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type"], max_age=300)
@@ -380,6 +461,126 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
     @app.get("/api/ready")
     def ready():
         return {"status": "ready", "storage": "sqlite-wal", "database": str(paths.database)}
+
+    @app.get("/api/ask/status")
+    def ask_status():
+        return ask_dexter.status()
+
+    @app.post("/api/ask/reconnect")
+    def ask_reconnect():
+        return ask_dexter.reconnect()
+
+    @app.put("/api/ask/config")
+    def ask_configure(body: AskEndpointRequest):
+        try:
+            result = ask_dexter.configure_endpoint(body.endpoint, body.agent_id)
+            return {**result, **ask_dexter.status()}
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "INVALID_OPENCODE_CONFIG", "message": str(exc)}) from None
+
+    @app.get("/api/ask/conversations")
+    def ask_conversations():
+        return ask_dexter.conversations()
+
+    @app.post("/api/ask/conversations", status_code=201)
+    def ask_create_conversation():
+        try:
+            return ask_dexter.create_conversation()
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+
+    @app.post("/api/ask/conversations/{conversation_id}/active")
+    def ask_activate_conversation(conversation_id: str):
+        try:
+            ask_dexter.activate(conversation_id)
+            return {"active_conversation_id": conversation_id}
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+
+    @app.put("/api/ask/conversations/{conversation_id}/title")
+    def ask_rename_conversation(conversation_id: str, body: AskTitleRequest):
+        try:
+            return ask_dexter.rename(conversation_id, body.title)
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "INVALID_CONVERSATION_TITLE", "message": str(exc)}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+
+    @app.delete("/api/ask/conversations/{conversation_id}")
+    def ask_delete_conversation(conversation_id: str):
+        try:
+            return ask_dexter.delete(conversation_id)
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+
+    @app.put("/api/ask/conversations/{conversation_id}/context")
+    def ask_set_context(conversation_id: str, body: AskContextPreferencesRequest):
+        try:
+            return ask_dexter.set_context_preferences(conversation_id, body.model_dump(mode="json"))
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "INVALID_WORKSPACE_CONTEXT", "message": str(exc)}) from None
+
+    @app.put("/api/ask/conversations/{conversation_id}/model")
+    def ask_set_model(conversation_id: str, body: AskModelRequest):
+        try:
+            return ask_dexter.set_model(conversation_id, body.model_dump(mode="json"))
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+        except RuntimeError as exc:
+            raise HTTPException(409, detail={"code": "ASK_CONVERSATION_BUSY", "message": str(exc)}) from None
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "ASK_MODEL_UNAVAILABLE", "message": str(exc)}) from None
+
+    @app.get("/api/ask/conversations/{conversation_id}/messages")
+    def ask_messages(conversation_id: str):
+        try:
+            return ask_dexter.messages(conversation_id)
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+
+    @app.post("/api/ask/conversations/{conversation_id}/messages")
+    def ask_send_message(conversation_id: str, body: AskMessageRequest):
+        try:
+            return ask_dexter.send(conversation_id, body.request_id, body.text,
+                                   body.context.model_dump(mode="json"))
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+        except RuntimeError as exc:
+            raise HTTPException(409, detail={"code": "ASK_CONVERSATION_BUSY", "message": str(exc)}) from None
+        except ValueError as exc:
+            raise HTTPException(422, detail={"code": "INVALID_ASK_MESSAGE", "message": str(exc)}) from None
+
+    @app.get("/api/ask/conversations/{conversation_id}/stream")
+    def ask_stream(conversation_id: str, request_id: str):
+        try:
+            uuid.UUID(request_id)
+            if not ask_dexter.repository.get(conversation_id):
+                raise KeyError(conversation_id)
+            return StreamingResponse(ask_dexter.stream(conversation_id, request_id), media_type="text/event-stream",
+                                    headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+        except (KeyError, ValueError):
+            raise HTTPException(404, detail={"code": "ASK_REQUEST_NOT_FOUND", "message": "Conversation request not found."}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
+
+    @app.post("/api/ask/conversations/{conversation_id}/stop")
+    def ask_stop(conversation_id: str):
+        try:
+            return ask_dexter.stop(conversation_id)
+        except KeyError:
+            raise HTTPException(404, detail={"code": "ASK_CONVERSATION_NOT_FOUND", "message": "Conversation not found."}) from None
+        except OpenCodeError as exc:
+            raise _ask_http_error(exc) from None
 
     @app.get("/api/connections")
     def get_connections():
@@ -2596,6 +2797,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
 
     app.state.paths = paths
     app.state.settings = settings
+    app.state.ask_dexter = ask_dexter
     return app
 
 
