@@ -16,6 +16,9 @@ from dexter.domain.synthetic import ColumnRule, SyntheticGenerationPlan
 DEFAULT_CHUNK_ROWS = 100_000
 DEFAULT_STAGING_BYTES = 128 * 1024 * 1024
 DEFAULT_TARGET_CHUNK_BYTES = 24 * 1024 * 1024
+# Increment when the physical Parquet representation changes even if the
+# approved logical Databricks schema stays the same.
+PARQUET_SCHEMA_VERSION = 2
 
 
 class GenerationError(ValueError):
@@ -31,6 +34,20 @@ def _sql_type(field: dict[str, Any]) -> str:
     supported = re.compile(r"^(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|FLOAT|REAL|DOUBLE|BOOLEAN|DATE|TIMESTAMP(?:_NTZ)?|STRING|VARCHAR|CHAR|DECIMAL|NUMERIC)(?:\s*\(\s*\d+(?:\s*,\s*\d+)?\s*\))?$")
     if not supported.fullmatch(original):
         raise GenerationError(f"The destination type for column {field.get('name', '')} is not supported yet")
+    timestamp_type = re.fullmatch(r"(TIMESTAMP(?:_NTZ)?)(?:\s*\(\s*(\d+)\s*\))?", original)
+    if timestamp_type and timestamp_type.group(2) and int(timestamp_type.group(2)) > 6:
+        raise GenerationError(
+            f"Column {field.get('name', '')} uses timestamp precision above 6, which the current Parquet generator cannot preserve"
+        )
+    # Databricks TIMESTAMP is an instant (UTC-normalized), while TIMESTAMP_NTZ
+    # is a wall-clock value. DuckDB's TIMESTAMP is naive; use TIMESTAMPTZ for
+    # Databricks TIMESTAMP so Arrow/Parquet carries the UTC-adjusted annotation
+    # expected by Delta. Keep NTZ mapped to DuckDB's naive TIMESTAMP.
+    base_type = re.split(r"\s*\(", original, maxsplit=1)[0]
+    if base_type == "TIMESTAMP":
+        return "TIMESTAMPTZ"
+    if base_type == "TIMESTAMP_NTZ":
+        return "TIMESTAMP"
     return original
 
 
@@ -150,6 +167,7 @@ def generate_parquet_chunks(
     if not re.fullmatch(r"\d+(?:KB|MB|GB)", duckdb_memory_limit.upper()):
         raise GenerationError("DuckDB memory limit must use a positive KB, MB, or GB value")
     db.execute(f"SET memory_limit='{duckdb_memory_limit.upper()}'")
+    db.execute("SET TimeZone='UTC'")
     db.execute("SET threads=1")
     semantic_fields = [field for field in fields if rules[field["name"].casefold()].generator in {"name", "email", "company", "address", "phone"}]
     semantic_generator = _semantic_provider(plan.locale, plan.seed) if semantic_fields else None
@@ -226,13 +244,29 @@ def generate_parquet_chunks(
                         raise GenerationError(f"Invalid ISO date for {name}") from exc
                     value = f"(DATE '{start}' + CAST(hash({offset} + {seed_value}) % 3650 AS INTEGER))"
                 elif generator == "timestamp_range":
-                    from datetime import datetime
+                    from datetime import datetime, timezone
                     start = str(rule.parameters.get("start", "2020-01-01T00:00:00"))
                     try:
-                        start = datetime.fromisoformat(start).isoformat(sep=" ")
+                        start_value = datetime.fromisoformat(start)
                     except ValueError as exc:
                         raise GenerationError(f"Invalid ISO timestamp for {name}") from exc
-                    value = f"(TIMESTAMP '{start}' + CAST(hash({offset} + {seed_value}) % 315360000 AS BIGINT) * INTERVAL 1 SECOND)"
+                    target_type = _sql_type(field)
+                    if target_type == "TIMESTAMPTZ":
+                        # A timezone-free input is interpreted as UTC. An
+                        # explicit offset is normalized to UTC before writing.
+                        if start_value.tzinfo is None:
+                            start_value = start_value.replace(tzinfo=timezone.utc)
+                        else:
+                            start_value = start_value.astimezone(timezone.utc)
+                        literal_type = "TIMESTAMPTZ"
+                    else:
+                        # NTZ values represent wall-clock time, so retain the
+                        # displayed clock value and discard any supplied zone.
+                        if start_value.tzinfo is not None:
+                            start_value = start_value.replace(tzinfo=None)
+                        literal_type = "TIMESTAMP"
+                    start = start_value.isoformat(sep=" ")
+                    value = f"({literal_type} '{start}' + CAST(hash({offset} + {seed_value}) % 315360000 AS BIGINT) * INTERVAL 1 SECOND)"
                 elif generator == "boolean":
                     probability = float(rule.parameters.get("true_probability", 0.5))
                     if not math.isfinite(probability) or not 0 <= probability <= 1:

@@ -2458,8 +2458,18 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 raise HTTPException(409, detail="The saved synthetic manifest is unavailable")
             from dexter.services.synthetic_runs import SyntheticRunRepository
             from dexter.services.synthetic_runtime import runtime_entrypoint, start_memory_scoped_worker
-            if SyntheticRunRepository(paths.database).get(run_id) is None:
+            synthetic_runs = SyntheticRunRepository(paths.database)
+            saved_run = synthetic_runs.get(run_id)
+            if saved_run is None:
                 raise HTTPException(409, detail="The saved synthetic manifest is unavailable")
+            if synthetic_runs.requires_regeneration(saved_run):
+                operations.update_details(operation_id, retry_available=False, resume_available=False,
+                                          legacy_parquet_incompatible=True)
+                raise HTTPException(
+                    409,
+                    detail=("This saved run contains verified timestamp files generated with an older format. "
+                            "Start a new Synthetic Data run; the existing files remain in the DEV staging Volume."),
+                )
             capability = __import__("dexter.services.synthetic_runtime", fromlist=["probe_memory_scope"]).probe_memory_scope()
             if not capability.available:
                 raise HTTPException(503, detail=capability.message)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from dexter.db.database import transaction
+from dexter.services.synthetic_generation import PARQUET_SCHEMA_VERSION
 
 
 def _now() -> str:
@@ -30,6 +31,7 @@ class SyntheticRunRepository:
         manifest = {"version": 1, "run_id": run_id, "operation_id": operation_id,
                     "state": "QUEUED", "plan": plan, "destination": destination, "files": [],
                     "review": review or {},
+                    "parquet_schema_version": PARQUET_SCHEMA_VERSION,
                     "generator_versions": {name: _version(name) for name in ("duckdb", "pyarrow", "mimesis")}}
         with transaction(self.db_path) as conn:
             conn.execute(
@@ -61,6 +63,26 @@ class SyntheticRunRepository:
             return None
         manifest = run.get("manifest") or {}
         return run if manifest.get("state") == "COMPLETED" and run.get("state") == "COMPLETED" else None
+
+    @staticmethod
+    def requires_regeneration(run: dict[str, Any]) -> bool:
+        """Legacy naive Parquet timestamps cannot be safely resumed as Delta TIMESTAMP."""
+        manifest = run.get("manifest") or {}
+        try:
+            schema_version = int(manifest.get("parquet_schema_version") or 0)
+        except (TypeError, ValueError):
+            schema_version = 0
+        if schema_version >= PARQUET_SCHEMA_VERSION:
+            return False
+        fields = ((run.get("plan") or {}).get("schema") or {}).get("fields") or []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            data_type = str(field.get("original_type") or field.get("canonical_type") or "").strip().upper()
+            base_type = data_type.split("(", 1)[0].strip()
+            if base_type == "TIMESTAMP":
+                return True
+        return False
 
     def verifies_table_provenance(self, run_id: str, *, destination: dict[str, Any],
                                   workspace_identity: dict[str, str], table_id: str | None) -> bool:

@@ -131,7 +131,7 @@ class SyntheticGenerationTests(unittest.TestCase):
                 kind = db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [files[0]["path"]]).fetchone()[1]
             finally:
                 db.close()
-        self.assertEqual(kind, "TIMESTAMP")
+        self.assertEqual(kind, "TIMESTAMP WITH TIME ZONE")
         self.assertEqual(len(values), 3)
 
     def test_random_string_is_deterministic_and_generator_contract_is_shared(self):
