@@ -7,7 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dexter.adapters.databricks_sql import StatementExecutionError, execute_statement
-from dexter.services.synthetic_runtime import probe_memory_scope, start_memory_scoped_worker, stop_memory_scoped_worker
+from dexter.services.synthetic_runtime import (probe_memory_scope, start_memory_scoped_worker,
+    stop_memory_scoped_worker, stop_synthetic_supervisor, wait_memory_scoped_worker)
 from dexter.db.database import migrate
 from dexter.services.operations import OperationsService
 
@@ -33,6 +34,26 @@ class SyntheticRuntimeTests(unittest.TestCase):
         with patch("dexter.services.synthetic_runtime.os.killpg") as kill:
             stop_memory_scoped_worker("dexter-pid-4567")
         kill.assert_called_once()
+
+    def test_cancel_systemd_worker_stops_its_entire_unit_cgroup(self):
+        with patch("dexter.services.synthetic_runtime.shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("dexter.services.synthetic_runtime.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+            stop_memory_scoped_worker("dexter-synthetic-abcdef-a01-123abc.service")
+        self.assertEqual(run.call_args.args[0][2:4], ["stop", "dexter-synthetic-abcdef-a01-123abc"])
+
+    def test_cancel_supervisor_targets_its_separate_process_group(self):
+        with patch("dexter.services.synthetic_runtime.os.killpg") as kill:
+            stop_synthetic_supervisor("dexter-supervisor-pid-4567")
+        kill.assert_called_once()
+
+    def test_wait_returns_systemd_oom_result_for_precise_classification(self):
+        response = SimpleNamespace(returncode=0,
+            stdout="ActiveState=failed\nResult=oom-kill\nExecMainStatus=1\n")
+        with patch("dexter.services.synthetic_runtime.shutil.which", return_value="/usr/bin/systemctl"), \
+             patch("dexter.services.synthetic_runtime.subprocess.run", return_value=response):
+            outcome = wait_memory_scoped_worker("dexter-synthetic-abcdef-a01-123abc.service", None)
+        self.assertEqual(outcome["result"], "oom-kill")
+        self.assertEqual(outcome["exit_code"], 1)
 
     def test_statement_adapter_polls_real_states_and_reports_phase(self):
         states = iter(["RUNNING", "SUCCEEDED"])

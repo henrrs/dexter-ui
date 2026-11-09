@@ -115,7 +115,7 @@ class WorkflowApiTests(unittest.TestCase):
         body = {**self.body, "review_id": "318755f4-1bc1-4cee-8bf5-ec286effba3c"}
         review = self.client.post("/api/synthetic/review", json=body).json()
         start = {**body, "plan_digest": review["plan_digest"], "confirm_destructive": True}
-        with patch("dexter.services.synthetic_runtime.start_memory_scoped_worker", return_value="fixture-worker") as worker:
+        with patch("dexter.services.synthetic_runtime.start_synthetic_supervisor", return_value="fixture-supervisor") as worker:
             first = self.client.post("/api/synthetic/runs", json=start)
             # Even if the remote workspace disappears after acceptance, a retry gets the saved operation.
             self.workspace.tables.get.side_effect = ConnectionError()

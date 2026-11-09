@@ -72,6 +72,21 @@ class SyntheticPlanTests(unittest.TestCase):
         self.assertTrue(any("requires values" in error for error in errors))
         self.assertTrue(any("between 0 and 100" in error for error in errors))
 
+    def test_rejects_oversized_fixed_and_enum_literals_before_worker_start(self):
+        string_schema = schema([{"name": "label", "original_type": "STRING", "canonical_type": "string"}])
+        fixed = SyntheticGenerationPlan(string_schema, 1, (
+            ColumnRule("label", "fixed", {"value": "x" * (64 * 1024 + 1)}),
+        ))
+        self.assertTrue(any("64 KiB" in error for error in fixed.validate()))
+        too_many = SyntheticGenerationPlan(string_schema, 1, (
+            ColumnRule("label", "enum", {"values": [f"value-{index}" for index in range(1_001)]}),
+        ))
+        self.assertTrue(any("1,000 value limit" in error for error in too_many.validate()))
+        too_large_pool = SyntheticGenerationPlan(string_schema, 1, (
+            ColumnRule("label", "enum", {"values": ["x" * 60_000 for _ in range(18)]}),
+        ))
+        self.assertTrue(any("1 MiB generation safety limit" in error for error in too_large_pool.validate()))
+
     def test_rejects_type_incompatible_rules_and_numeric_overflow_before_generation(self):
         typed = schema([
             {"name": "amount", "original_type": "DECIMAL(5,2)", "canonical_type": "decimal", "nullable": False},

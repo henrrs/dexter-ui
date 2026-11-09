@@ -1989,16 +1989,19 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                                   source=reviewed["source"], runtime_capability=capability.mechanism,
                                   qualified_name=synthetic_qualified_name, environment="dev",
                                   destination_strategy=synthetic_destination.get("strategy"),
-                                  total_rows=body.row_count, retry_available=True, phase="queued")
+                                  total_rows=body.row_count, retry_available=True, phase="queued",
+                                  memory_retry_count=0, generation_batch_rows_limit=10_000,
+                                  duckdb_memory_limit_mb=64, memory_limit_bytes=256 * 1024 * 1024)
         if not operations.acquire_worker_lease(operation["id"], worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS):
             raise HTTPException(409, detail="The synthetic worker could not claim the queued operation")
         try:
-            from dexter.services.synthetic_runtime import start_memory_scoped_worker
-            from dexter.services.synthetic_runtime import runtime_entrypoint
-            unit = start_memory_scoped_worker(operation["id"], [*runtime_entrypoint(), "--operation-id", operation["id"],
+            from dexter.services.synthetic_runtime import start_synthetic_supervisor
+            supervisor = start_synthetic_supervisor(["--operation-id", operation["id"],
                 "--worker-id", worker_id, "--database", str(paths.database), "--config-dir", str(paths.config),
                 "--temporary-dir", str(paths.temporary)])
-            operations.update_details(operation["id"], worker_unit=unit)
+            # Do not write worker_unit here: the supervisor may already have
+            # launched and registered the bounded worker before this returns.
+            operations.update_details(operation["id"], worker_supervisor_unit=supervisor)
         except Exception as exc:
             operations.release_worker_lease(operation["id"], worker_id)
             operations.transition(operation["id"], "failed", message="Synthetic worker could not start",
@@ -2454,11 +2457,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 raise ValueError("Cancellation is disabled after table recreation begins; let the operation finish or reconcile its remote state")
             operation = operations.request_cancel(operation_id)
             if operation.get("kind") == "synthetic-data" and operation.get("details", {}).get("worker_unit"):
-                # The worker polls the durable cancellation flag between chunks and SQL
-                # statements. The unit remains available for lease-based recovery.
+                # Stop the complete worker cgroup, including any generation/upload child.
                 from dexter.services.synthetic_runtime import stop_memory_scoped_worker
                 threading.Thread(target=stop_memory_scoped_worker,
                     args=(operation["details"]["worker_unit"],), daemon=True).start()
+            if operation.get("kind") == "synthetic-data" and operation.get("details", {}).get("worker_supervisor_unit"):
+                from dexter.services.synthetic_runtime import stop_synthetic_supervisor
+                threading.Thread(target=stop_synthetic_supervisor,
+                    args=(operation["details"]["worker_supervisor_unit"],), daemon=True).start()
             return operation
         except KeyError:
             raise HTTPException(404, detail="Operation not found") from None
@@ -2478,7 +2484,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             if not isinstance(run_id, str):
                 raise HTTPException(409, detail="The saved synthetic manifest is unavailable")
             from dexter.services.synthetic_runs import SyntheticRunRepository
-            from dexter.services.synthetic_runtime import runtime_entrypoint, start_memory_scoped_worker
+            from dexter.services.synthetic_runtime import start_synthetic_supervisor
             synthetic_runs = SyntheticRunRepository(paths.database)
             saved_run = synthetic_runs.get(run_id)
             if saved_run is None:
@@ -2499,10 +2505,14 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 queued = operations.requeue_synthetic(operation_id)
                 if not operations.acquire_worker_lease(operation_id, worker_id, lease_seconds=QUEUED_WORKER_LEASE_SECONDS):
                     raise HTTPException(409, detail="Another worker owns this synthetic data run")
-                unit = start_memory_scoped_worker(operation_id, [*runtime_entrypoint(), "--operation-id", operation_id,
+                # Clear a stale prior attempt before launching its replacement.
+                operations.update_details(operation_id, worker_unit=None,
+                                          worker_supervisor_unit=None)
+                supervisor = start_synthetic_supervisor(["--operation-id", operation_id,
                     "--worker-id", worker_id, "--database", str(paths.database), "--config-dir", str(paths.config),
                     "--temporary-dir", str(paths.temporary)])
-                operations.update_details(operation_id, worker_unit=unit, runtime_capability=capability.mechanism)
+                operations.update_details(operation_id, worker_supervisor_unit=supervisor,
+                                           runtime_capability=capability.mechanism)
                 return operations.get(operation_id)
             except HTTPException:
                 raise

@@ -105,6 +105,35 @@ class OperationsService:
             conn.execute("UPDATE operations SET state='queued',message='Resuming verified synthetic data stages',error_code=NULL,error_message=NULL,cancel_requested=0,updated_at=?,finished_at=NULL WHERE id=?", (stamp, operation_id))
             return self._serialize(conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone())
 
+    def record_supervised_worker_stop(self, operation_id: str, *, state: str,
+                                      message: str, error_code: str,
+                                      error_message: str, details: dict | None = None) -> dict:
+        """Persist an OS-observed worker exit, including a killed worker with no cleanup."""
+        if state not in {"failed", "interrupted"}:
+            raise ValueError("A supervised worker stop must be failed or interrupted")
+        stamp = now()
+        with transaction(self.db_path) as conn:
+            row = conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            if row["state"] in {"succeeded", "cancelled"}:
+                return self._serialize(row)
+            current = json.loads(row["details_json"] or "{}")
+            current.update(details or {})
+            destructive = bool(current.get("destructive_started") or current.get("reconciliation_required"))
+            if destructive:
+                current["retry_available"] = False
+                current["resume_available"] = False
+                current["reconciliation_required"] = True
+            conn.execute(
+                "UPDATE operations SET state=?,message=?,error_code=?,error_message=?,details_json=?,updated_at=?,finished_at=? WHERE id=?",
+                (state, message, error_code, error_message, json.dumps(current, separators=(",", ":")),
+                 stamp, stamp, operation_id),
+            )
+            conn.execute("DELETE FROM operation_worker_leases WHERE operation_id=?", (operation_id,))
+            result = conn.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+            return self._serialize(result)
+
     def chunk_records(self, operation_id: str) -> list[dict]:
         with transaction(self.db_path) as conn:
             rows = conn.execute("SELECT checkpoint_json FROM materialization_chunks WHERE operation_id=? ORDER BY chunk_index", (operation_id,)).fetchall()

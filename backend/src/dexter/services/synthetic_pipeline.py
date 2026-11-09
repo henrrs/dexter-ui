@@ -23,8 +23,10 @@ from dexter.services.operations import OperationsService
 from dexter.services.synthetic_generation import GenerationError, generate_parquet_chunks
 from dexter.services.synthetic_runs import SyntheticRunRepository
 
-MAX_PENDING_FILES = 2
+MAX_PENDING_FILES = 1
 QUEUE_CAPACITY = 1
+INITIAL_BATCH_ROWS_LIMIT = 10_000
+OPERATIONAL_MEMORY_LIMIT_BYTES = int(256 * 1024 * 1024 * 0.8)
 
 
 class SyntheticPipelineError(RuntimeError):
@@ -72,9 +74,11 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
         operations.update_details(operation_id, phase="generation_upload", generated_rows=0, uploaded_rows=0,
                                   total_rows=int(run["plan"]["row_count"]), generated_bytes=0, uploaded_bytes=0,
                                   file_count=0, memory_limit_bytes=(256 * 1024 * 1024 if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") != "1" else None),
-                                  rss_guard_bytes=(220 * 1024 * 1024 if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") == "1" else None),
+                                  rss_guard_bytes=(OPERATIONAL_MEMORY_LIMIT_BYTES if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") == "1" else None),
+                                  generation_batch_rows_limit=int((operation.get("details") or {}).get("generation_batch_rows_limit", INITIAL_BATCH_ROWS_LIMIT)),
+                                  duckdb_memory_limit_mb=int((operation.get("details") or {}).get("duckdb_memory_limit_mb", 64)),
                                   max_pending_files=MAX_PENDING_FILES, staging_limit_bytes=128 * 1024 * 1024,
-                                  local_rss_bytes=_rss())
+                                  local_rss_bytes=_rss(), memory_metrics=_memory_metrics())
         _log(operations, operation_id, "Synthetic generation and upload started")
         _run_generation_upload(operations, runs, operation_id, run_id, run,
                                config_dir, temporary_dir)
@@ -181,12 +185,13 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
         current_details = (operations.get(operation_id) or {}).get("details", {})
         failed_phase = str(current_details.get("phase") or "unknown")
         diagnostic = safe_diagnostic_text(str(exc), limit=180)
+        error_code = "SYNTHETIC_ENGINE_MEMORY_LIMIT" if _is_engine_memory_error(exc) else "WORKER_FAILURE"
         operations.update_details(operation_id, failed_phase=failed_phase,
                                   failure_type=type(exc).__name__, failure_summary=diagnostic)
         detail = f" Details: {diagnostic}." if diagnostic else " Check the local Dexter log for the worker traceback."
         message = (f"The synthetic data operation failed during {failed_phase.replace('_', ' ')} "
                    f"({type(exc).__name__}).{detail} The manifest was kept for recovery.")
-        _fail(operations, runs, operation_id, run_id, message, "WORKER_FAILURE")
+        _fail(operations, runs, operation_id, run_id, message, error_code)
     finally:
         stop_heartbeat.set()
         heartbeat.join(timeout=2)
@@ -234,6 +239,11 @@ def _run_generation_upload(operations: OperationsService, runs: SyntheticRunRepo
     local_ready: list[tuple[dict, Path]] = []
     chunk_by_index = {int(item["chunk_index"]): item for item in chunks}
 
+    # A worker killed between Parquet close and manifest checkpoint can leave an
+    # untracked final file. Remove only files absent from this run's durable
+    # manifest; confirmed local checkpoints remain resumable.
+    _prune_uncheckpointed_local_files(staging, chunks)
+
     # Reconcile every previously confirmed remote file before considering local cleanup.
     for item in chunks:
         index = int(item["chunk_index"])
@@ -277,9 +287,24 @@ def _run_generation_upload(operations: OperationsService, runs: SyntheticRunRepo
             return True
         return False
 
+    def check_memory_guard() -> dict[str, int | None]:
+        memory = _memory_metrics()
+        cgroup_limit = memory.get("cgroup_limit_bytes")
+        if isinstance(cgroup_limit, int) and cgroup_limit > 0:
+            observed = memory.get("cgroup_current_bytes") or 0
+            guard_limit = min(OPERATIONAL_MEMORY_LIMIT_BYTES, int(cgroup_limit * 0.8))
+        else:
+            observed = memory.get("rss_bytes") or 0
+            guard_limit = OPERATIONAL_MEMORY_LIMIT_BYTES
+        if observed > guard_limit:
+            _log(operations, operation_id,
+                 f"Generation memory guard reached: observed={observed} bytes, operational_limit={guard_limit}, metrics={memory}",
+                 "warning")
+            raise SyntheticPipelineError("Generation is reducing its memory use before continuing", "RSS_GUARD_LIMIT_REACHED")
+        return memory
+
     def update_progress(message: str) -> None:
-        if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") == "1" and (_rss() or 0) > 220 * 1024 * 1024:
-            raise SyntheticPipelineError("The isolated worker reached its monitored RSS safety threshold; uploaded files were retained for resume", "RSS_GUARD_LIMIT_REACHED")
+        memory = check_memory_guard()
         with state_lock:
             total = plan.row_count
             produced = min(total, totals["generated"])
@@ -290,7 +315,8 @@ def _run_generation_upload(operations: OperationsService, runs: SyntheticRunRepo
             operations.update_details(operation_id, phase="generation_upload",
                 generated_rows=produced, uploaded_rows=uploaded, file_count=totals["files"],
                 generated_bytes=totals["generated_bytes"], uploaded_bytes=totals["uploaded_bytes"],
-                staging_bytes=staged, local_rss_bytes=_rss(), active_uploads=1 if uploaded < produced else 0)
+                staging_bytes=staged, local_rss_bytes=memory.get("rss_bytes"),
+                memory_metrics=memory, active_uploads=1 if uploaded < produced else 0)
 
     def uploader() -> None:
         while True:
@@ -353,11 +379,13 @@ def _run_generation_upload(operations: OperationsService, runs: SyntheticRunRepo
             pending.put((file, prior))
         def acquire_for_chunk(_count: int) -> None:
             _acquire_slot(permits, is_cancelled)
-            if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") == "1" and (_rss() or 0) > 220 * 1024 * 1024:
-                raise SyntheticPipelineError("The isolated worker reached its monitored RSS safety threshold; uploaded files were retained for resume", "RSS_GUARD_LIMIT_REACHED")
+            check_memory_guard()
         for file in generate_parquet_chunks(plan, staging, before_chunk=acquire_for_chunk,
                 staging_limit_bytes=128 * 1024 * 1024, chunk_schedule=schedule, skip_parts=skip_parts,
-                duckdb_memory_limit="64MB" if os.getenv("DEXTER_SYNTHETIC_RSS_GUARD") == "1" else "192MB"):
+                duckdb_memory_limit=f"{int((operations.get(operation_id) or {}).get('details', {}).get('duckdb_memory_limit_mb', 64))}MB",
+                batch_rows_limit=int((operations.get(operation_id) or {}).get("details", {}).get(
+                    "generation_batch_rows_limit", INITIAL_BATCH_ROWS_LIMIT)),
+                before_batch=check_memory_guard):
             if is_cancelled():
                 # The completed file is durable and remains in the manifest for resume.
                 runs.record_file(run_id, file)
@@ -447,6 +475,21 @@ def _directory_bytes(path: Path) -> int:
         return 0
 
 
+def _prune_uncheckpointed_local_files(staging: Path, chunks: list[dict]) -> int:
+    """Remove temporary or unmanifested Parquet output from this private run dir."""
+    tracked_files = {str(item.get("file_name")) for item in chunks}
+    removed = 0
+    for candidate in staging.iterdir():
+        if not candidate.is_file():
+            continue
+        untracked_part = (candidate.name.startswith("part-") and candidate.name.endswith(".parquet")
+                          and candidate.name not in tracked_files)
+        if candidate.name.endswith(".tmp") or untracked_part:
+            candidate.unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
 def _cleanup_remote(workspace: Any, directory: str) -> str | None:
     """Delete only files beneath this completed run directory, then the empty directory."""
     root = directory.rstrip("/") + "/"
@@ -471,6 +514,18 @@ def _cleanup_remote(workspace: Any, directory: str) -> str | None:
 def _rss() -> int | None:
     from dexter.services.synthetic_runtime import report_runtime_rss
     return report_runtime_rss()
+
+
+def _memory_metrics() -> dict[str, int | None]:
+    from dexter.services.synthetic_runtime import report_runtime_memory_metrics
+    return report_runtime_memory_metrics()
+
+
+def _is_engine_memory_error(error: BaseException) -> bool:
+    """Recognize explicit Python, DuckDB, or Arrow allocation failures only."""
+    return isinstance(error, MemoryError) or type(error).__name__ in {
+        "OutOfMemoryException", "ArrowMemoryError", "OutOfMemoryError"
+    }
 
 
 def _heartbeat(operations: OperationsService, operation_id: str, worker_id: str, stop: threading.Event) -> None:

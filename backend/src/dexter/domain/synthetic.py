@@ -12,6 +12,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 MAX_ROWS = 1_000_000
+MAX_SYNTHETIC_LITERAL_BYTES = 64 * 1024
+MAX_ENUM_VALUES = 1_000
+MAX_ENUM_TEXT_BYTES = 1024 * 1024
 SUPPORTED_GENERATORS = {
     "sequence", "integer_range", "decimal_range", "date_range", "timestamp_range", "boolean",
     "enum", "fixed", "random_string", "name", "email", "company", "address", "phone",
@@ -267,6 +270,16 @@ class SyntheticGenerationPlan:
                 errors.append(f"fixed value is incompatible with {data_type} column {rule.column}")
             elif rule.generator == "fixed" and params.get("value") is not None and data_type in {"DECIMAL", "NUMERIC"} and not _decimal_fits(params.get("value"), field_schema):
                 errors.append(f"fixed value exceeds the declared precision or scale for {rule.column}")
+            if rule.generator == "fixed" and params.get("value") is not None:
+                try:
+                    literal = params["value"]
+                    literal_size = (len(str(literal).encode("utf-8", errors="replace"))
+                                    if isinstance(literal, (str, int, float, bool))
+                                    else MAX_SYNTHETIC_LITERAL_BYTES + 1)
+                except (ValueError, OverflowError):
+                    literal_size = MAX_SYNTHETIC_LITERAL_BYTES + 1
+                if literal_size > MAX_SYNTHETIC_LITERAL_BYTES:
+                    errors.append(f"fixed value for {rule.column} exceeds the 64 KiB generation safety limit")
             field_constraints = field_schema.get("constraints") or []
             if isinstance(field_constraints, str):
                 field_constraints = [field_constraints]
@@ -291,6 +304,14 @@ class SyntheticGenerationPlan:
                 errors.append(f"enum for {rule.column} requires values")
             if rule.generator == "enum":
                 values = params.get("values")
+                if isinstance(values, list) and len(values) > MAX_ENUM_VALUES:
+                    errors.append(f"enum for {rule.column} exceeds the {MAX_ENUM_VALUES:,} value limit")
+                if isinstance(values, list):
+                    text_sizes = [len(value.encode("utf-8", errors="replace")) for value in values if isinstance(value, str)]
+                    if any(size > MAX_SYNTHETIC_LITERAL_BYTES for size in text_sizes):
+                        errors.append(f"enum text for {rule.column} contains a value above the 64 KiB generation safety limit")
+                    if sum(text_sizes) > MAX_ENUM_TEXT_BYTES:
+                        errors.append(f"enum text for {rule.column} exceeds the 1 MiB generation safety limit")
                 if isinstance(values, list) and any(not _value_matches_type(value, field_schema) for value in values):
                     errors.append(f"enum values are incompatible with {data_type} column {rule.column}")
                 weights = params.get("weights")

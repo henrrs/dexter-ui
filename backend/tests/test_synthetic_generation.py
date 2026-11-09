@@ -8,10 +8,36 @@ import duckdb
 import pyarrow
 
 from dexter.domain.synthetic import ColumnRule, SyntheticGenerationPlan
-from dexter.services.synthetic_generation import generate_parquet_chunks
+from dexter.services.synthetic_generation import generate_parquet_chunks, plan_generation_batch_rows
 
 
 class SyntheticGenerationTests(unittest.TestCase):
+    def test_wide_schema_plans_smaller_batches_and_writes_multiple_row_groups(self):
+        import pyarrow.parquet as pq
+
+        fields = [{"name": f"field_{index}", "original_type": "STRING", "canonical_type": "string"}
+                  for index in range(30)]
+        schema = {"qualified_name": "dev.gold.wide", "fields": fields}
+        rules = tuple(ColumnRule(field["name"], "random_string") for field in fields)
+        rules_by_name = {rule.column.casefold(): rule for rule in rules}
+        batch_rows = plan_generation_batch_rows(fields, rules_by_name)
+        self.assertGreater(batch_rows, 0)
+        self.assertLess(batch_rows, 10_000)
+        self.assertLessEqual(batch_rows * 30 * 256, 8 * 1024 * 1024)
+
+        plan = SyntheticGenerationPlan(schema, 5_000, rules, seed=81)
+        with tempfile.TemporaryDirectory() as folder:
+            files = list(generate_parquet_chunks(plan, Path(folder), chunk_rows=5_000))
+            metadata = pq.ParquetFile(files[0]["path"]).metadata
+        self.assertEqual(sum(item["rows"] for item in files), 5_000)
+        self.assertGreater(metadata.num_row_groups, 1)
+
+    def test_planner_never_exceeds_row_limit_and_falls_back_to_single_row(self):
+        narrow_fields = [{"name": "id", "original_type": "BIGINT", "canonical_type": "bigint"}]
+        narrow_rules = {"id": ColumnRule("id", "sequence", unique=True)}
+        self.assertEqual(plan_generation_batch_rows(narrow_fields, narrow_rules), 10_000)
+        self.assertEqual(plan_generation_batch_rows(narrow_fields, narrow_rules, memory_limit_bytes=128 * 1024 * 1024), 1)
+
     def test_typed_parquet_output_is_incremental_and_reproducible_across_chunk_sizes(self):
         schema = {"qualified_name": "dev.gold.test", "complete": True, "fields": [
             {"name": "id", "original_type": "BIGINT", "canonical_type": "bigint", "nullable": False},

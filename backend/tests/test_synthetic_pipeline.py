@@ -12,7 +12,8 @@ from unittest.mock import patch
 from dexter.db.database import migrate
 from dexter.domain.synthetic import ColumnRule, SyntheticGenerationPlan
 from dexter.services.operations import OperationsService, SettingsRepository
-from dexter.services.synthetic_pipeline import run_synthetic_operation
+from dexter.services.synthetic_pipeline import (_is_engine_memory_error, _prune_uncheckpointed_local_files,
+                                                run_synthetic_operation)
 from dexter.services.synthetic_runs import SyntheticRunRepository
 
 
@@ -58,6 +59,27 @@ class SyntheticPipelineTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_recovery_prunes_only_uncheckpointed_local_parts_and_temporary_files(self):
+        staging = self.root / "temporary" / "synthetic" / "run"
+        staging.mkdir(parents=True)
+        tracked = staging / "part-000001.parquet"
+        orphan = staging / "part-000002.parquet"
+        temporary = staging / ".part-000003.parquet.123.tmp"
+        for path in (tracked, orphan, temporary):
+            path.write_bytes(b"fixture")
+        removed = _prune_uncheckpointed_local_files(staging, [{"file_name": tracked.name}])
+        self.assertEqual(removed, 2)
+        self.assertTrue(tracked.is_file())
+        self.assertFalse(orphan.exists())
+        self.assertFalse(temporary.exists())
+
+    def test_only_explicit_engine_allocation_errors_are_classified_as_memory_pressure(self):
+        class OutOfMemoryException(Exception):
+            pass
+        self.assertTrue(_is_engine_memory_error(MemoryError()))
+        self.assertTrue(_is_engine_memory_error(OutOfMemoryException()))
+        self.assertFalse(_is_engine_memory_error(ValueError("unrelated validation error")))
+
     def create_run(self):
         operation = self.operations.create("synthetic-data", "Queued")
         run_id = "12345678-1234-5678-1234-567812345678"
@@ -84,6 +106,7 @@ class SyntheticPipelineTests(unittest.TestCase):
         with patch("dexter.services.synthetic_pipeline._dev_workspace", return_value=workspace), \
              patch("dexter.services.synthetic_pipeline.ensure_staging_volume", return_value="/Volumes/sandbox/qa/dexter"), \
              patch("dexter.services.synthetic_pipeline.create_run_directory", return_value=remote_root), \
+             patch("dexter.services.synthetic_pipeline.require_sql_read_access"), \
              patch("dexter.services.synthetic_pipeline.ensure_sql_warehouse_running"), \
              patch("dexter.services.synthetic_pipeline.upload_verified", side_effect=upload), \
              patch("dexter.services.synthetic_pipeline.publish_verified_run", return_value={
