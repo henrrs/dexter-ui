@@ -569,6 +569,9 @@ def publish_verified_run(workspace: Any, *, warehouse_id: str, destination: dict
     if strategy == "append" and final_count != int(append_baseline or 0) + expected_rows:
         raise SyntheticPublishError("The final row count does not match the saved Append baseline plus this run", "PUBLISHED_ROW_COUNT_MISMATCH")
     return {"target": full_name, "strategy": strategy, "row_count": final_count,
+            # `row_count` remains the verified destination total for compatibility.
+            # `rows_published` is the contribution of this run, which differs for Append.
+            "rows_published": expected_rows, "total_rows": final_count,
             "schema": final_schema, "storage_type": storage_type,
             "external_location": final_location, "table_id": _field(final_info, "table_id"),
             "table_properties": _safe_synthetic_properties(_field(final_info, "properties") or {}),

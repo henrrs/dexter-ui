@@ -1760,17 +1760,22 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             from dexter.adapters.databricks_synthetic_publisher import external_uri_is_safe
             selected_external = None
             if destination["storage_type"] == "external" and destination["strategy"] in {"create", "isolated", "drop_recreate"}:
-                location_name = destination.get("external_location_name")
+                from dexter.domain.synthetic import expected_dev_external_location_name
+                location_name = expected_dev_external_location_name(destination["catalog"], destination["schema"])
+                if not location_name:
+                    raise HTTPException(422, detail="The DEV catalog and schema cannot be mapped to an External Location name")
                 locations = list(workspace.external_locations.list())
-                match = next((item for item in locations if getattr(item, "name", None) == location_name), None)
+                match = next((item for item in locations
+                              if str(getattr(item, "name", "")).casefold() == location_name.casefold()), None)
                 if not match:
-                    raise HTTPException(403, detail="Select an External Location available to the DEV profile")
+                    raise HTTPException(403, detail=f"The expected DEV External Location {location_name} is not available to this profile")
                 selected_external = {"name": str(match.name), "url": str(getattr(match, "url", "")),
                                      "read_only": bool(getattr(match, "read_only", False))}
+                destination["external_location_name"] = str(match.name)
                 if selected_external["read_only"] or not selected_external["url"]:
-                    raise HTTPException(403, detail="The selected External Location is read-only or has no verified URL")
+                    raise HTTPException(403, detail=f"The expected DEV External Location {location_name} is read-only or has no verified URL")
                 if not external_uri_is_safe(selected_external["url"]):
-                    raise HTTPException(422, detail="The selected External Location URL contains credential-like components; configure it through a Unity Catalog storage credential")
+                    raise HTTPException(422, detail="The configured DEV External Location URL contains credential-like components; configure it through a Unity Catalog storage credential")
             elif exists and actual_storage == "external":
                 safe_location = str(actual_location or "")
                 if safe_location and not external_uri_is_safe(safe_location):
@@ -1987,6 +1992,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         try:
             warehouses, warnings = [], []
             if catalog is None:
+                expected_external_location_name = None
                 catalogs_page = discover.cached_children("databricks:dev")
                 catalogs = [{"name": item.get("name")} for item in catalogs_page.get("items", [])
                             if isinstance(item, dict) and item.get("name")]
@@ -2047,8 +2053,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                         logger.info("Optional destination suggestion unavailable (%s)", type(exc).__name__)
                         warnings.append({"code": "metadata_unavailable", "message": "Reference metadata is unavailable. Choose a DEV destination manually or retry reference metadata in Schema.", "resource": "reference_metadata"})
                         suggestion = None
-                # Location scores are hints only. A location is auto-suggested only when the
-                # highest score is unique and effective DEV grants have been verified.
+                if suggestion:
+                    from dexter.domain.synthetic import expected_dev_external_location_name
+                    expected_external_location_name = expected_dev_external_location_name(
+                        str(suggestion.get("catalog") or ""), str(suggestion.get("schema") or ""))
+                # Location scores are diagnostic only; only the governed name convention may be suggested.
                 if locations:
                     from dexter.adapters.databricks_synthetic_publisher import _privileges
                     from dexter.domain.synthetic import rank_external_locations
@@ -2082,6 +2091,7 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                         suggestion["suggested_external_location"] = best_location
                 return {"catalogs": catalogs, "schemas": [], "tables": [], "warehouses": warehouses,
                         "external_locations": external_locations, "suggestion": suggestion,
+                        "expected_external_location_name": expected_external_location_name,
                         "source_storage_type": source_storage_type, "warnings": warnings}
             if schema is None:
                 schema_page = discover.children(f"databricks:dev:{catalog}")
@@ -2097,6 +2107,10 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             target_storage_type = None
             target_format = None
             target_state = "unchecked"
+            expected_external_location_name = None
+            if catalog and schema:
+                from dexter.domain.synthetic import expected_dev_external_location_name
+                expected_external_location_name = expected_dev_external_location_name(catalog, schema)
             if table and catalog and schema:
                 try:
                     target = workspace.tables.get(full_name=f"{catalog}.{schema}.{table}")
@@ -2107,7 +2121,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                         raise
                     return {"catalogs": [], "schemas": [], "tables": tables, "warehouses": [],
                             "external_locations": [], "target_state": "absent", "target_schema": None,
-                            "drop_recreate_eligible": False}
+                            "drop_recreate_eligible": False,
+                            "expected_external_location_name": expected_external_location_name}
                 target_state = "present"
                 from dexter.domain.schema import canonical_schema
                 from dexter.services.synthetic_runs import SyntheticRunRepository
@@ -2130,7 +2145,8 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
             return {"catalogs": [], "schemas": schemas, "tables": tables, "target_schema": target_schema, "target_state": target_state,
                     "target_storage_type": target_storage_type, "target_format": target_format,
                     "drop_recreate_eligible": drop_recreate_eligible,
-                    "warehouses": warehouses, "external_locations": []}
+                    "warehouses": warehouses, "external_locations": [],
+                    "expected_external_location_name": expected_external_location_name}
         except HTTPException:
             raise
         except Exception as exc:

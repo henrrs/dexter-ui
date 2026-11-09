@@ -41,30 +41,49 @@ def generator_contract() -> list[dict[str, Any]]:
     return [{"id": name, **descriptor} for name, descriptor in GENERATOR_REGISTRY.items()]
 
 
+def expected_dev_external_location_name(catalog: str, schema: str) -> str | None:
+    """Return the governed DEV External Location name for one physical catalog/schema."""
+    catalog_name, schema_name = catalog.strip().casefold(), schema.strip().casefold()
+    catalog_name = re.sub(r"_dev$", "", catalog_name)
+    catalog_part = re.sub(r"[^a-z0-9]", "", catalog_name)
+    schema_part = re.sub(r"[^a-z0-9_-]", "", schema_name)
+    if not catalog_part or not schema_part:
+        return None
+    expected = f"corpdevlake{catalog_part}st-{schema_part}-external-location"
+    return expected if len(expected) <= 255 else None
+
+
 def rank_external_locations(locations: list[dict[str, Any]], *, catalog: str, schema: str,
                             table: str, authorized_names: set[str]) -> tuple[list[dict[str, Any]], str | None]:
-    """Rank DEV locations by catalog/schema path evidence; only suggest a unique authorized match."""
+    """Rank DEV locations for diagnostics; only select the configured catalog/schema location."""
     ranked = []
     table_hint = table.split("_", 1)[0]
+    expected_name = expected_dev_external_location_name(catalog, schema)
     for item in locations:
         name, url = str(item.get("name", "")), str(item.get("url", ""))
         read_only = bool(item.get("read_only", False))
         searchable = f"{name} {url}".casefold()
         has_catalog, has_schema = catalog.casefold() in searchable, schema.casefold() in searchable
         matches = [token for token in (catalog, schema, table_hint) if token and token.casefold() in searchable]
-        score = (5 if has_catalog else 0) + (4 if has_schema else 0) + (1 if len(matches) > 2 else 0)
+        exact_policy_match = bool(expected_name and name.casefold() == expected_name.casefold())
+        score = 100 if exact_policy_match else (5 if has_catalog else 0) + (4 if has_schema else 0) + (1 if len(matches) > 2 else 0)
         authorized = name in authorized_names and not read_only
+        reason = "Matches the configured DEV catalog/schema External Location" if exact_policy_match else (
+            "Matches " + ", ".join(matches) if matches else "No catalog or schema path match")
         ranked.append({"name": name, "url": url, "read_only": read_only, "score": score,
-                       "authorized": authorized, "reason": "Matches " + ", ".join(matches) if matches else "No catalog or schema path match"})
+                       "authorized": authorized, "reason": reason})
     ranked.sort(key=lambda item: (-item["score"], item["name"].casefold()))
-    eligible = [item for item in ranked if item["score"] >= 9 and item["authorized"]]
-    if len(eligible) == 1:
-        return ranked, eligible[0]["name"]
-    if eligible:
-        top_score = eligible[0]["score"]
-        top = [item for item in eligible if item["score"] == top_score]
-        if len(top) == 1:
-            return ranked, top[0]["name"]
+
+    # A location under the explicit corporate naming convention always wins.
+    # If it exists but cannot be authorized, never silently substitute another root.
+    policy_matches = [item for item in ranked if item["score"] == 100]
+    if policy_matches:
+        if len(policy_matches) == 1 and policy_matches[0]["authorized"]:
+            return ranked, policy_matches[0]["name"]
+        return ranked, None
+
+    # A fuzzy path match is useful diagnostic evidence, but it is not policy.
+    # Never substitute a different storage root for a missing/unavailable DEV location.
     return ranked, None
 TABLE_STRATEGIES = {"create", "isolated", "append", "replace", "drop_recreate"}
 TABLE_STORAGE_TYPES = {"managed", "external"}

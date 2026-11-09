@@ -766,6 +766,11 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 [data-workflow-tab][hidden] { display:none; }
 .synthetic-step-strip button,.schema-evolution-steps button { white-space:nowrap; overflow-wrap:normal; }
 .workflow-field-hint { color:var(--muted); font-size:10px; line-height:1.6; }
+.synthetic-external-location { grid-column:1/-1; display:flex; flex-direction:column; gap:3px; padding:8px 10px; border:1px solid var(--border); border-radius:5px; background:var(--panel-2); }
+.synthetic-external-location strong { color:var(--text); font-size:10px; font-weight:600; }
+.synthetic-external-location span { color:var(--text); overflow-wrap:anywhere; }
+.synthetic-external-location small { color:var(--muted); font-size:9px; }
+.synthetic-external-location[data-state="ready"] { border-color:#376d50; }
 .workflow-verification,.workflow-remote-warning { display:flex; align-items:center; flex-wrap:wrap; gap:8px; color:var(--muted); font-size:10px; }
 .workflow-remote-warning { color:var(--amber); padding:10px; border:1px solid var(--border); border-radius:5px; }
 .synthetic-schema-source { display:flex; align-items:center; flex-wrap:wrap; gap:8px; color:var(--muted); font-size:10px; }

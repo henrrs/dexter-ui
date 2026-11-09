@@ -844,40 +844,6 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     else void selectNode(tab.node, tab.environment)
   }
 
-  const openSyntheticDestination = async (destination: { catalog: string; schema: string; table: string }, compare = false) => {
-    try {
-      const refreshed = await api.discoverSources(true)
-      setSources(refreshed.items)
-      const catalogNode = refreshed.items.find((item) => item.kind === 'catalog' && item.variants?.some((variant) => variant.environment === 'dev' && variant.catalog?.toLowerCase() === destination.catalog.toLowerCase()))
-      if (!catalogNode) throw new Error('The new table was published, but its DEV catalog could not be refreshed yet.')
-      const schemaPage = await api.discoverCatalogChildren(catalogNode.id, true)
-      if (!Array.isArray(schemaPage) && schemaPage.error) throw new Error(schemaPage.error)
-      const schemaItems: DiscoverNode[] = (Array.isArray(schemaPage) ? schemaPage : schemaPage.items) as DiscoverNode[]
-      const schemaNode = schemaItems.find((item) => item.kind === 'schema' && item.variants?.some((variant) => variant.environment === 'dev' && variant.catalog?.toLowerCase() === destination.catalog.toLowerCase() && variant.schema?.toLowerCase() === destination.schema.toLowerCase()))
-      if (!schemaNode) throw new Error('The DEV schema could not be refreshed after publication.')
-      const tablePage = await api.discoverCatalogChildren(schemaNode.id, true)
-      if (!Array.isArray(tablePage) && tablePage.error) throw new Error(tablePage.error)
-      const tableItems: DiscoverNode[] = (Array.isArray(tablePage) ? tablePage : tablePage.items) as DiscoverNode[]
-      const tableNode = tableItems.find((item) => item.variants?.some((variant) => variant.environment === 'dev' && variant.catalog?.toLowerCase() === destination.catalog.toLowerCase() && variant.schema?.toLowerCase() === destination.schema.toLowerCase() && variant.table?.toLowerCase() === destination.table.toLowerCase()))
-      if (!tableNode) throw new Error('The published table is not visible in the refreshed DEV catalog. Check permissions or refresh metadata later.')
-      setPages((prior) => ({ ...prior, [catalogNode.id]: { items: schemaItems, stale: false, error: null }, [schemaNode.id]: { items: tableItems, stale: false, error: null } }))
-      setExpanded((prior) => new Set([...prior, catalogNode.id, schemaNode.id]))
-      setSelected(tableNode)
-      setActiveEnvironment('dev')
-      if (compare) {
-        const key = `${tableNode.id}:compare`
-        const state: CompareTabState = { referenceNodeId: tableNode.id, referenceEnvironment: 'dev', compareNodeId: tableNode.variants?.some((variant) => variant.environment === 'prod') ? tableNode.id : null, compareEnvironment: 'prod', loading: true, filter: 'all' }
-        const tab: WorkbenchTab = { key, node: tableNode, environment: 'dev', view: 'compare', comparison: state }
-        setWorkbenchTabs((prior) => prior.some((item) => item.key === key) ? prior.map((item) => item.key === key ? tab : item) : [...prior, tab])
-        setActiveTabKey(key); setActiveSection('compare'); void loadComparison(key, state)
-      } else {
-        await selectNode(tableNode, 'dev')
-      }
-    } catch (cause) {
-      setSourcesError(cause instanceof Error ? cause.message : 'The published DEV table could not be opened.')
-    }
-  }
-
   const purviewMetadata = selected?.purview_metadata ?? selected?.variants?.find((variant) => variant.environment === 'purview')?.metadata
   const purviewRecord = asRecord(purviewMetadata)
   const purviewAttributes = asRecord(purviewRecord?.attributes)
@@ -954,7 +920,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current))).catch(() => undefined)
             }
           }} onCompare={openCompare} />
-          : <SyntheticStudio active={active && activeTabKey === tab.key} contextTabId={tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => closeSyntheticTab(tab)} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
+          : <SyntheticStudio active={active && activeTabKey === tab.key} contextTabId={tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => closeSyntheticTab(tab)} onPublished={() => void refreshOpenHierarchy(true)} />}
       </div>)}{selected ? <>{activeSection === 'schema-evolution' || activeSection === 'synthetic' ? null : activeSection === 'compare' ? (() => {
         const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')
         const comparison = compareTab?.comparison

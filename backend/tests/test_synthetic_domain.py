@@ -4,7 +4,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from dexter.domain.synthetic import ColumnRule, MAX_ROWS, SchemaChangePlan, SyntheticGenerationPlan, rank_external_locations
+from dexter.domain.synthetic import (ColumnRule, MAX_ROWS, SchemaChangePlan, SyntheticGenerationPlan,
+                                    expected_dev_external_location_name, rank_external_locations)
 from dexter.db.database import migrate
 from dexter.services.operations import OperationsService
 from dexter.services.synthetic_runs import DestructiveTargetLocked, SyntheticRunRepository
@@ -18,15 +19,36 @@ def schema(fields=None):
 
 
 class SyntheticPlanTests(unittest.TestCase):
-    def test_external_location_requires_unique_catalog_schema_match_and_grants(self):
+    def test_expected_dev_external_location_follows_corporate_catalog_schema_convention(self):
+        self.assertEqual(expected_dev_external_location_name("tech_dev", "gold"),
+                         "corpdevlaketechst-gold-external-location")
+        self.assertEqual(expected_dev_external_location_name("tech", "gold"),
+                         "corpdevlaketechst-gold-external-location")
+        self.assertIsNone(expected_dev_external_location_name("", "gold"))
+
+    def test_policy_external_location_is_preferred_and_never_falls_back_without_grant(self):
+        expected = "corpdevlaketechst-gold-external-location"
+        candidates = [
+            {"name": "generic-gold", "url": "abfss://x/dev/tech/gold", "read_only": False},
+            {"name": expected, "url": "abfss://x/dev/tech/gold", "read_only": False},
+        ]
+        ranked, selected = rank_external_locations(candidates, catalog="tech_dev", schema="gold",
+                                                   table="customers", authorized_names={"generic-gold", expected})
+        self.assertEqual(selected, expected)
+        self.assertEqual(ranked[0]["name"], expected)
+        _ranked, selected_without_grant = rank_external_locations(
+            candidates, catalog="tech_dev", schema="gold", table="customers", authorized_names={"generic-gold"})
+        self.assertIsNone(selected_without_grant)
+
+    def test_external_location_fuzzy_match_is_never_substituted_for_governed_location(self):
         candidates = [
             {"name": "gold-root", "url": "abfss://x/dev/tech/gold", "read_only": False},
             {"name": "other-root", "url": "abfss://x/dev/tech/silver", "read_only": False},
             {"name": "readonly", "url": "abfss://x/dev/tech/gold", "read_only": True},
         ]
         ranked, suggestion = rank_external_locations(candidates, catalog="tech", schema="gold", table="customers", authorized_names={"gold-root", "other-root", "readonly"})
-        self.assertEqual(suggestion, "gold-root")
-        self.assertTrue(ranked[0]["authorized"])
+        self.assertIsNone(suggestion)
+        self.assertTrue(any(item["authorized"] for item in ranked))
         self.assertIsNone(rank_external_locations(candidates, catalog="tech", schema="gold", table="customers", authorized_names={"readonly"})[1])
         tied, no_suggestion = rank_external_locations([candidates[0], {**candidates[0], "name": "same"}], catalog="tech", schema="gold", table="customers", authorized_names={"gold-root", "same"})
         self.assertIsNone(no_suggestion)

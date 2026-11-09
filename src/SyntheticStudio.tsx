@@ -7,7 +7,7 @@ import { SchemaFieldEditor } from './SchemaFieldEditor'
 
 const steps = ['Destination', 'Schema', 'Generation Rules', 'Review', 'Execution'] as const
 type Step = 0 | 1 | 2 | 3 | 4
-type Props = { active?: boolean; node: DiscoverNode; contextTabId?: string; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onOpenTable?: (destination: SyntheticDestination) => void; onCompare?: (destination: SyntheticDestination) => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
+type Props = { active?: boolean; node: DiscoverNode; contextTabId?: string; sourceEnvironment: 'dev' | 'prod'; onClose: () => void; onPublished?: () => void; comparison?: { summary?: Record<string, number>; state?: string } }
 type Environment = 'prod' | 'dev'
 type SchemaVersion = { schema: CanonicalSchema; rules: SyntheticRule[] }
 type Draft = { schemaBase?: Environment; versions?: Partial<Record<Environment, SchemaVersion>>; step: number; rowCount: number; locale: 'pt_BR' | 'en_US'; seed: number; rules: SyntheticRule[]; schema: CanonicalSchema; schemaSource: 'source' | 'dev' | 'custom'; destination: Partial<SyntheticDestination> }
@@ -21,13 +21,21 @@ function formatBytes(value: unknown): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
 }
 
+function isolatedTableName(sourceName: string, existingTables: Array<{ name: string }>) {
+  const existing = new Set(existingTables.map((item) => item.name.toLocaleLowerCase()))
+  const base = `${sourceName}_synthetic`
+  let candidate = base, suffix = 2
+  while (existing.has(candidate.toLocaleLowerCase())) candidate = `${base}_${suffix++}`
+  return candidate
+}
+
 function syntheticExecutionStages(operation: Operation, fallbackTotal: number, destructive: boolean): ExecutionStage[] {
   const details = operation.details ?? {}
   const rawPhase = String(details.failed_phase ?? details.phase ?? 'queued').toLowerCase()
   const total = Number(details.total_rows ?? fallbackTotal)
   const generated = Number(details.generated_rows ?? 0)
   const uploaded = Number(details.uploaded_rows ?? 0)
-  const validated = Number(details.validated_rows ?? (details.publication as Record<string, unknown> | undefined)?.row_count ?? 0)
+  const validated = Number(details.validated_rows ?? (details.publication as Record<string, unknown> | undefined)?.rows_published ?? (details.publication as Record<string, unknown> | undefined)?.row_count ?? 0)
   const generation = [
     { id: 'generation', label: 'Generation', detail: `${generated.toLocaleString()} / ${total.toLocaleString()} rows` },
     { id: 'upload', label: 'Upload', detail: `${uploaded.toLocaleString()} / ${total.toLocaleString()} rows verified` },
@@ -106,7 +114,7 @@ function loadDraft(node: DiscoverNode, initial: CanonicalSchema): Draft {
   }
 }
 
-export function SyntheticStudio({ active = true, node, contextTabId = node.id, sourceEnvironment, onClose, onOpenTable, onCompare, onPublished, comparison }: Props) {
+export function SyntheticStudio({ active = true, node, contextTabId = node.id, sourceEnvironment, onClose, onPublished, comparison }: Props) {
   const sourceKey = node.variants?.find((item) => item.environment === sourceEnvironment)?.node_id ?? node.id
   const initialSchema = useMemo(() => makeSchema(node), [node])
   const [initial] = useState(() => loadDraft(node, initialSchema))
@@ -138,6 +146,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
   const [targetFormat, setTargetFormat] = useState<string | null>(null)
   const [verification, setVerification] = useState<{ key: string; state: 'idle' | 'checking' | 'present' | 'absent' | 'error'; message?: string }>({ key: '', state: 'idle' })
   const [destinationSuggestion, setDestinationSuggestion] = useState<Awaited<ReturnType<typeof api.syntheticDestinations>>['suggestion']>(null)
+  const [expectedExternalLocationName, setExpectedExternalLocationName] = useState<string | null>(null)
   const [warehouses, setWarehouses] = useState<Array<{ id: string; name: string; state: string }>>([])
   const [externalLocations, setExternalLocations] = useState<Array<{ name: string; url: string; read_only: boolean; authorized?: boolean | null; score?: number; reason?: string }>>([])
   const [generatorRegistry, setGeneratorRegistry] = useState<SyntheticGenerator[]>([])
@@ -208,7 +217,13 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     if (targetState === 'checking' || listing) return 'Checking destination metadata'
     if (targetState === 'error') return 'Metadata verification unavailable; retry'
     if (!destination.catalog || !destination.schema || !destination.table) return 'Choose a DEV destination'
-    if (value === 'isolated') return '' // Selecting this explicitly proposes a distinct name, verified by GET.
+    if (value === 'isolated') {
+      if (strategy !== 'isolated') return '' // Selecting it automatically proposes a distinct available name.
+      if (targetExists) return 'The isolated table name already exists; choose another name'
+      if (targetState !== 'absent') return 'Destination existence is not verified'
+      if (destination.table.toLocaleLowerCase() === node.name.toLocaleLowerCase()) return 'An isolated table needs a distinct DEV table name'
+      return ''
+    }
     if (value === 'create') return targetExists ? 'The destination already exists' : targetState !== 'absent' ? 'Destination existence is not verified' : ''
     if (targetState === 'absent') return 'The DEV table does not exist'
     if (!targetSupportsWrites) return 'The destination is not a supported managed or external Delta table'
@@ -216,7 +231,19 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     return ''
   }
   const strategyUnavailableReason = strategyReason(strategy)
-  const locationOptions = destinationSuggestion?.external_locations?.length ? destinationSuggestion.external_locations : externalLocations
+  const suggestionMatchesDestination = destinationSuggestion?.catalog?.toLocaleLowerCase() === destination.catalog?.toLocaleLowerCase()
+    && destinationSuggestion?.schema?.toLocaleLowerCase() === destination.schema?.toLocaleLowerCase()
+  const expectedLocationName = expectedExternalLocationName
+    ?? (suggestionMatchesDestination ? destinationSuggestion?.suggested_external_location ?? null : null)
+  const expectedLocation = expectedLocationName
+    ? externalLocations.find((item) => item.name.toLocaleLowerCase() === expectedLocationName.toLocaleLowerCase())
+    : undefined
+  const externalLocationProblem = !expectedLocationName ? 'The expected DEV External Location is still being resolved.'
+    : !expectedLocation ? `The expected DEV External Location ${expectedLocationName} was not found.`
+      : expectedLocation.read_only ? `The expected DEV External Location ${expectedLocation.name} is read-only.`
+        : expectedLocation.authorized === false ? `The current DEV identity is not authorized to use ${expectedLocation.name}.`
+          : expectedLocation.authorized !== true ? `Access to ${expectedLocation.name} could not be verified.` : ''
+  const externalLocationReady = Boolean(expectedLocation && !externalLocationProblem)
   const terminal = Boolean(operation && ['succeeded', 'failed', 'interrupted', 'cancelled'].includes(operation.state))
 
   useEffect(() => {
@@ -304,6 +331,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
       if (!active) return
       setExternalLocations(result.external_locations)
       setDestinationSuggestion(result.suggestion ?? null); setSourceStorageType(result.source_storage_type ?? null)
+      setExpectedExternalLocationName(result.expected_external_location_name ?? result.suggestion?.suggested_external_location ?? null)
       setMetadataError((result.warnings ?? []).map((item) => `${item.resource.replaceAll('_', ' ')}: ${item.message}`).join(' '))
       if (!destinationTouched.current && !initial.destination.catalog) setDestination((current) => ({ ...current,
         ...(result.suggestion ? { catalog: result.suggestion.catalog, schema: result.suggestion.schema, table: result.suggestion.table,
@@ -381,6 +409,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     const timer = window.setTimeout(() => {
       void api.syntheticDestinations(destination.catalog, destination.schema, destination.table, undefined, controller.signal).then((result) => {
         if (!active) return
+        setExpectedExternalLocationName(result.expected_external_location_name ?? null)
         setTables(result.tables); setTargetSchema(result.target_schema ?? null); setTargetStorageType(result.target_storage_type ?? null)
         setTargetFormat(result.target_format ?? null); setDropRecreateEligible(Boolean(result.drop_recreate_eligible))
         setVerification({ key: fullTarget, state: result.target_state === 'present' ? 'present' : result.target_state === 'absent' ? 'absent' : 'error',
@@ -443,7 +472,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     destinationTouched.current = true
     if (!lockedSchema) setVersions((current) => ({ ...current, [schemaBase]: { schema, rules } }))
     if (lockedSchema && update.strategy && !['append', 'replace'].includes(update.strategy) && sourceStorageType) update = { ...update, storage_type: sourceStorageType }
-    if (update.strategy === 'isolated' && (targetExists || destination.table === node.name)) update = { ...update, table: `${node.name}_synthetic` }
+    if (update.strategy === 'isolated' && (targetExists || destination.table === node.name)) update = { ...update, table: isolatedTableName(node.name, tables) }
     setDestination((current) => ({ ...current, ...update, environment: 'dev' }))
     setReview(null); setError(''); setNotice('')
   }
@@ -481,7 +510,9 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     source_node_id: node.id, source_environment: sourceEnvironment,
     destination: { environment: 'dev', catalog: destination.catalog ?? '', schema: destination.schema ?? '', table: destination.table ?? '',
       warehouse_id: destination.warehouse_id ?? '', strategy: strategy as SyntheticDestination['strategy'],
-      storage_type: destination.storage_type ?? 'managed', external_location_name: destination.external_location_name },
+      storage_type: destination.storage_type ?? 'managed',
+      external_location_name: destination.storage_type === 'external' && !lockedSchema
+        ? expectedLocationName ?? undefined : destination.external_location_name },
     schema, row_count: rowCount, rules, locale, seed,
   }
   const validateSchema = () => {
@@ -521,7 +552,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     if (!destination.catalog || !destination.schema || !destination.table || !destination.warehouse_id) { setError('Choose a DEV catalog, schema, table and SQL warehouse in Destination before reviewing publication. Local preview remains available.'); return }
     if (strategyUnavailableReason) { setError(strategyUnavailableReason); return }
     if (targetState !== 'present' && targetState !== 'absent') { setError('Verification pending. Confirm DEV destination metadata before publication review.'); return }
-    if (destination.storage_type === 'external' && !lockedSchema && !destination.external_location_name) { setError('Select an authorized External Location in Destination before review.'); return }
+    if (destination.storage_type === 'external' && !lockedSchema && !externalLocationReady) { setError(externalLocationProblem); return }
     if (lockedSchema && (!targetSchema || JSON.stringify(schema.fields) !== JSON.stringify(targetSchema.fields))) { setError('The physical DEV schema is still being verified. Retry destination metadata before reviewing Append or Replace.'); return }
     const controller = new AbortController(), digest = planDigest
     actionController.current?.abort(); actionController.current = controller
@@ -576,8 +607,11 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
   const generatedRows = Number(operation?.details?.generated_rows ?? 0)
   const uploadedRows = Number(operation?.details?.uploaded_rows ?? 0)
   const totalRows = Number(operation?.details?.total_rows ?? rowCount)
-  const validatedRowsRaw = operation?.details?.validated_rows ?? publication?.row_count
+  const publishedStrategy = String(publication?.strategy ?? strategy)
+  const legacyAppendSuccess = operation?.state === 'succeeded' && publishedStrategy === 'append' && publication?.rows_published == null
+  const validatedRowsRaw = publication?.rows_published ?? (legacyAppendSuccess ? generatedRows : operation?.details?.validated_rows ?? publication?.row_count)
   const validatedRows = validatedRowsRaw === undefined || validatedRowsRaw === null ? null : Number(validatedRowsRaw)
+  const destinationRows = Number(operation?.details?.destination_rows ?? publication?.total_rows ?? publication?.row_count ?? 0)
   const failedPhase = String(operation?.details?.failed_phase ?? '')
   const completedTransfer = Boolean(totalRows > 0 && generatedRows >= totalRows && uploadedRows >= totalRows)
   const publicationFailedAfterUpload = Boolean(operation && ['failed', 'interrupted'].includes(operation.state)
@@ -614,7 +648,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
         <label>{isExistingStrategy ? 'Existing DEV table' : strategy === 'isolated' ? 'New isolated table' : 'New table'}<input aria-label="DEV table" list="synthetic-dev-tables" value={destination.table ?? ''} onChange={(event) => updateDestination({ table: event.target.value })} placeholder={node.name} /><datalist id="synthetic-dev-tables">{tables.map((item) => <option key={item.name} value={item.name}>{item.table_type}</option>)}</datalist></label>
         <div className="synthetic-destination-field"><label>SQL warehouse<select aria-label="DEV SQL warehouse" value={destination.warehouse_id ?? ''} disabled={warehousesLoading || !warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehousesLoading ? 'Loading DEV warehouses…' : warehouseError && !warehouses.length ? 'Warehouse list unavailable' : warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select><small>{warehouseError || 'Required for publication review. A stopped warehouse starts only when execution requires compute.'}</small></label><button type="button" className="button secondary small" disabled={warehousesLoading} onClick={() => setRetryWarehouses((value) => value + 1)}><RefreshCw size={11} /> Refresh list</button></div>
         <label>Table storage<select aria-label="Table storage" value={destination.storage_type ?? 'managed'} disabled={lockedSchema} onChange={(event) => updateDestination({ storage_type: event.target.value as 'managed' | 'external' })}><option value="managed">Managed Delta</option><option value="external">External Delta</option></select>{lockedSchema && <small>Uses the existing DEV table storage. Create Isolated or eligible Drop &amp; Recreate lets you choose new storage.</small>}</label>
-        {destination.storage_type === 'external' && !lockedSchema && <label>Authorized External Location<select aria-label="External Location" value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{locationOptions.map((item) => <option key={item.name} value={item.name} disabled={item.read_only || item.authorized === false}>{item.name}{item.read_only ? ' · Read-only' : item.authorized === false ? ' · Permission denied' : item.authorized == null ? ' · Verification required' : ''}</option>)}</select></label>}
+        {destination.storage_type === 'external' && !lockedSchema && <div className="workflow-field-hint synthetic-external-location" role={externalLocationProblem ? 'status' : 'note'} data-state={externalLocationReady ? 'ready' : 'unavailable'}><strong>External Location · automatic</strong><span>{expectedLocationName ?? 'Resolving the DEV catalog/schema location…'}</span><small>{externalLocationProblem || 'Dexter will use the configured DEV location after verifying access.'}</small></div>}
       </div>
       <div className="workflow-verification" role="status" data-state={targetState}>{targetState === 'checking' ? <><LoaderCircle size={13} className="spin" /> Verification pending · checking DEV destination…</> : targetState === 'present' ? 'DEV destination found' : targetState === 'absent' ? 'Destination not found · a new table can be created' : targetState === 'error' ? verification.message : 'Select a DEV destination for publication.'}{targetState === 'error' && <button className="button secondary small" onClick={() => setRetryTarget((value) => value + 1)}>Retry destination</button>}</div>
       {strategyUnavailableReason && !['checking', 'error', 'idle'].includes(targetState) && <p className="workflow-field-hint">{strategyUnavailableReason}</p>}
@@ -624,7 +658,7 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
     {step === 1 && <section className="synthetic-panel"><h3>02 · Schema Editor</h3>
       <div className="synthetic-schema-source" role="group" aria-label="Schema base">{(['prod', 'dev'] as const).map((base) => <button type="button" className={`button secondary small ${(lockedSchema ? schemaReference : schemaBase) === base ? 'selected' : ''}`} aria-pressed={(lockedSchema ? schemaReference : schemaBase) === base} key={base} disabled={base === 'dev' ? !(lockedSchema ? targetSchema : sourceSchemas.dev) : !sourceSchemas.prod} onClick={() => selectSchemaBase(base)}>{base.toUpperCase()}{lockedSchema && base === 'prod' ? ' · reference' : ''}</button>)}<span>{lockedSchema ? `Effective schema · DEV · ${targetSchema?.qualified_name ?? 'Verification pending'}` : `${schemaBase.toUpperCase()} base${schemaSource === 'custom' ? ' · Edited draft' : ''} · ${schema.fields.length} columns`}</span></div>
       {sourceError && <p className="workflow-field-hint">{sourceError}<button className="button secondary small" onClick={() => setRetryMetadata((value) => value + 1)}>Retry reference metadata</button></p>}
-      {lockedSchema && <p className="workflow-field-hint">Append and Replace Data preserve the physical DEV schema. PROD is available as a reference; return to Destination to choose a strategy that permits structural changes.</p>}
+      {lockedSchema && <p className="workflow-field-hint">Append and Replace preserve the physical DEV schema. Column removal is available with a schema-changing strategy such as Create Isolated Table.</p>}
       {lockedSchema && !targetSchema && <p className="workflow-field-hint" role="status">DEV schema verification is pending. Local preview can use the preserved draft; publication remains blocked.</p>}
       <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{displayedSchema.fields.map((field, index) => <SchemaFieldEditor key={`${field.name}:${index}`} mode="synthetic" field={field} disabled={lockedSchema} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
       {!lockedSchema && <button className="button secondary small" onClick={addField}>Add column</button>}
@@ -691,10 +725,10 @@ export function SyntheticStudio({ active = true, node, contextTabId = node.id, s
       <div className="synthetic-progress-heading"><span>{operation.progress}% complete</span><span>Current stage · {currentStageLabel}</span></div>
       <div className="operation-progress-track" role="progressbar" aria-label="Synthetic data progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={operation.progress}><span style={{ width: `${operation.progress}%` }} /></div>
       <div className="synthetic-stage-status">{executionStages.map((item) => <div className={item.state} key={item.id}><span aria-hidden="true">{item.state === 'completed' ? <Check size={13} /> : item.state === 'active' ? <LoaderCircle size={13} className="spin" /> : item.state === 'failed' ? '!' : item.state === 'skipped' ? '–' : '·'}</span><strong>{item.label}<small>{item.detail}</small></strong><em>{item.state === 'completed' ? 'Completed' : item.state === 'active' ? 'Running' : item.state === 'failed' ? 'Failed' : item.state === 'skipped' ? 'Skipped' : 'Pending'}</em></div>)}</div>
-      <div className="synthetic-metrics"><span>Rows generated<strong>{generatedRows.toLocaleString()}</strong></span><span>Rows published / validated<strong>{validatedRows === null || !Number.isFinite(validatedRows) ? '—' : validatedRows.toLocaleString()}</strong></span><span>Current stage<strong>{currentStageLabel}</strong></span></div>
+      <div className="synthetic-metrics"><span>Rows generated<strong>{generatedRows.toLocaleString()}</strong></span><span>{publishedStrategy === 'append' ? 'Rows appended / validated' : 'Rows published / validated'}<strong>{validatedRows === null || !Number.isFinite(validatedRows) ? '—' : validatedRows.toLocaleString()}</strong></span><span>{publishedStrategy === 'append' && destinationRows ? 'DEV table total' : 'Current stage'}<strong>{publishedStrategy === 'append' && destinationRows ? destinationRows.toLocaleString() : currentStageLabel}</strong></span></div>
       {operation.state === 'failed' || operation.state === 'interrupted' ? <div className="synthetic-failure" role="alert"><strong>{publicationFailedAfterUpload ? 'Materialization failed' : validationFailedAfterMaterialization ? 'Final validation failed' : `Failed during ${failedPhase || operationPhase}`}</strong><span>{operation.error_message ?? operation.message}</span>{Boolean(operation.details?.reconciliation_required) && <span>Reconcile the current DEV table before starting another publication.</span>}</div> : null}
       {Boolean(operation.details?.reconciliation_required) && strategy === 'drop_recreate' && <div className="synthetic-destructive-confirm"><strong>Reconcile current DEV state</strong><p>Dexter will check that the prior DROP statement is terminal and that the destination is either absent or still the unchanged original table. It will not resume the old publication.</p><label>Type {fullTarget}<input value={reconcileConfirmation} onChange={(event) => setReconcileConfirmation(event.target.value)} /></label><button className="button secondary small" disabled={loading || reconcileConfirmation !== fullTarget} onClick={() => void reconcileRun()}>Verify and release retry lock</button></div>}
-      {operation.state === 'succeeded' && <div className="synthetic-complete"><Check size={17} /><span><strong>{Number(validatedRows ?? 0).toLocaleString()} records published and validated</strong><small>{String(publication?.target ?? fullTarget)}</small></span><div><button className="button secondary small" onClick={() => onOpenTable?.(review?.destination ?? request.destination)}>Open Table</button>{onCompare && <button className="button secondary small" onClick={() => onCompare?.(review?.destination ?? request.destination)}>Compare DEV × PROD</button>}</div></div>}
+      {operation.state === 'succeeded' && <div className="synthetic-complete"><Check size={17} /><span><strong>{Number(validatedRows ?? 0).toLocaleString()} {publishedStrategy === 'append' ? 'new records appended and validated' : 'records published and validated'}{publishedStrategy === 'append' && destinationRows ? ` · ${destinationRows.toLocaleString()} records now in DEV` : ''}</strong><small>{String(publication?.target ?? fullTarget)}</small></span></div>}
       {['failed','interrupted'].includes(operation.state) && operation.details?.retry_available && <div className="synthetic-recovery"><div><strong>Resume Execution</strong><span>Continue using files already uploaded.</span></div><button className="button secondary small" onClick={() => void resumeRun()}><RefreshCw size={12} /> Resume Execution</button></div>}
       {Boolean(operation.details?.reconciled_state) && <button className="button secondary small" onClick={() => { setOperation(null); setRun(null); setReview(null); setStep(0); setConfirmDestructive(false); setTypedConfirmation('') }}>Start a new reviewed publication</button>}
       {['queued','running'].includes(operation.state) && !operation.details?.destructive_started && <button className="button secondary small" onClick={() => void cancelRun()}>Cancel safely</button>}

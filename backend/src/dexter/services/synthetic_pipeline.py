@@ -131,10 +131,17 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
                 runs, operations, run_id, operation_id, state, details),
         )
         runs.set_state(run_id, "VALIDATED", details={"publication": publication})
+        rows_published = publication.get("rows_published", publication.get("row_count"))
+        total_rows = publication.get("total_rows", publication.get("row_count"))
         operations.update_details(operation_id, phase="validation", validated_schema=True,
-                                  validated_rows=publication.get("row_count"))
+                                  validated_rows=rows_published, destination_rows=total_rows)
         operations.transition(operation_id, "running", progress=98, message="DEV schema and row count validated")
-        _log(operations, operation_id, f"DEV table publication validated: {publication['row_count']:,} rows")
+        if publication.get("strategy") == "append":
+            _log(operations, operation_id,
+                 f"DEV Append validated: {int(rows_published or 0):,} new rows; table total={int(total_rows or 0):,}")
+        else:
+            _log(operations, operation_id,
+                 f"DEV table publication validated: {int(rows_published or 0):,} rows")
         cleanup_warning = _cleanup_remote(workspace, volume_path)
         staging = temporary_dir / "synthetic" / run_id
         shutil.rmtree(staging, ignore_errors=True)

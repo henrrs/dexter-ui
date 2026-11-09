@@ -152,6 +152,27 @@ class WorkflowApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503, response.text)
         self.assertEqual(response.json()["error"]["code"], "metadata_unavailable")
 
+    def test_external_destination_resolves_the_governed_location_name(self):
+        response = self.client.get("/api/synthetic/destinations", params={"catalog": "tech_dev", "schema": "gold"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["expected_external_location_name"],
+                         "corpdevlaketechst-gold-external-location")
+
+    def test_external_isolated_review_uses_policy_location_not_a_client_choice(self):
+        missing = RuntimeError("not found")
+        missing.status_code = 404
+        self.workspace.tables.get.side_effect = missing
+        policy_name = "corpdevlaketechst-gold-external-location"
+        self.workspace.external_locations.list.return_value = [SimpleNamespace(
+            name=policy_name, url="abfss://container@storage.dfs.core.windows.net/tech/gold", read_only=False)]
+        body = {**self.body, "destination": {**self.body["destination"],
+            "table": "ledger_synthetic", "strategy": "isolated", "storage_type": "external",
+            "external_location_name": "a-different-user-selected-location"}}
+        response = self.client.post("/api/synthetic/review", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["destination"]["external_location_name"], policy_name)
+        self.assertEqual(response.json()["external_location"]["name"], policy_name)
+
     def test_partial_warehouse_failure_does_not_block_destination_metadata(self):
         self.workspace.warehouses.list.side_effect = ConnectionError()
         response = self.client.get("/api/synthetic/destinations", params={"source_node_id": self.node_id})

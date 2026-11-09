@@ -166,6 +166,8 @@ class SyntheticPublisherTests(unittest.TestCase):
         result = publish(workspace, "append", baseline=None, persist=persisted.append)
         self.assertEqual(persisted, [10])
         self.assertEqual(result["row_count"], 13)
+        self.assertEqual(result["rows_published"], 3)
+        self.assertEqual(result["total_rows"], 13)
 
     def test_replace_preserves_existing_table_schema_and_replaces_rows(self):
         target = SimpleNamespace(columns=[SimpleNamespace(name="id", type_text="BIGINT", nullable=False)],

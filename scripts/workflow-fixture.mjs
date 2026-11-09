@@ -15,7 +15,7 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, extraTables: 0, syntheticFailureAt: null, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1' }
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, extraTables: 0, syntheticFailureAt: null, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1', syntheticTargetMode: 'managed_delta', syntheticExistingTable: 'ledger' }
   const currentIdentity = () => ({ ...identity, table_id: state.currentTableId })
   const freshDraft = () => {
     const baseline = state.schemaPhysical ?? devSchema
@@ -63,7 +63,7 @@ export function workflowFixture() {
         next.details = { ...next.details, phase: 'materialization', failed_phase: 'materialization', total_rows: 1000, generated_rows: 1000, uploaded_rows: 1000, validated_rows: null, uploaded_bytes: 560, file_count: 2, retry_available: true, databricks_error_code: 'BAD_REQUEST', databricks_sql_state: 'DELTA_FAILED_TO_MERGE_FIELDS' }
         return send(next)
       }
-      if (pollNumber > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000; next.details.validated_rows = 1000; next.details.publication = { target: 'tech_dev.gold.ledger', row_count: 1000 } }
+      if (pollNumber > 1) { next.state = 'succeeded'; next.progress = 100; next.message = 'Simulated operation completed'; next.details.phase = 'completed'; next.details.generated_rows = 1000; next.details.uploaded_rows = 1000; next.details.validated_rows = 1000; next.details.destination_rows = 2000; next.details.publication = { target: 'tech_dev.gold.ledger', strategy: 'append', row_count: 2000, rows_published: 1000, total_rows: 2000 } }
       if (next.kind === 'schema-evolution' && next.state === 'succeeded') {
         state.schemaPhysical = { ...devSchema, fields: clone(state.draft.columns.filter(item => !item.removed).map(item => item.field)) }
         if (state.currentOperation.details?.execution_strategy === 'recreate') { state.currentTableId = 'table-2'; next.details.destructive_started = true }
@@ -143,18 +143,23 @@ export function workflowFixture() {
     if (path === '/api/synthetic/destinations') {
       if (fail()) return
       const catalog = url.searchParams.get('catalog'), selectedTable = url.searchParams.get('table')
-      if (!catalog) return send({ catalogs: [{ name: 'tech_dev' }], schemas: [], tables: [], warehouses: [{ id: 'wh-stopped', name: 'DEV SQL', state: 'STOPPED' }], external_locations: [{ name: 'dev-gold', url: 's3://fixture/tech_dev/gold', authorized: true, read_only: false }], source_storage_type: 'external', suggestion: { catalog: 'tech_dev', schema: 'gold', table: 'ledger', target_exists: true, source: prodSchema.qualified_name, mapping: 'unique_unified_discover_match', suggested_external_location: 'dev-gold' } })
+      const expectedLocation = 'corpdevlaketechst-gold-external-location'
+      const fixtureLocation = { name: expectedLocation, url: 's3://fixture/tech_dev/gold', authorized: true, read_only: false }
+      if (!catalog) return send({ catalogs: [{ name: 'tech_dev' }], schemas: [], tables: [], warehouses: [{ id: 'wh-stopped', name: 'DEV SQL', state: 'STOPPED' }], external_locations: [fixtureLocation], expected_external_location_name: expectedLocation, source_storage_type: 'external', suggestion: { catalog: 'tech_dev', schema: 'gold', table: 'ledger', target_exists: true, source: prodSchema.qualified_name, mapping: 'unique_unified_discover_match', suggested_external_location: expectedLocation } })
       if (!url.searchParams.get('schema')) return send({ catalogs: [], schemas: [{ name: 'gold' }], tables: [], warehouses: [], external_locations: [] })
       if (selectedTable === 'slow_table') await new Promise((resolve) => setTimeout(resolve, 1000))
       if (selectedTable === 'timeout_table') await new Promise((resolve) => setTimeout(resolve, 2000))
-      const exists = selectedTable === 'ledger'
-      return send({ catalogs: [], schemas: [], tables: [{ name: 'ledger', table_type: 'MANAGED', data_source_format: 'DELTA' }], warehouses: [], external_locations: [], target_state: exists ? 'present' : 'absent', target_schema: exists ? devSchema : null, target_storage_type: exists ? 'managed' : null, target_format: exists ? 'DELTA' : null, drop_recreate_eligible: false })
+      const exists = selectedTable === state.syntheticExistingTable
+      const isView = state.syntheticTargetMode === 'view'
+      const storageType = isView ? 'unsupported' : 'managed'
+      const format = state.syntheticTargetMode === 'non_delta' ? 'CSV' : 'DELTA'
+      return send({ catalogs: [], schemas: [], tables: [{ name: state.syntheticExistingTable, table_type: isView ? 'VIEW' : 'MANAGED', data_source_format: format }], warehouses: [], external_locations: [], target_state: exists ? 'present' : 'absent', target_schema: exists ? devSchema : null, target_storage_type: exists ? storageType : null, target_format: exists ? format : null, expected_external_location_name: expectedLocation, drop_recreate_eligible: exists && state.syntheticTargetMode === 'dexter_delta' })
     }
     if (path === '/api/synthetic/preview') { await new Promise((resolve) => setTimeout(resolve, state.previewDelay)); return send({ rows: [Object.fromEntries(body.schema.fields.map((field) => [field.name, field.original_type === 'BIGINT' ? 1 : 'preview value']))] }) }
     if (path === '/api/synthetic/review') {
       if (fail()) return
       await new Promise((resolve) => setTimeout(resolve, state.reviewDelay))
-      return send({ source: { environment: 'prod', qualified_name: prodSchema.qualified_name }, schema: body.schema, destination: body.destination, target_exists: body.destination.table === 'ledger', target_storage_type: 'managed', strategy: body.destination.strategy, row_count: body.row_count, plan_digest: 'b'.repeat(64), schema_changes: { added: [], removed: [] }, publication_ready: true, permissions: { state: 'confirmed', message: 'Fixture DEV privileges confirmed' }, warnings: [], publication_plan: [{ stage: 'materialize', action: 'Simulated DEV publication' }], runtime: { mechanism: 'isolated-process-rss-guard', memory_limit_message: 'Fixture runtime', max_pending_files: 2, staging_limit_bytes: 128 * 1024 * 1024 } })
+      return send({ source: { environment: 'prod', qualified_name: prodSchema.qualified_name }, schema: body.schema, destination: body.destination, target_exists: body.destination.table === state.syntheticExistingTable, target_storage_type: 'managed', strategy: body.destination.strategy, row_count: body.row_count, plan_digest: 'b'.repeat(64), schema_changes: { added: [], removed: [] }, publication_ready: true, permissions: { state: 'confirmed', message: 'Fixture DEV privileges confirmed' }, warnings: [], publication_plan: [{ stage: 'materialize', action: 'Simulated DEV publication' }], runtime: { mechanism: 'isolated-process-rss-guard', memory_limit_message: 'Fixture runtime', max_pending_files: 2, staging_limit_bytes: 128 * 1024 * 1024 } })
     }
     if (path === '/api/synthetic/runs') {
       if (state.reviewDrift) return send({ error: { code: 'CONFLICT', message: 'Destination metadata changed after review. Review it again before starting.' } }, 409)

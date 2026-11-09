@@ -268,6 +268,8 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-execution')`, synthetic); await capture('synthetic-05-execution')
         await wait(`return !!document.querySelector('[data-workflow-tab]:not([hidden]) .synthetic-complete')`)
         await wait(`return !!localStorage.getItem('dexter.synthetic.draft.unified:table:fixture-ledger-refreshed')`)
+        assert.match(await execute(`return document.querySelector(arguments[0] + ' .synthetic-complete').textContent`, synthetic), /1,000 new records appended and validated.*2,000 records now in DEV/)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' .synthetic-metrics').textContent.includes('2,000')`, synthetic), true)
         assert.equal(await execute(`return document.querySelectorAll('.workbench-tab.active').length`), 1)
         assert.ok(await execute(`return !!document.querySelector(arguments[0] + ' .synthetic-execution')`, synthetic))
         const requests = fixture.state.requests.filter((request) => request.path === '/api/synthetic/review' && request.body.destination.strategy === 'replace')
@@ -275,11 +277,37 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         results.push({ journey: 'B', result: 'passed', evidence: 'synthetic-01 through synthetic-05, drift rejection' })
       })
       await t.test('C: isolated storage, both schema bases, draft banks and rule recomposition', async () => {
-        await openSynthetic(); await set(`${synthetic} select[aria-label="Publication strategy"]`, 'isolated')
+        await openSynthetic()
+        const strategyOptions = async () => execute(`return Object.fromEntries([...document.querySelectorAll(arguments[0] + ' select[aria-label="Publication strategy"] option')].map(option => [option.value, option.disabled]))`, synthetic)
+        let availability = await strategyOptions()
+        assert.deepEqual(availability, { create: true, isolated: false, append: false, replace: false, drop_recreate: true })
+        fixture.state.syntheticTargetMode = 'view'; fixture.state.syntheticExistingTable = 'view_asset'
+        await set(`${synthetic} input[aria-label="DEV table"]`, 'view_asset'); await waitTarget()
+        availability = await strategyOptions()
+        assert.deepEqual(availability, { create: true, isolated: false, append: true, replace: true, drop_recreate: true })
+        fixture.state.syntheticTargetMode = 'non_delta'; fixture.state.syntheticExistingTable = 'csv_asset'
+        await set(`${synthetic} input[aria-label="DEV table"]`, 'csv_asset'); await waitTarget()
+        availability = await strategyOptions()
+        assert.deepEqual(availability, { create: true, isolated: false, append: true, replace: true, drop_recreate: true })
+        fixture.state.syntheticTargetMode = 'managed_delta'; fixture.state.syntheticExistingTable = 'ledger'
+        await set(`${synthetic} input[aria-label="DEV table"]`, 'new_asset')
+        await wait(`return document.querySelector(arguments[0] + ' .workflow-verification')?.dataset.state === 'absent'`, synthetic)
+        availability = await strategyOptions()
+        assert.deepEqual(availability, { create: false, isolated: false, append: true, replace: true, drop_recreate: true })
+        fixture.state.syntheticTargetMode = 'dexter_delta'; fixture.state.syntheticExistingTable = 'managed_asset'
+        await set(`${synthetic} input[aria-label="DEV table"]`, 'managed_asset'); await waitTarget()
+        availability = await strategyOptions()
+        assert.deepEqual(availability, { create: true, isolated: false, append: false, replace: false, drop_recreate: false })
+        fixture.state.syntheticTargetMode = 'managed_delta'; fixture.state.syntheticExistingTable = 'ledger'
+        await set(`${synthetic} input[aria-label="DEV table"]`, 'ledger'); await waitTarget()
+        await set(`${synthetic} select[aria-label="Publication strategy"]`, 'isolated')
         await wait(`return document.querySelector(arguments[0] + ' .workflow-verification')?.dataset.state === 'absent'`, synthetic)
         assert.equal(await execute(`return document.querySelector(arguments[0] + ' select[aria-label="Table storage"]').value`, synthetic), 'external')
+        assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' select[aria-label="External Location"]')`, synthetic), false)
+        assert.match(await execute(`return document.querySelector(arguments[0] + ' .synthetic-external-location')?.textContent`, synthetic), /corpdevlaketechst-gold-external-location.*will use the configured DEV location/i)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' .synthetic-external-location')?.dataset.state`, synthetic), 'ready')
         await set(`${synthetic} select[aria-label="Table storage"]`, 'managed'); await set(`${synthetic} select[aria-label="Table storage"]`, 'external')
-        await set(`${synthetic} select[aria-label="External Location"]`, 'dev-gold'); await clickText('Schema', `${synthetic} .synthetic-panel`)
+        await clickText('Schema', `${synthetic} .synthetic-panel`)
         await clickText('Add column', synthetic)
         const addedColumn = await execute(`return [...document.querySelectorAll(arguments[0] + ' input[aria-label^="Column name new_column_"]')].at(-1)?.getAttribute('aria-label').replace('Column name ', '')`, synthetic)
         assert.ok(addedColumn)
@@ -287,8 +315,12 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await wait(`return !!document.querySelector(arguments[0] + ' input[aria-label="Column name dev_note"]')`, synthetic)
         await clickText('PROD', `${synthetic} .synthetic-schema-source`)
         await wait(`return !!document.querySelector(arguments[0] + ' input[aria-label="Column name ' + arguments[1] + '"]')`, synthetic, addedColumn)
+        assert.equal(await execute(`return document.querySelector(arguments[0] + ' button[aria-label="Remove prod_note"]')?.disabled`, synthetic), false)
+        await click(`${synthetic} button[aria-label="Remove prod_note"]`)
+        await wait(`return !document.querySelector(arguments[0] + ' input[aria-label="Column name prod_note"]')`, synthetic)
         await clickText('Generation Rules', `${synthetic} footer`)
         assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' select[aria-label="Generator for dev_note"]')`, synthetic), false)
+        assert.equal(await execute(`return !!document.querySelector(arguments[0] + ' select[aria-label="Generator for prod_note"]')`, synthetic), false)
         await clickText('Preview ≤100 rows', synthetic); await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-preview')`, synthetic)
         // Editing during an in-flight preview must discard the obsolete response.
         fixture.state.previewDelay = 500
@@ -309,8 +341,12 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         fixture.state.reviewDelay = 0
         await clickText('Schema', `${synthetic} .synthetic-panel`); await clickText('Generation Rules', `${synthetic} footer`)
         await clickText('Review Plan', synthetic); await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-review-facts')`, synthetic)
+        const isolatedReview = fixture.state.requests.filter((request) => request.path === '/api/synthetic/review' && request.body.destination.strategy === 'isolated').at(-1)
+        assert.ok(isolatedReview)
+        assert.equal(isolatedReview.body.destination.external_location_name, 'corpdevlaketechst-gold-external-location')
+        assert.deepEqual(isolatedReview.body.schema.fields.map((field) => field.name), ['id', addedColumn])
         await screenshot('isolated-review-fhd')
-        results.push({ journey: 'C', result: 'passed', evidence: 'isolated-review-fhd' })
+        results.push({ journey: 'C', result: 'passed', evidence: 'strategy availability matrix, automatic external location, removable generation columns, isolated-review-fhd' })
       })
       await t.test('D: isolated failures, recovery, local preview without DEV and late metadata response', async () => {
         for (const failure of ['connection_unavailable', 'metadata_unavailable', 'permission_denied']) {
@@ -362,7 +398,7 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         const executionText = await execute(`return document.querySelector(arguments[0] + ' .synthetic-execution').innerText`, synthetic)
         assert.match(executionText, /Generation completed\. Publication failed\./)
         assert.match(executionText, /1,000 records were generated and uploaded, but they were not materialized in DEV\./)
-        assert.match(executionText, /Rows published \/ validated\s+—/)
+        assert.match(executionText, /Rows (?:appended|published) \/ validated\s+—/)
         const stageStates = await execute(`return [...document.querySelectorAll(arguments[0] + ' .synthetic-stage-status > div')].map(item => ({ label: item.querySelector('strong').childNodes[0].textContent.trim(), state: item.querySelector('em').textContent.trim() }))`, synthetic)
         assert.deepEqual(stageStates.slice(0, 5), [
           { label: 'Generation', state: 'Completed' },
@@ -375,7 +411,7 @@ test('F4 workflows: real Firefox journeys with controlled remote responses', { t
         await capture('synthetic-materialization-failed')
         await clickText('Resume Execution', synthetic)
         await wait(`return !!document.querySelector(arguments[0] + ' .synthetic-complete')`, synthetic)
-        assert.match(await execute(`return document.querySelector(arguments[0] + ' .synthetic-complete').textContent`, synthetic), /1,000 records published and validated/)
+        assert.match(await execute(`return document.querySelector(arguments[0] + ' .synthetic-complete').textContent`, synthetic), /1,000 new records appended and validated.*2,000 records now in DEV/)
         await capture('synthetic-publication-recovered')
         results.push({ journey: 'E', result: 'passed', evidence: 'synthetic-materialization-failed and synthetic-publication-recovered screenshots; stage states and row accounting verified' })
       })
