@@ -97,12 +97,17 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   const [confirmDestructive, setConfirmDestructive] = useState(false)
   const [loading, setLoading] = useState(false)
   const [busyAction, setBusyAction] = useState('')
-  const [listing, setListing] = useState(false)
+  const [listing, setListing] = useState(true)
+  const [warehousesLoading, setWarehousesLoading] = useState(true)
   const [schemasLoading, setSchemasLoading] = useState(false)
   const [metadataError, setMetadataError] = useState('')
+  const [catalogError, setCatalogError] = useState('')
+  const [warehouseError, setWarehouseError] = useState('')
   const [sourceError, setSourceError] = useState('')
   const [generatorError, setGeneratorError] = useState('')
   const [retryMetadata, setRetryMetadata] = useState(0)
+  const [retryCatalogs, setRetryCatalogs] = useState(0)
+  const [retryWarehouses, setRetryWarehouses] = useState(0)
   const [retryTarget, setRetryTarget] = useState(0)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -185,10 +190,39 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   useEffect(() => {
     const controller = new AbortController()
     let active = true
-    setListing(true); setMetadataError('')
+    setListing(true); setCatalogError('')
+    void (async () => {
+      try {
+        const cached = await api.discoverChildren('databricks:dev', false, true, controller.signal)
+        if (!active) return
+        const cachedPage = Array.isArray(cached) ? null : cached
+        if (cachedPage) {
+          setCatalogs(cachedPage.items.map((item) => ({ name: item.name })))
+          if (cachedPage.fetched_at !== null && retryCatalogs === 0) {
+            setListing(false)
+            return
+          }
+          if (cachedPage.items.length === 0 && cachedPage.error) setCatalogError(cachedPage.error)
+        }
+        const result = await api.discoverChildren('databricks:dev', retryCatalogs > 0, false, controller.signal)
+        if (!active) return
+        const items = Array.isArray(result) ? result : result.items
+        setCatalogs(items.map((item) => ({ name: item.name })))
+        if (!Array.isArray(result) && result.error && items.length === 0) setCatalogError(result.error)
+      } catch (cause) {
+        if (active) setCatalogError(cause instanceof Error ? cause.message : 'DEV catalogs could not be loaded.')
+      } finally { if (active) setListing(false) }
+    })()
+    return () => { active = false; controller.abort() }
+  }, [retryCatalogs])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setMetadataError('')
     void api.syntheticDestinations(undefined, undefined, undefined, node.id, controller.signal, sourceEnvironment).then((result) => {
       if (!active) return
-      setCatalogs(result.catalogs); setWarehouses(result.warehouses); setExternalLocations(result.external_locations)
+      setExternalLocations(result.external_locations)
       setDestinationSuggestion(result.suggestion ?? null); setSourceStorageType(result.source_storage_type ?? null)
       setMetadataError((result.warnings ?? []).map((item) => `${item.resource.replaceAll('_', ' ')}: ${item.message}`).join(' '))
       if (!destinationTouched.current && !initial.destination.catalog) setDestination((current) => ({ ...current,
@@ -198,7 +232,6 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
         ...(!lockedSchema && result.source_storage_type ? { storage_type: result.source_storage_type } : {}),
       }))
     }).catch((cause) => { if (active) setMetadataError(cause instanceof Error ? cause.message : 'Connection unavailable. Retry DEV metadata.') })
-      .finally(() => { if (active) setListing(false) })
     void api.syntheticGenerators(controller.signal).then((result) => { if (active) { setGeneratorRegistry(result.items); setGeneratorError('') } })
       .catch((cause) => { if (active) setGeneratorError(cause instanceof Error ? cause.message : 'Generator metadata unavailable.') })
     void api.compareSchemas(node.id, node.id).then((result) => {
@@ -212,6 +245,20 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
   }, [sourceKey, retryMetadata])
 
   useEffect(() => {
+    const controller = new AbortController()
+    let active = true
+    setWarehousesLoading(true); setWarehouseError('')
+    void api.syntheticWarehouses(retryWarehouses > 0 || retryMetadata > 0, controller.signal).then((result) => {
+      if (!active) return
+      setWarehouses(result.items)
+      setWarehouseError(result.warning ?? '')
+    }).catch((cause) => {
+      if (active) setWarehouseError(cause instanceof Error ? cause.message : 'DEV warehouses could not be loaded.')
+    }).finally(() => { if (active) setWarehousesLoading(false) })
+    return () => { active = false; controller.abort() }
+  }, [retryMetadata, retryWarehouses])
+
+  useEffect(() => {
     if (!generatorRegistry.length) return
     const next = reconcileRules(schema, rules)
     if (JSON.stringify(next) !== JSON.stringify(rules)) {
@@ -222,9 +269,25 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
     const controller = new AbortController()
     let active = true
     setSchemas([]); setSchemasLoading(Boolean(destination.catalog))
-    if (destination.catalog) void api.syntheticDestinations(destination.catalog, undefined, undefined, undefined, controller.signal).then((result) => {
-      if (active) setSchemas(result.schemas)
-    }).catch((cause) => { if (active) setMetadataError(cause.message) }).finally(() => { if (active) setSchemasLoading(false) })
+    if (destination.catalog) void (async () => {
+      try {
+        const nodeId = `databricks:dev:${destination.catalog}`
+        const cached = await api.discoverChildren(nodeId, false, true, controller.signal)
+        if (!active) return
+        const cachedPage = Array.isArray(cached) ? null : cached
+        if (cachedPage) {
+          setSchemas(cachedPage.items.map((item) => ({ name: item.name })))
+          if (cachedPage.fetched_at !== null && retryMetadata === 0) return
+        }
+        const result = await api.discoverChildren(nodeId, retryMetadata > 0, false, controller.signal)
+        if (!active) return
+        const items = Array.isArray(result) ? result : result.items
+        setSchemas(items.map((item) => ({ name: item.name })))
+        if (!Array.isArray(result) && result.error && items.length === 0) setMetadataError(result.error)
+      } catch (cause) {
+        if (active) setMetadataError(cause instanceof Error ? cause.message : 'DEV schemas could not be loaded.')
+      } finally { if (active) setSchemasLoading(false) }
+    })()
     return () => { active = false; controller.abort() }
   }, [destination.catalog, retryMetadata])
   useEffect(() => {
@@ -435,14 +498,14 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
     {notice && <p className="synthetic-notice" role="status">{notice}</p>}
 
     {step === 0 && <section className="synthetic-panel"><h3>01 · Destination</h3>
-      <div className="synthetic-destination-grid"><label>DEV catalog<select aria-label="DEV catalog" value={destination.catalog ?? ''} disabled={listing || !catalogs.length} onChange={(event) => updateDestination({ catalog: event.target.value, schema: '', table: '' })}><option value="">{listing ? 'Loading catalogs…' : 'Select catalog'}</option>{catalogs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
+      <div className="synthetic-destination-grid"><div className="synthetic-destination-field"><label>DEV catalog<select aria-label="DEV catalog" value={destination.catalog ?? ''} disabled={listing || !catalogs.length} onChange={(event) => updateDestination({ catalog: event.target.value, schema: '', table: '' })}><option value="">{listing ? 'Loading catalogs…' : catalogError ? 'Catalog list unavailable' : catalogs.length ? 'Select catalog' : 'No DEV catalogs available'}</option>{catalogs.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>{catalogError && <small role="alert">{catalogError} <button type="button" className="button secondary small" disabled={listing} onClick={() => setRetryCatalogs((value) => value + 1)}>Retry</button></small>}</div>
         <label>DEV schema<select aria-label="DEV schema" value={destination.schema ?? ''} disabled={!destination.catalog || schemasLoading} onChange={(event) => updateDestination({ schema: event.target.value, table: '' })}><option value="">{schemasLoading ? 'Loading schemas…' : 'Select schema'}</option>{schemas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
         <label>Publication strategy<select aria-label="Publication strategy" value={strategy} onChange={(event) => updateDestination({ strategy: event.target.value as SyntheticDestination['strategy'] })}>{allStrategies.map((item) => {
           const reason = strategyReason(item.id)
           return <option key={item.id} value={item.id} disabled={Boolean(reason)}>{item.label}{reason ? ` · ${reason}` : ''}</option>
         })}</select></label>
         <label>{isExistingStrategy ? 'Existing DEV table' : strategy === 'isolated' ? 'New isolated table' : 'New table'}<input aria-label="DEV table" list="synthetic-dev-tables" value={destination.table ?? ''} onChange={(event) => updateDestination({ table: event.target.value })} placeholder={node.name} /><datalist id="synthetic-dev-tables">{tables.map((item) => <option key={item.name} value={item.name}>{item.table_type}</option>)}</datalist></label>
-        <label>SQL warehouse<select aria-label="DEV SQL warehouse" value={destination.warehouse_id ?? ''} disabled={!warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select><small>Required for publication review. A stopped warehouse starts only when execution requires compute.</small></label>
+        <div className="synthetic-destination-field"><label>SQL warehouse<select aria-label="DEV SQL warehouse" value={destination.warehouse_id ?? ''} disabled={warehousesLoading || !warehouses.length} onChange={(event) => updateDestination({ warehouse_id: event.target.value })}><option value="">{warehousesLoading ? 'Loading DEV warehouses…' : warehouseError && !warehouses.length ? 'Warehouse list unavailable' : warehouses.length ? 'Select warehouse' : 'No DEV warehouses available'}</option>{warehouses.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.state}</option>)}</select><small>{warehouseError || 'Required for publication review. A stopped warehouse starts only when execution requires compute.'}</small></label><button type="button" className="button secondary small" disabled={warehousesLoading} onClick={() => setRetryWarehouses((value) => value + 1)}><RefreshCw size={11} /> Refresh list</button></div>
         <label>Table storage<select aria-label="Table storage" value={destination.storage_type ?? 'managed'} disabled={lockedSchema} onChange={(event) => updateDestination({ storage_type: event.target.value as 'managed' | 'external' })}><option value="managed">Managed Delta</option><option value="external">External Delta</option></select>{lockedSchema && <small>Uses the existing DEV table storage. Create Isolated or eligible Drop &amp; Recreate lets you choose new storage.</small>}</label>
         {destination.storage_type === 'external' && !lockedSchema && <label>Authorized External Location<select aria-label="External Location" value={destination.external_location_name ?? ''} onChange={(event) => updateDestination({ external_location_name: event.target.value })}><option value="">Select location</option>{locationOptions.map((item) => <option key={item.name} value={item.name} disabled={item.read_only || item.authorized === false}>{item.name}{item.read_only ? ' · Read-only' : item.authorized === false ? ' · Permission denied' : item.authorized == null ? ' · Verification required' : ''}</option>)}</select></label>}
       </div>
@@ -456,7 +519,7 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
       {sourceError && <p className="workflow-field-hint">{sourceError}<button className="button secondary small" onClick={() => setRetryMetadata((value) => value + 1)}>Retry reference metadata</button></p>}
       {lockedSchema && <p className="workflow-field-hint">Append and Replace Data preserve the physical DEV schema. PROD is available as a reference; return to Destination to choose a strategy that permits structural changes.</p>}
       {lockedSchema && !targetSchema && <p className="workflow-field-hint" role="status">DEV schema verification is pending. Local preview can use the preserved draft; publication remains blocked.</p>}
-      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{displayedSchema.fields.map((field, index) => <SchemaFieldEditor key={index} mode="synthetic" field={field} disabled={lockedSchema} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
+      <div className="synthetic-schema-editor"><div className="synthetic-rule-row heading"><span>Column</span><span>Databricks type</span><span>Nullability</span><span>Action</span></div>{displayedSchema.fields.map((field, index) => <SchemaFieldEditor key={`${field.name}:${index}`} mode="synthetic" field={field} disabled={lockedSchema} onChange={(change) => updateField(field.name, change)} onRemove={() => removeField(field.name)} />)}</div>
       {!lockedSchema && <button className="button secondary small" onClick={addField}>Add column</button>}
       <footer className="synthetic-actions"><button className="button secondary small" onClick={() => navigateToStep(0)}><ArrowLeft size={13} /> Destination</button><button className="button primary small" onClick={() => navigateToStep(2)}>Generation Rules <ArrowRight size={13} /></button></footer>
     </section>}
@@ -531,7 +594,7 @@ export function SyntheticStudio({ active = true, node, sourceEnvironment, onClos
         return stages.map((item) => <div className={operation.state === 'failed' && phase !== 'completed' && !item.done && !item.active ? 'failed' : item.done ? 'done' : item.active ? 'active' : ''} key={item.id}><span>{item.done ? <Check size={13} /> : item.active ? <LoaderCircle size={13} className="spin" /> : operation.state === 'failed' && phase !== 'completed' ? '!' : '○'}</span><strong>{item.label}<small>{item.detail}</small></strong></div>)
       })()}</div>
       <div className="synthetic-metrics"><span>Rows generated <strong>{Number(operation.details?.generated_rows ?? 0).toLocaleString()}</strong></span><span>Rows uploaded <strong>{Number(operation.details?.uploaded_rows ?? 0).toLocaleString()}</strong></span><span>Files <strong>{run?.chunks.length ?? operation.details?.file_count ?? 0}</strong></span><span>Uploaded data <strong>{(Number(operation.details?.uploaded_bytes ?? 0)/1024/1024).toFixed(1)} MiB</strong></span><span>Local staging <strong>{(Number(operation.details?.staging_bytes ?? 0)/1024/1024).toFixed(1)} MiB</strong></span><span>Worker RSS <strong>{operation.details?.local_rss_bytes ? `${(Number(operation.details.local_rss_bytes)/1024/1024).toFixed(1)} MiB` : 'Unavailable'}</strong></span><span>Warehouse <strong>{warehouses.find((item) => item.id === destination.warehouse_id)?.name ?? 'Selected DEV warehouse'}</strong></span></div>
-      {operation.error_message && <div className="discover-error" role="alert">{operation.error_message}{Boolean(operation.details?.reconciliation_required) && <p>Destructive execution started. Automatic retry is disabled; inspect the current DEV table and reconcile the recorded run before any new publication.</p>}</div>}
+      {operation.error_message && <div className="discover-error" role="alert">{operation.error_message}{operation.details?.failed_phase && <small>Stage: {String(operation.details.failed_phase).replaceAll('_', ' ')}</small>}{operation.details?.databricks_error_code && <small>Databricks error: {String(operation.details.databricks_error_code)}{operation.details.databricks_sql_state ? ` · SQLSTATE ${String(operation.details.databricks_sql_state)}` : ''}</small>}{Boolean(operation.details?.reconciliation_required) && <p>Destructive execution started. Automatic retry is disabled; inspect the current DEV table and reconcile the recorded run before any new publication.</p>}</div>}
       {Boolean(operation.details?.reconciliation_required) && strategy === 'drop_recreate' && <div className="synthetic-destructive-confirm"><strong>Reconcile current DEV state</strong><p>Dexter will check that the prior DROP statement is terminal and that the destination is either absent or still the unchanged original table. It will not resume the old publication.</p><label>Type {fullTarget}<input value={reconcileConfirmation} onChange={(event) => setReconcileConfirmation(event.target.value)} /></label><button className="button secondary small" disabled={loading || reconcileConfirmation !== fullTarget} onClick={() => void reconcileRun()}>Verify and release retry lock</button></div>}
       {logs.length > 0 && <details className="synthetic-log-details"><summary>Execution log · {logs.length} entries</summary><ol>{logs.map((item, index) => <li key={`${item.created_at}-${index}`}><time>{new Date(item.created_at).toLocaleTimeString()}</time><span>{item.message}</span></li>)}</ol></details>}
       {operation.state === 'succeeded' && <div className="synthetic-complete"><Check size={17} /><span><strong>DEV snapshot validated</strong>{operation.details?.publication && ` · ${Number((operation.details.publication as Record<string, unknown>).row_count ?? 0).toLocaleString()} rows in ${String((operation.details.publication as Record<string, unknown>).target ?? fullTarget)}`}</span><div><button className="button secondary small" onClick={() => onOpenTable?.(review?.destination ?? request.destination)}>Open Table</button><button className="button secondary small" onClick={() => onCompare?.(review?.destination ?? request.destination)}>Compare Tables</button></div></div>}

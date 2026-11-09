@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dexter.adapters.databricks import ensure_sql_warehouse_running, profile_config_file
-from dexter.adapters.databricks_sql import StatementExecutionError
+from dexter.adapters.databricks_sql import StatementExecutionError, safe_diagnostic_text
 from dexter.adapters.databricks_synthetic_publisher import SyntheticPublishError, publish_verified_run
 from dexter.adapters.databricks_volume import (
     VolumeTransportError, create_run_directory, ensure_staging_volume, require_sql_read_access,
@@ -167,16 +167,26 @@ def run_synthetic_operation(*, operation_id: str, worker_id: str, database: Path
         operations.update_details(operation_id, failed_phase=exc.phase or "publication",
                                   databricks_error_code=error_code,
                                   databricks_sql_state=sql_state or None,
+                                  databricks_error_message=exc.diagnostic,
                                   staged_files_retained=True)
         state_detail = f", SQLSTATE {sql_state}" if sql_state else ""
-        message = (f"Dexter could not complete the Databricks SQL step during {phase} ({error_code}{state_detail}). "
+        diagnostic_detail = f" Details: {exc.diagnostic}." if exc.diagnostic else " Check the Databricks error code and SQLSTATE in the operation details."
+        message = (f"Databricks SQL failed during {phase} ({error_code}{state_detail}).{diagnostic_detail} "
                    "The verified files remain in the DEV staging Volume for recovery.")
         _fail(operations, runs, operation_id, run_id, message, "DATABRICKS_STATEMENT_FAILED")
     except Exception as exc:
-        # Keep stack traces and SDK diagnostics in backend logs only; surface a safe stage message.
+        # Keep the traceback in local logs; persist only a bounded, redacted summary for the UI.
         import logging
         logging.getLogger("dexter.synthetic").exception("Synthetic operation failed run=%s type=%s", run_id, type(exc).__name__)
-        _fail(operations, runs, operation_id, run_id, "The synthetic data operation stopped unexpectedly; the manifest was kept for recovery", "WORKER_FAILURE")
+        current_details = (operations.get(operation_id) or {}).get("details", {})
+        failed_phase = str(current_details.get("phase") or "unknown")
+        diagnostic = safe_diagnostic_text(str(exc), limit=180)
+        operations.update_details(operation_id, failed_phase=failed_phase,
+                                  failure_type=type(exc).__name__, failure_summary=diagnostic)
+        detail = f" Details: {diagnostic}." if diagnostic else " Check the local Dexter log for the worker traceback."
+        message = (f"The synthetic data operation failed during {failed_phase.replace('_', ' ')} "
+                   f"({type(exc).__name__}).{detail} The manifest was kept for recovery.")
+        _fail(operations, runs, operation_id, run_id, message, "WORKER_FAILURE")
     finally:
         stop_heartbeat.set()
         heartbeat.join(timeout=2)
@@ -507,6 +517,13 @@ def _cancelled(operations: OperationsService, runs: SyntheticRunRepository, oper
 def _fail(operations: OperationsService, runs: SyntheticRunRepository, operation_id: str,
           run_id: str | None, message: str, code: str) -> None:
     safe = message[:400]
+    try:
+        current_details = (operations.get(operation_id) or {}).get("details", {})
+        phase = current_details.get("phase")
+        if phase and not current_details.get("failed_phase"):
+            operations.update_details(operation_id, failed_phase=str(phase))
+    except Exception:
+        pass
     if isinstance(run_id, str):
         try:
             run = runs.get(run_id)

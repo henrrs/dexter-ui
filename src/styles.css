@@ -663,6 +663,7 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .synthetic-step-strip button.active { border-color:#806820; color:#e4c65f; background:#2b2618; }
 .synthetic-step-strip button.complete { color:#69b887; border-color:#34583f; }
 .synthetic-destination-grid,.synthetic-review-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:11px; }
+.synthetic-destination-field { display:flex; min-width:0; flex-direction:column; gap:5px; color:#9ba39f; font-size:9px; }.synthetic-destination-field > button { align-self:flex-start; }
 .synthetic-destination-grid label { display:flex; min-width:0; flex-direction:column; gap:5px; color:#9ba39f; font-size:9px; }
 .synthetic-destination-grid input,.synthetic-destination-grid select,.synthetic-schema-editor input,.synthetic-schema-editor select,.synthetic-destructive-confirm input { width:100%; min-width:0; height:33px; padding:0 9px; border:1px solid #343b3c; border-radius:4px; color:#d4d9d5; background:#202425; font:inherit; font-size:10px; }
 .synthetic-schema-editor { max-height:48vh; overflow:auto; border:1px solid #292e2f; border-radius:5px; }

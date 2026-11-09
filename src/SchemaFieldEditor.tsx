@@ -48,7 +48,7 @@ export function SchemaFieldEditor({ mode, field, status, origin, modified = fals
     <select aria-label={`Nullability for ${field.name}`} disabled={disabled} value={field.nullable === false ? 'required' : 'nullable'} onChange={(event) => onChange({ nullable: event.target.value === 'nullable' })}>
       <option value="nullable">Nullable</option><option value="required">Required</option>
     </select>
-    <button className="icon-button subtle" aria-label={`Remove ${field.name}`} disabled={disabled} onClick={onRemove}><X size={13} /></button>
+    <button type="button" className="icon-button subtle" aria-label={`Remove ${field.name}`} title={disabled && mode === 'synthetic' ? 'Append and Replace preserve the existing DEV schema. Choose a strategy that allows schema changes.' : undefined} disabled={disabled} onClick={onRemove}><X size={13} /></button>
   </div>
 
   return <tr data-origin={origin} data-edit-state={removed ? 'removed' : added ? 'added' : modified ? 'modified' : 'unchanged'} className={removed ? 'removed' : origin === 'prod' ? 'added-from-prod' : origin === 'manual' ? 'added-manually' : modified ? 'modified' : ''}>
@@ -57,6 +57,6 @@ export function SchemaFieldEditor({ mode, field, status, origin, modified = fals
     <td><select aria-label={`Nullability ${field.name}`} value={field.nullable === false ? 'required' : 'nullable'} disabled={disabled || removed || complex} onChange={(event) => onChange({ nullable: event.target.value === 'nullable' })}><option value="nullable">Nullable</option><option value="required">NOT NULL</option></select></td>
     <td><input aria-label={`Comment ${field.name}`} value={String(field.technology_properties?.comment ?? '')} disabled={disabled || removed || complex} onChange={(event) => onChange({ comment: event.target.value })} /></td>
     <td><span className="schema-draft-label">{origin === 'prod' ? 'Added from PROD' : origin === 'manual' ? 'Added manually' : 'Original DEV'}</span>{(removed || added || modified) && <small>{removed ? 'Removed' : added ? 'Pending addition' : 'Modified'}</small>}{status && status !== 'Matches PROD' && <small className="schema-physical-comparison">{status}</small>}</td>
-    <td>{removed ? <button className="icon-button subtle" aria-label={`Restore ${field.name}`} onClick={onRestore}><RotateCcw size={14} /></button> : <button className="icon-button subtle" aria-label={`Remove ${field.name}`} onClick={onRemove}><Trash2 size={14} /></button>}</td>
+    <td>{removed ? <button type="button" className="icon-button subtle" aria-label={`Restore ${field.name}`} onClick={onRestore}><RotateCcw size={14} /></button> : <button type="button" className="icon-button subtle" aria-label={`Remove ${field.name}`} onClick={onRemove}><Trash2 size={14} /></button>}</td>
   </tr>
 }

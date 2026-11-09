@@ -1745,6 +1745,38 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         except Exception as exc:
             raise _remote_failure(exc) from None
 
+    @app.get("/api/synthetic/warehouses")
+    def synthetic_warehouses(force: bool = False):
+        config = settings_repo.get("databricks.dev") or {}
+        profile = str(config.get("profile") or "")
+        if not profile:
+            raise HTTPException(409, detail="No Databricks DEV profile is configured")
+        from dexter.adapters.databricks import safe_workspace_host
+        from dexter.catalog.cache import context_key
+        host = safe_workspace_host(profile)
+        cache_context = context_key("databricks", "dev", profile, host) if host else None
+        cached = discover.cache.get(cache_context, "warehouses") if cache_context else None
+        if cached and not force:
+            return {"items": cached["items"],
+                    "metadata_cache": {"state": "stale" if cached["stale"] else "cached", "fetched_at": cached["fetched_at"]},
+                    "warning": None}
+        try:
+            workspace = _synthetic_workspace()
+            items = [{"id": item.id, "name": item.name,
+                      "state": str(item.state).upper().split(".")[-1]}
+                     for item in workspace.warehouses.list()]
+            context = cache_context or context_key("databricks", "dev", profile,
+                str(getattr(getattr(workspace, "config", None), "host", "")))
+            page = discover.cache.put(context, "warehouses", items, 3600)
+            return {"items": items, "metadata_cache": {"state": "refreshed", "fetched_at": page["fetched_at"]},
+                    "warning": None}
+        except Exception as exc:
+            if cached:
+                return {"items": cached["items"],
+                        "metadata_cache": {"state": "stale", "fetched_at": cached["fetched_at"]},
+                        "warning": "Could not refresh DEV warehouses; showing the saved list."}
+            raise _remote_failure(exc) from None
+
     @app.get("/api/synthetic/destinations")
     def synthetic_destinations(catalog: str | None = None, schema: str | None = None, table: str | None = None,
                                source_node_id: str | None = None, source_environment: str = "prod"):
@@ -1754,13 +1786,17 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         try:
             warehouses, warnings = [], []
             if catalog is None:
-                try:
-                    warehouses = [{"id": item.id, "name": item.name, "state": str(item.state).upper().split(".")[-1]}
-                                  for item in workspace.warehouses.list()]
-                except Exception as exc:
-                    from dexter.adapters.databricks_diagnostics import classify_failure
-                    warnings.append({**classify_failure(exc), "resource": "warehouses"})
-                catalogs = [{"name": item.name} for item in workspace.catalogs.list()]
+                catalogs_page = discover.cached_children("databricks:dev")
+                catalogs = [{"name": item.get("name")} for item in catalogs_page.get("items", [])
+                            if isinstance(item, dict) and item.get("name")]
+                from dexter.adapters.databricks import safe_workspace_host
+                from dexter.catalog.cache import context_key
+                config = settings_repo.get("databricks.dev") or {}
+                profile = str(config.get("profile") or "")
+                host = safe_workspace_host(profile) if profile else None
+                warehouse_context = context_key("databricks", "dev", profile, host) if host else None
+                warehouse_page = discover.cache.get(warehouse_context, "warehouses") if warehouse_context else None
+                warehouses = warehouse_page.get("items", []) if warehouse_page else []
                 try:
                     locations = list(workspace.external_locations.list())
                     external_locations = [{"name": item.name, "url": getattr(item, "url", ""), "read_only": bool(getattr(item, "read_only", False))} for item in locations]
@@ -1846,7 +1882,12 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
                 return {"catalogs": catalogs, "schemas": [], "tables": [], "warehouses": warehouses,
                         "external_locations": external_locations, "suggestion": suggestion,
                         "source_storage_type": source_storage_type, "warnings": warnings}
-            schemas = [{"name": item.name} for item in workspace.schemas.list(catalog_name=catalog)] if schema is None else []
+            if schema is None:
+                schema_page = discover.children(f"databricks:dev:{catalog}")
+                schemas = [{"name": item.get("name")} for item in schema_page.get("items", [])
+                           if isinstance(item, dict) and item.get("name")]
+            else:
+                schemas = []
             tables = [{"name": item.name, "table_type": str(item.table_type).upper().split(".")[-1],
                        "data_source_format": str(getattr(item, "data_source_format", "")).upper().split(".")[-1]}
                       for item in workspace.tables.list(catalog_name=catalog, schema_name=schema)] if schema else []
@@ -2040,11 +2081,11 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         return result
 
     @app.get("/api/discover/nodes/{node_id:path}/children")
-    def discover_children(node_id: str, force: bool = False):
-        return discover.children(node_id, force)
+    def discover_children(node_id: str, force: bool = False, cached_only: bool = False):
+        return discover.cached_children(node_id) if cached_only else discover.children(node_id, force)
 
     @app.get("/api/discover/nodes/{node_id:path}/warehouses")
-    def available_warehouses(node_id: str, environment: str = "dev"):
+    def available_warehouses(node_id: str, environment: str = "dev", force: bool = False):
         detail = unified.detail(node_id, environment) if node_id.startswith("unified:") else discover.detail(node_id)
         if not detail or detail.get("source") != "databricks" or detail.get("access") != "read":
             raise HTTPException(403, detail="A readable Databricks table is required")
@@ -2052,14 +2093,26 @@ def create_app(paths: DexterPaths | None = None, settings: Settings | None = Non
         config = settings_repo.get(f"databricks.{env}")
         if not config:
             raise HTTPException(409, detail="The selected environment has no configured profile")
+        from dexter.adapters.databricks import safe_workspace_host
+        from dexter.catalog.cache import context_key
+        profile = str(config.get("profile") or "")
+        host = safe_workspace_host(profile) if profile else None
+        cache_context = context_key("databricks", env, profile, host) if host else None
+        cached = discover.cache.get(cache_context, "warehouses") if cache_context else None
+        if cached and not force:
+            return {"items": cached["items"], "message": None if cached["items"] else "No SQL warehouses are available to this Databricks profile."}
         try:
             from databricks.sdk import WorkspaceClient
             from dexter.adapters.databricks import profile_config_file
-            workspace = WorkspaceClient(profile=config["profile"], config_file=str(profile_config_file(config["profile"])))
+            workspace = WorkspaceClient(profile=profile, config_file=str(profile_config_file(profile)))
             items = [{"id": w.id, "name": w.name, "state": str(w.state).upper().split(".")[-1]} for w in workspace.warehouses.list()]
+            context = cache_context or context_key("databricks", env, profile, str(getattr(getattr(workspace, "config", None), "host", "")))
+            discover.cache.put(context, "warehouses", items, 3600)
             return {"items": items, "message": None if items else "No SQL warehouses are available to this Databricks profile."}
         except Exception as exc:
             logger.info("Warehouse listing failed (%s)", type(exc).__name__)
+            if cached:
+                return {"items": cached["items"], "message": "Could not refresh SQL warehouses; showing the saved list."}
             raise HTTPException(503, detail="Could not list SQL warehouses accessible to the selected profile") from None
 
     @app.get("/api/discover/nodes/{node_id:path}")

@@ -792,6 +792,13 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
     }
     void selectNode(tab.node, tab.environment)
   }
+  const closeSyntheticTab = (tab: WorkbenchTab) => {
+    const remaining = workbenchTabs.filter((item) => item.key !== tab.key)
+    setWorkbenchTabs(remaining)
+    const tableTab = remaining.find((item) => item.key === tab.node.id && item.view === 'table')
+    if (tableTab) activateTab(tableTab)
+    else void selectNode(tab.node, tab.environment)
+  }
 
   const openSyntheticDestination = async (destination: { catalog: string; schema: string; table: string }, compare = false) => {
     try {
@@ -903,7 +910,7 @@ export function DiscoverView({ active, explorerOpen, explorerWidth, onCollapseEx
               if (item.view === 'table' && item.node.id === tab.node.id) void api.discoverCatalogDetail(item.node.id, item.environment).then(detail => setWorkbenchTabs(tabs => tabs.map(current => current.key === item.key ? { ...current, node: { ...current.node, ...detail, id: current.node.id } } : current))).catch(() => undefined)
             }
           }} onCompare={openCompare} />
-          : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => { const tableTab = workbenchTabs.find((item) => item.key === tab.node.id); if (tableTab) activateTab(tableTab); else void selectNode(tab.node) }} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
+          : <SyntheticStudio active={active && activeTabKey === tab.key} node={tab.node} sourceEnvironment={tab.environment === 'prod' ? 'prod' : 'dev'} comparison={tab.syntheticComparison} onClose={() => closeSyntheticTab(tab)} onPublished={() => void refreshOpenHierarchy(true)} onOpenTable={(destination) => void openSyntheticDestination(destination)} onCompare={(destination) => void openSyntheticDestination(destination, true)} />}
       </div>)}{selected ? <>{activeSection === 'schema-evolution' || activeSection === 'synthetic' ? null : activeSection === 'compare' ? (() => {
         const compareTab = workbenchTabs.find((tab) => tab.key === activeTabKey && tab.view === 'compare')
         const comparison = compareTab?.comparison

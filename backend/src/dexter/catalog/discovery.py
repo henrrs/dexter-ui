@@ -82,7 +82,7 @@ class DiscoverService:
                 if not host:
                     continue
                 context = context_key("databricks", env, config["profile"], host)
-                paths.update(node for node in self.cache.nodes(context) if node != "catalogs")
+                paths.update(node for node in self.cache.nodes(context) if node not in {"catalogs", "warehouses"})
             except Exception as exc:
                 # Cache discovery is local-only and must not require a successful profile login.
                 logger.debug("Could not inspect cached Databricks page keys (%s)", type(exc).__name__)
