@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -116,7 +118,35 @@ class FakeRuntime:
         self.shutdown_called = True
 
 
+class BootstrapAdapter:
+    def health(self, *, timeout=0.75):
+        return type("Health", (), {"healthy": True, "version": "test"})()
+
+    def agents(self, *, timeout=5.0):
+        return [{"id": "build", "description": "Build", "mode": "primary"}]
+
+    def models(self, *, timeout=5.0):
+        return [MODEL]
+
+    def close(self):
+        pass
+
+
 class OpenCodeAdapterTests(unittest.TestCase):
+    def test_health_probe_uses_its_own_short_timeout(self):
+        seen = []
+
+        def respond(request):
+            seen.append(request.extensions["timeout"]["read"])
+            return httpx.Response(200, json={"version": "test", "healthy": True})
+
+        adapter = OpenCodeAdapter("http://127.0.0.1:1", directory="/tmp/private", timeout=12)
+        adapter._client.close()
+        adapter._client = httpx.Client(base_url="http://127.0.0.1:1", transport=httpx.MockTransport(respond))
+        self.assertTrue(adapter.health(timeout=0.4).healthy)
+        self.assertEqual(seen, [0.4])
+        adapter.close()
+
     def test_prompt_and_session_are_explicitly_tool_and_permission_restricted(self):
         requests = []
 
@@ -303,6 +333,156 @@ class AskConversationTests(unittest.TestCase):
 
 
 class OpenCodeRuntimePolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.paths = DexterPaths(root / "home", root / "config", root / "home", root / "home/metadata",
+                                 root / "home/datasets", root / "home/artifacts", root / "home/logs", root / "home/tmp")
+        self.paths.ensure()
+        migrate(self.paths.database)
+        self.settings = SettingsRepository(self.paths.database)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_status_starts_discovery_in_background_and_coalesces_requests(self):
+        runtime = OpenCodeRuntime(self.paths, self.settings)
+        entered = threading.Event()
+        release = threading.Event()
+        adapter = BootstrapAdapter()
+        calls = []
+
+        def connect():
+            calls.append(1)
+            entered.set()
+            release.wait(2)
+            runtime._adapter = adapter
+            return adapter
+
+        runtime.adapter = connect
+        first = runtime.status()
+        self.assertEqual(first["state"], "starting")
+        self.assertTrue(entered.wait(1))
+        self.assertEqual(runtime.status()["state"], "starting")
+        self.assertEqual(len(calls), 1)
+        release.set()
+        deadline = time.monotonic() + 2
+        while runtime.status()["state"] == "starting" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(runtime.status()["state"], "connected")
+        runtime.shutdown()
+
+    def test_managed_start_retries_transient_readiness_failures(self):
+        class Process:
+            def __init__(self, *_args, **_kwargs):
+                self.pid = 12345
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout):
+                return 0
+
+        class Adapter:
+            def __init__(self, *_args, **_kwargs):
+                self.probes = 0
+                self.closed = False
+
+            def health(self, *, timeout):
+                self.probes += 1
+                if self.probes < 3:
+                    raise OpenCodeError("OPENCODE_UNAVAILABLE", "not ready")
+                return type("Health", (), {"healthy": True, "version": "test"})()
+
+            def close(self):
+                self.closed = True
+
+        process = Process()
+        adapter = Adapter()
+        with patch("dexter.services.opencode_runtime.shutil.which", return_value="/bin/opencode"), \
+                patch("dexter.services.opencode_runtime.subprocess.Popen", return_value=process), \
+                patch("dexter.services.opencode_runtime.OpenCodeAdapter", return_value=adapter), \
+                patch.object(OpenCodeRuntime, "_available_port", return_value=54321), \
+                patch.object(OpenCodeRuntime, "_opencode_environment", return_value={}), \
+                patch.object(OpenCodeRuntime, "STARTUP_TIMEOUT_SECONDS", 2):
+            runtime = OpenCodeRuntime(self.paths, self.settings)
+            connected = runtime._start_managed()
+        self.assertIs(connected, adapter)
+        self.assertEqual(adapter.probes, 3)
+        self.assertFalse(process.terminated)
+        self.assertTrue(runtime._managed)
+        runtime.shutdown()
+
+    def test_configured_endpoint_retries_readiness_without_managing_external_process(self):
+        class Adapter:
+            def __init__(self, *_args, **_kwargs):
+                self.probes = 0
+                self.closed = False
+
+            def health(self, *, timeout):
+                self.probes += 1
+                if self.probes < 3:
+                    raise OpenCodeError("OPENCODE_UNAVAILABLE", "not ready")
+                return type("Health", (), {"healthy": True, "version": "test"})()
+
+            def close(self):
+                self.closed = True
+
+        adapter = Adapter()
+        with patch("dexter.services.opencode_runtime.OpenCodeAdapter", return_value=adapter), \
+                patch.object(OpenCodeRuntime, "STARTUP_TIMEOUT_SECONDS", 2):
+            runtime = OpenCodeRuntime(self.paths, self.settings)
+            connected = runtime._connect("https://opencode.example", managed=False)
+        self.assertIs(connected, adapter)
+        self.assertEqual(adapter.probes, 3)
+        self.assertFalse(runtime._managed)
+        self.assertIsNone(runtime._process)
+        runtime.shutdown()
+
+    def test_managed_start_failure_terminates_only_its_child(self):
+        class Process:
+            def __init__(self, *_args, **_kwargs):
+                self.pid = 12346
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout):
+                return 0
+
+        class Adapter:
+            def __init__(self, *_args, **_kwargs):
+                self.closed = False
+
+            def health(self, *, timeout):
+                raise OpenCodeError("OPENCODE_UNAVAILABLE", "not ready")
+
+            def close(self):
+                self.closed = True
+
+        process = Process()
+        adapter = Adapter()
+        with patch("dexter.services.opencode_runtime.shutil.which", return_value="/bin/opencode"), \
+                patch("dexter.services.opencode_runtime.subprocess.Popen", return_value=process), \
+                patch("dexter.services.opencode_runtime.OpenCodeAdapter", return_value=adapter), \
+                patch.object(OpenCodeRuntime, "_available_port", return_value=54321), \
+                patch.object(OpenCodeRuntime, "_opencode_environment", return_value={}), \
+                patch.object(OpenCodeRuntime, "STARTUP_TIMEOUT_SECONDS", 0):
+            runtime = OpenCodeRuntime(self.paths, self.settings)
+            with self.assertRaisesRegex(OpenCodeError, "did not become ready"):
+                runtime._start_managed()
+        self.assertTrue(adapter.closed)
+        self.assertTrue(process.terminated)
+        self.assertFalse(runtime._managed)
+
     def test_model_preference_is_discovered_without_fixed_id(self):
         self.assertEqual(select_preferred_model([{"provider_id": "x", "id": "other", "name": "Other"}, MODEL])["id"], "gpt-6-luna")
         self.assertIsNone(select_preferred_model([{"provider_id": "x", "id": "fallback", "name": "Fallback"}]))
@@ -326,19 +506,13 @@ class OpenCodeRuntimePolicyTests(unittest.TestCase):
         self.assertNotIn("NODE_OPTIONS", child)
 
     def test_agent_identifier_is_configurable_and_managed_profile_denies_tools(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            paths = DexterPaths(root / "home", root / "config", root / "home", root / "home/metadata",
-                                root / "home/datasets", root / "home/artifacts", root / "home/logs", root / "home/tmp")
-            paths.ensure(); migrate(paths.database)
-            settings = SettingsRepository(paths.database)
-            runtime = OpenCodeRuntime(paths, settings)
-            self.assertEqual(runtime.agent_id, "build")
-            configured = runtime.configure_endpoint(None, "dexter-preview")
-            self.assertEqual(configured["agent_id"], "dexter-preview")
-            self.assertEqual(OpenCodeRuntime(paths, settings).agent_id, "dexter-preview")
-            with self.assertRaisesRegex(ValueError, "agent ID"):
-                runtime.configure_endpoint(None, "../unsafe")
+        runtime = OpenCodeRuntime(self.paths, self.settings)
+        self.assertEqual(runtime.agent_id, "build")
+        configured = runtime.configure_endpoint(None, "dexter-preview")
+        self.assertEqual(configured["agent_id"], "dexter-preview")
+        self.assertEqual(OpenCodeRuntime(self.paths, self.settings).agent_id, "dexter-preview")
+        with self.assertRaisesRegex(ValueError, "agent ID"):
+            runtime.configure_endpoint(None, "../unsafe")
         self.assertEqual(MANAGED_CONFIG["agent"]["build"]["tools"], {"*": False})
         self.assertEqual(MANAGED_CONFIG["permission"], {"*": "deny"})
 

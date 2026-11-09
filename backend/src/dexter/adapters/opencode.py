@@ -41,13 +41,14 @@ class OpenCodeAdapter:
     def close(self) -> None:
         self._client.close()
 
-    def health(self) -> OpenCodeHealth:
-        payload = self._json("GET", "/global/health")
+    def health(self, *, timeout: float = 0.75) -> OpenCodeHealth:
+        """Run a short readiness probe without inheriting request timeouts."""
+        payload = self._json("GET", "/global/health", timeout=timeout)
         return OpenCodeHealth(version=str(payload.get("version") or "unknown"),
                               healthy=payload.get("healthy") is True)
 
-    def agents(self) -> list[dict[str, Any]]:
-        payload = self._json("GET", "/agent", params=self._scope())
+    def agents(self, *, timeout: float = 12.0) -> list[dict[str, Any]]:
+        payload = self._json("GET", "/agent", params=self._scope(), timeout=timeout)
         result = []
         for item in payload if isinstance(payload, list) else []:
             name = item.get("name")
@@ -58,9 +59,9 @@ class OpenCodeAdapter:
                            "native": bool(item.get("native"))})
         return result
 
-    def models(self) -> list[dict[str, Any]]:
+    def models(self, *, timeout: float = 12.0) -> list[dict[str, Any]]:
         """Return safe models from connected providers only, dropping auth fields."""
-        payload = self._json("GET", "/provider", params=self._scope())
+        payload = self._json("GET", "/provider", params=self._scope(), timeout=timeout)
         providers = payload.get("all", [])
         connected = {str(item) for item in payload.get("connected", []) if isinstance(item, str)}
         result: list[dict[str, Any]] = []

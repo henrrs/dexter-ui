@@ -203,3 +203,14 @@ Validation on 2026-11-09:
 - `node --test scripts/ui-contract.test.mjs` — all 10 contracts passed. `npm run build`, Python compilation, and `git diff --check` passed.
 - The broader `test_workflow_stabilization` module still has the previously recorded `test_partial_warehouse_failure_does_not_block_destination_metadata` expectation mismatch: it expects a warehouse warning although this route reads the cached list without calling the warehouse API. The new location-resolution API tests pass independently. This unrelated behavior was not changed here.
 - Databricks endpoints are fake/local fixtures for these checks. No live External Location grants or publication were accessed; the exact corporate name is asserted from the user-provided `tech_dev.gold` convention, while workspace existence and effective access remain runtime checks.
+
+## F4.4 OpenCode automatic startup and readiness retries
+
+Validation on 2026-11-09; this follow-up replaces the automatic-startup caveat recorded during the original F4.4 certification:
+
+- `PYTHONPATH=backend/src ../switchyard/.venv/bin/python -m unittest backend.tests.test_ask_dexter -v` — all 18 focused tests passed, including background single-flight startup, short health-probe timeouts, transient retries for configured and managed servers, and cleanup of only a Dexter-owned child after failure.
+- `node --test --test-force-exit scripts/opencode-startup-ui.test.mjs` — the real Firefox UI test passed with a controlled API fixture: the panel initiated status discovery without user configuration, showed the pending startup state across repeated responses, then enabled New Chat after readiness.
+- `npm run test:ui` — all 13 browser journeys passed, including the new OpenCode startup journey and all existing Discover/workflow journeys.
+- End-to-end local API smoke test passed against installed OpenCode **1.19.5**: the first `GET /api/ask/status` returned `starting` in under 0.01 seconds; background startup reached `connected` with the `build` agent and 37 connected model entries using a Dexter-managed loopback process. Dexter API shutdown terminated its managed process. No prompt, remote provider generation, Databricks, or Purview request was made.
+- A separate OpenCode CLI loopback health smoke test passed. `npm run build`, all 11 `scripts/ui-contract.test.mjs` contracts, Python compilation, and `git diff --check` passed.
+- Startup uses short 0.75-second health probes with capped exponential backoff for up to 45 seconds; agent/model metadata uses up to three five-second attempts. The UI polls at 0.8-second intervals while startup is pending. Authentication and invalid-endpoint errors fail fast.

@@ -89,6 +89,8 @@ Invariants:
 
 The connection order is: configured endpoint, an already-running local server at `127.0.0.1:4096`, then a Dexter-managed local server if one is needed. Endpoints must be a bare loopback HTTP origin or credential-free HTTPS origin. The browser sees only `/api/ask/*`. Managed OpenCode binds to `127.0.0.1`, uses a random in-memory HTTP Basic credential, a private Dexter-owned workspace/log directory and `--pure`; Dexter retains the native OpenCode auth store but does not pass API tokens or Databricks/Azure credentials through the server process environment. Logs are mode-restricted and provider credentials are not returned by model discovery.
 
+The mounted Ask panel triggers startup through `GET /api/ask/status`; the API returns `starting` immediately while one background bootstrap validates the runtime. Concurrent status requests share that bootstrap. Readiness probes have a 0.75-second timeout and retry with a capped exponential delay for up to 45 seconds. The same bounded retry window applies to a configured endpoint. Once health succeeds, agent/provider metadata is fetched with five-second timeouts and up to three attempts. Authentication failures and invalid endpoint responses stop early. The UI polls status every 0.8 seconds while startup is pending, then shows the validated agent/models or a retry action. Dexter terminates only a managed child it started; it never terminates a configured or pre-existing OpenCode server. Shutdown and reconnect cancel outstanding retries.
+
 The installed OpenCode version's actual API supports session-level permission rules and per-prompt `tools`. Dexter creates every session with `permission: * = deny` and sends every prompt with `tools: {"*": false}`. The managed profile additionally disables all tools, denies all permissions, and disables snapshots. These controls are sent in protocol requests as well as managed configuration; a system message is not the security control. If the configured agent is unavailable as a primary agent, the runtime reports it and does not silently switch agents.
 
 This boundary removes OpenCode shell/edit tools from the F4.4 conversation. It does not make an external model provider local: when a connected provider is selected, the user message and compact workspace context are sent to it by OpenCode. The UI context summary lets the user inspect which tabs will be included. Content inside workspace context is explicitly marked untrusted in the system message and cannot grant tools or permissions.
@@ -131,11 +133,19 @@ sequenceDiagram
   participant R as OpenCodeRuntime
   participant O as OpenCode Server
   UI->>API: GET /ask/status
-  API->>R: status()
-  R->>O: health, agents, connected providers/models
-  O-->>R: version + capability metadata
-  R-->>API: connected state; preferred model if present
-  API-->>UI: safe status DTO
+  API->>R: start background bootstrap if needed
+  R-->>API: starting + attempt count
+  API-->>UI: safe starting DTO immediately
+  loop while startup is pending
+    UI->>API: GET /ask/status
+    API-->>UI: starting DTO
+  end
+  R->>O: short health probes with bounded retries
+  O-->>R: healthy server
+  R->>O: list agent and connected model metadata
+  O-->>R: validated capability metadata
+  UI->>API: GET /ask/status
+  API-->>UI: connected state; preferred model if present
 ```
 
 The runtime starts a managed server only when no configured or local server responds and the OpenCode executable exists. A missing provider/model is represented in status, not hidden by a fake response.
@@ -220,7 +230,7 @@ The build-to-Dexter change is intentionally local: change the configured agent I
 ## Operations and troubleshooting
 
 1. Install and authenticate OpenCode using its supported native CLI workflow. Dexter does not copy provider keys into its database or offer another credential editor.
-2. Start Dexter normally. Open Ask Dexter; the panel checks for a configured endpoint, an existing local server, then may start its own private loopback server. The managed auto-start path did not pass readiness validation on this host during F4.4 certification. The working path was an explicitly configured loopback endpoint to the installed OpenCode 1.19.5 server. If Dexter reports `OPENCODE_START_FAILED`, start OpenCode Server manually with `opencode serve --hostname 127.0.0.1 --port 4096`, then use Retry or set that loopback endpoint in Ask settings; Dexter will not terminate this user-owned process.
+2. Start Dexter normally. The mounted Ask panel checks a configured endpoint, an existing local server, then starts its own private loopback server when necessary. It reports “Starting OpenCode” during its bounded readiness retries. If Dexter reports `OPENCODE_NOT_INSTALLED`, install the OpenCode CLI and restart Dexter. If a configured endpoint reports unavailable, verify the endpoint and server; use Retry to run another bounded attempt. A manual `opencode serve --hostname 127.0.0.1 --port 4096` remains an option, but is not required for the managed startup path.
 3. Open the panel's settings only to choose an available primary agent or configure a server endpoint. HTTP is accepted only for loopback; remote endpoints require HTTPS and must not contain a path, query, fragment, or embedded credentials.
 4. Select a connected model. If Luna 6 is absent, connect it in OpenCode and choose Retry; otherwise choose a model explicitly from the returned list.
 5. For “OpenCode unavailable”, use Retry and inspect the safe status/error code. Check that the CLI is on `PATH`, OpenCode authentication is current, endpoint is reachable, the selected agent is primary, and at least one provider is connected.

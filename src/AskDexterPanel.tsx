@@ -149,6 +149,23 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
 
   useEffect(() => { void refresh(true) }, [])
   useEffect(() => {
+    if (status?.state !== 'starting') return
+    let active = true
+    let timer: ReturnType<typeof setTimeout>
+    const poll = async () => {
+      try {
+        const next = await api.askStatus()
+        if (!active) return
+        setStatus(next)
+        if (next.state === 'starting') timer = setTimeout(() => { void poll() }, 800)
+      } catch {
+        if (active) timer = setTimeout(() => { void poll() }, 1200)
+      }
+    }
+    timer = setTimeout(() => { void poll() }, 800)
+    return () => { active = false; clearTimeout(timer) }
+  }, [status?.state])
+  useEffect(() => {
     if (!activeConversationId || loading || loadedConversationId === activeConversationId || !selectedConversation) return
     void loadConversation(selectedConversation.id)
   }, [activeConversationId, conversations, loading, loadedConversationId, loadConversation, selectedConversation])
@@ -269,7 +286,7 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
 
   return <div className="ask-panel-body">
     <div className="ask-toolbar">
-      <div className="ask-status"><span className={`ask-status-dot ${status?.connected ? 'online' : 'offline'}`} /><span>{status?.connected ? 'Connected' : loading ? 'Connecting' : 'OpenCode unavailable'}</span></div>
+      <div className="ask-status"><span className={`ask-status-dot ${status?.connected ? 'online' : status?.state === 'starting' || loading ? 'connecting' : 'offline'}`} /><span>{status?.connected ? 'Connected' : status?.state === 'starting' || loading ? 'Starting OpenCode' : 'OpenCode unavailable'}</span></div>
       <button className="ask-toolbar-button" aria-label="Reconnect OpenCode" title="Reconnect OpenCode" onClick={() => { setLoading(true); void api.askReconnect().then(setStatus).catch((cause) => setError(cause instanceof Error ? cause.message : 'OpenCode reconnection failed.')).finally(() => setLoading(false)) }}><RefreshCw size={13} /></button>
       <button className="ask-toolbar-button" aria-label="OpenCode settings" title="OpenCode settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen((value) => !value)}><Settings2 size={14} /></button>
     </div>
@@ -314,8 +331,8 @@ export function AskDexterPanel({ tabs, activeTabId }: Props) {
     </div>
 
     <div className="ask-messages" aria-live="polite">
-      {loading ? <div className="ask-empty"><LoaderCircle size={18} className="spin" /><span>Connecting to OpenCode…</span></div>
-          : !status?.connected ? <div className="ask-empty"><Bot size={22} /><strong>OpenCode is unavailable</strong><span>{status?.message ?? error ?? 'Check that OpenCode is installed and authenticated.'}</span><button onClick={() => { setLoading(true); void api.askReconnect().then((value) => { setStatus(value); setAgentDraft(value.agent_id ?? value.agent?.id ?? 'build'); setError('') }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Retry failed.')).finally(() => setLoading(false)) }}>Retry connection</button><small>Check the selected agent and local OpenCode authentication in settings.</small></div>
+      {loading || status?.state === 'starting' ? <div className="ask-empty"><LoaderCircle size={18} className="spin" /><strong>Starting local OpenCode…</strong><span>{status?.message ?? 'Dexter is checking the local service, agent, and available models.'}{status?.attempts ? ` · readiness checks: ${status.attempts}` : ''}</span></div>
+          : !status?.connected ? <div className="ask-empty"><Bot size={22} /><strong>{status?.state === 'agent_unavailable' ? 'OpenCode agent unavailable' : 'OpenCode is unavailable'}</strong><span>{status?.message ?? error ?? 'Check that OpenCode is installed and authenticated.'}</span><button onClick={() => { setLoading(true); void api.askReconnect().then((value) => { setStatus(value); setAgentDraft(value.agent_id ?? value.agent?.id ?? 'build'); setError('') }).catch((cause) => setError(cause instanceof Error ? cause.message : 'Retry failed.')).finally(() => setLoading(false)) }}>Retry connection</button><small>Dexter can start a local OpenCode server automatically when the executable is available.</small></div>
           : !selectedConversation ? <div className="ask-empty"><Bot size={23} /><strong>Start a conversation</strong><span>Ask about the active workspace or select tabs as context.</span><button disabled={!status.models.length} onClick={() => void createConversation()}>New chat</button>{!status.preferred_model_available && <small>Luna 6 is not connected. Choose an available model after creating a chat.</small>}</div>
             : messages.length === 0 && !busy ? <div className="ask-empty"><Bot size={23} /><strong>Ask Dexter</strong><span>{contextMode === 'active' && activeContext ? `Ready to discuss ${contextLabel(activeContext)}.` : 'Your workspace context is attached when you send a message.'}</span></div>
               : <>{messages.map((item) => <article key={item.id} className={`ask-message ${item.role}`}><div className="ask-message-role">{item.role === 'user' ? 'You' : 'Ask Dexter'}</div><div className="ask-message-content">{messageText(item.text)}</div></article>)}{busy && <article className="ask-message assistant streaming"><div className="ask-message-role">Ask Dexter <span>{streamState || 'Thinking'}</span></div><div className="ask-message-content">{streamingText ? messageText(streamingText) : <span className="ask-thinking"><LoaderCircle size={13} className="spin" /> Thinking…</span>}</div></article>}<div ref={messagesEnd} /></>}

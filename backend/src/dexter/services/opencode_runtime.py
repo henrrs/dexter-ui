@@ -57,6 +57,11 @@ def validate_opencode_endpoint(value: str) -> str:
 class OpenCodeRuntime:
     """Connects to local OpenCode or starts a private loopback instance on demand."""
 
+    STARTUP_TIMEOUT_SECONDS = 45.0
+    HEALTH_PROBE_TIMEOUT_SECONDS = 0.75
+    STARTUP_METADATA_TIMEOUT_SECONDS = 5.0
+    STARTUP_METADATA_ATTEMPTS = 3
+
     def __init__(self, paths: DexterPaths, settings: SettingsRepository,
                  *, agent_id: str | None = None):
         self.paths = paths
@@ -67,11 +72,19 @@ class OpenCodeRuntime:
             raise ValueError("OpenCode agent ID must contain only letters, digits, dots, underscores, and hyphens")
         self.agent_id = selected_agent
         self._lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._adapter: OpenCodeAdapter | None = None
         self._process: subprocess.Popen | None = None
         self._managed = False
         self._last_error: str | None = None
         self._version: str | None = None
+        self._state = "stopped"
+        self._startup_thread: threading.Thread | None = None
+        self._generation = 0
+        self._restart_after_current = False
+        self._startup_cancelled = threading.Event()
+        self._startup_attempts = 0
+        self._status_snapshot: dict | None = None
 
     def configured_endpoint(self) -> str | None:
         config = self.settings.get("ai.opencode") or {}
@@ -79,11 +92,12 @@ class OpenCodeRuntime:
         return validate_opencode_endpoint(endpoint) if isinstance(endpoint, str) and endpoint else None
 
     def configure_endpoint(self, endpoint: str | None, agent_id: str | None = None) -> dict:
+        normalized = validate_opencode_endpoint(endpoint) if endpoint else None
+        selected_agent = agent_id or self.agent_id
+        if not isinstance(selected_agent, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", selected_agent):
+            raise ValueError("OpenCode agent ID must contain only letters, digits, dots, underscores, and hyphens")
+        self._startup_cancelled.set()
         with self._lock:
-            normalized = validate_opencode_endpoint(endpoint) if endpoint else None
-            selected_agent = agent_id or self.agent_id
-            if not isinstance(selected_agent, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", selected_agent):
-                raise ValueError("OpenCode agent ID must contain only letters, digits, dots, underscores, and hyphens")
             current = self.settings.get("ai.opencode") or {}
             if normalized:
                 current["endpoint"] = normalized
@@ -95,6 +109,14 @@ class OpenCodeRuntime:
             self._close_adapter()
             self._stop_managed()
             self._last_error = None
+        with self._state_lock:
+            self._generation += 1
+            self._state = "stopped"
+            self._startup_attempts = 0
+            self._status_snapshot = None
+            self._startup_cancelled.clear()
+            if self._startup_thread and self._startup_thread.is_alive():
+                self._restart_after_current = True
         return {"endpoint": normalized, "mode": "external" if normalized else "automatic",
                 "agent_id": selected_agent}
 
@@ -102,12 +124,17 @@ class OpenCodeRuntime:
         with self._lock:
             if self._adapter is not None:
                 try:
-                    health = self._adapter.health()
+                    health = self._adapter.health(timeout=self.HEALTH_PROBE_TIMEOUT_SECONDS)
                     if health.healthy:
                         self._version = health.version
                         return self._adapter
+                    self._close_adapter()
+                    if self._managed:
+                        self._stop_managed()
                 except OpenCodeError:
                     self._close_adapter()
+                    if self._managed:
+                        self._stop_managed()
             endpoint = self.configured_endpoint()
             if endpoint:
                 return self._connect(endpoint, managed=False)
@@ -120,70 +147,45 @@ class OpenCodeRuntime:
             return self._start_managed()
 
     def status(self) -> dict:
-        endpoint = self.configured_endpoint()
-        try:
-            adapter = self.adapter()
-            health = adapter.health()
-            agents = adapter.agents()
-            models = adapter.models()
-            agent = next((item for item in agents if item["id"] == self.agent_id and item["mode"] in {"primary", "all"}), None)
-            connected = bool(health.healthy and agent)
-            default_model = select_preferred_model(models)
-            return {
-                "connected": connected,
-                "state": "connected" if connected else "agent_unavailable",
-                "version": health.version,
-                "agent_id": self.agent_id,
-                "agent": agent,
-                "agents": [item for item in agents if item["mode"] in {"primary", "all"}],
-                "models": models,
-                "default_model": default_model,
-                "preferred_model_available": default_model is not None,
-                "managed": self._managed,
-                "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "local"),
-                "endpoint": endpoint if endpoint else None,
-                "message": None if connected else f"The configured OpenCode agent '{self.agent_id}' is not available as a primary agent.",
-            }
-        except OpenCodeError as exc:
-            self._last_error = exc.code
-            return {
-                "connected": False,
-                "state": "unavailable",
-                "version": self._version,
-                "agent_id": self.agent_id,
-                "agent": None,
-                "agents": [],
-                "models": [],
-                "default_model": None,
-                "preferred_model_available": False,
-                "managed": self._managed,
-                "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "automatic"),
-                "endpoint": endpoint,
-                "message": str(exc),
-                "error_code": exc.code,
-                "retryable": True,
-            }
-        except Exception as exc:
-            logger.warning("OpenCode discovery failed type=%s", type(exc).__name__)
-            return {
-                "connected": False, "state": "unavailable", "version": self._version, "agent_id": self.agent_id,
-                "agent": None, "agents": [], "models": [], "default_model": None,
-                "preferred_model_available": False, "managed": self._managed,
-                "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "automatic"),
-                "endpoint": endpoint, "message": "OpenCode could not be reached. Retry the connection.",
-                "error_code": "OPENCODE_UNAVAILABLE", "retryable": True,
-            }
+        """Return a quick status; first use starts discovery outside the API request."""
+        with self._state_lock:
+            if self._state == "stopped":
+                self._launch_startup_locked(self._generation)
+            if self._state == "starting":
+                return self._starting_status()
+            if self._status_snapshot is not None:
+                return dict(self._status_snapshot)
+            return self._unavailable_status(
+                "OPENCODE_UNAVAILABLE", "OpenCode could not be reached. Retry the connection."
+            )
 
     def reconnect(self) -> dict:
-        with self._lock:
-            self._close_adapter()
-            self._last_error = None
-        return self.status()
-
-    def shutdown(self) -> None:
+        self._startup_cancelled.set()
         with self._lock:
             self._close_adapter()
             self._stop_managed()
+            self._last_error = None
+        with self._state_lock:
+            self._generation += 1
+            self._state = "starting"
+            self._startup_attempts = 0
+            self._status_snapshot = None
+            self._startup_cancelled.clear()
+            if self._startup_thread and self._startup_thread.is_alive():
+                self._restart_after_current = True
+            else:
+                self._launch_startup_locked(self._generation)
+            return self._starting_status()
+
+    def shutdown(self) -> None:
+        self._startup_cancelled.set()
+        with self._lock:
+            self._close_adapter()
+            self._stop_managed()
+        with self._state_lock:
+            self._generation += 1
+            self._state = "stopped"
+            self._status_snapshot = None
 
     def _connect_existing_default(self) -> OpenCodeAdapter | None:
         username = os.getenv("OPENCODE_SERVER_USERNAME", "opencode")
@@ -191,9 +193,11 @@ class OpenCodeRuntime:
         adapter = OpenCodeAdapter("http://127.0.0.1:4096", directory=self._workspace_directory(),
                                   username=username if password else None, password=password)
         try:
-            health = adapter.health()
-        except OpenCodeError:
+            health = adapter.health(timeout=self.HEALTH_PROBE_TIMEOUT_SECONDS)
+        except OpenCodeError as exc:
             adapter.close()
+            if exc.code == "OPENCODE_AUTH_REQUIRED":
+                raise
             return None
         if not health.healthy:
             adapter.close()
@@ -208,18 +212,34 @@ class OpenCodeRuntime:
         password = os.getenv("OPENCODE_SERVER_PASSWORD")
         adapter = OpenCodeAdapter(endpoint, directory=self._workspace_directory(),
                                   username=username if password else None, password=password)
-        try:
-            health = adapter.health()
-        except OpenCodeError:
-            adapter.close()
-            raise
-        if not health.healthy:
-            adapter.close()
-            raise OpenCodeError("OPENCODE_UNAVAILABLE", "OpenCode reported that the server is not healthy.")
-        self._adapter = adapter
-        self._version = health.version
-        self._managed = managed
-        return adapter
+        deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
+        last_error: OpenCodeError | None = None
+        attempt = 0
+        while time.monotonic() < deadline and not self._startup_cancelled.is_set():
+            attempt += 1
+            self._record_startup_attempt(attempt)
+            try:
+                health = adapter.health(timeout=self.HEALTH_PROBE_TIMEOUT_SECONDS)
+                if health.healthy:
+                    self._adapter = adapter
+                    self._version = health.version
+                    self._managed = managed
+                    logger.info("OpenCode endpoint became ready after %s checks", attempt)
+                    return adapter
+                last_error = OpenCodeError("OPENCODE_UNAVAILABLE", "OpenCode reported that the server is not healthy.")
+            except OpenCodeError as exc:
+                last_error = exc
+                logger.debug("OpenCode endpoint readiness check failed attempt=%s code=%s", attempt, exc.code)
+                # Credentials and invalid endpoints will not heal by waiting;
+                # transport and server failures are retried within the window.
+                if exc.code not in {"OPENCODE_UNAVAILABLE", "OPENCODE_TIMEOUT", "OPENCODE_PROVIDER_FAILED"}:
+                    adapter.close()
+                    raise
+            self._startup_cancelled.wait(min(0.15 * (2 ** min(attempt - 1, 3)), 0.8))
+        adapter.close()
+        if self._startup_cancelled.is_set():
+            raise OpenCodeError("OPENCODE_START_CANCELLED", "OpenCode connection check was cancelled.")
+        raise OpenCodeError("OPENCODE_UNAVAILABLE", f"The configured OpenCode server did not become ready within {self.STARTUP_TIMEOUT_SECONDS:g} seconds.") from last_error
 
     def _start_managed(self) -> OpenCodeAdapter:
         binary = shutil.which("opencode")
@@ -250,27 +270,182 @@ class OpenCodeRuntime:
             raise OpenCodeError("OPENCODE_START_FAILED", "Dexter could not start the local OpenCode server.") from exc
         self._process = process
         self._managed = True
+        logger.info("Started Dexter-managed OpenCode server pid=%s on loopback", process.pid)
         adapter = OpenCodeAdapter(f"http://127.0.0.1:{port}", directory=workdir,
                                   username="dexter", password=password)
-        deadline = time.monotonic() + 12
+        deadline = time.monotonic() + self.STARTUP_TIMEOUT_SECONDS
         last_error: OpenCodeError | None = None
+        attempt = 0
         while time.monotonic() < deadline:
+            if self._startup_cancelled.is_set():
+                break
             if process.poll() is not None:
                 break
+            attempt += 1
+            self._record_startup_attempt(attempt)
             try:
-                health = adapter.health()
+                health = adapter.health(timeout=self.HEALTH_PROBE_TIMEOUT_SECONDS)
                 if health.healthy:
                     self._version = health.version
                     self._adapter = adapter
+                    logger.info("Dexter-managed OpenCode server became ready after %s checks", attempt)
                     return adapter
             except OpenCodeError as exc:
                 last_error = exc
-            time.sleep(0.15)
+                logger.debug("Managed OpenCode readiness check failed attempt=%s code=%s", attempt, exc.code)
+                if exc.code == "OPENCODE_AUTH_REQUIRED":
+                    break
+            # Short exponential pause avoids hammering a slow local startup.
+            self._startup_cancelled.wait(min(0.15 * (2 ** min(attempt - 1, 3)), 0.8))
         adapter.close()
         self._stop_managed()
         if last_error and last_error.code == "OPENCODE_AUTH_REQUIRED":
             raise last_error
+        if self._startup_cancelled.is_set():
+            raise OpenCodeError("OPENCODE_START_CANCELLED", "OpenCode startup was cancelled.")
+        if process.poll() is not None:
+            raise OpenCodeError("OPENCODE_START_FAILED", "The local OpenCode server exited before becoming ready. Check the local OpenCode log.")
         raise OpenCodeError("OPENCODE_START_FAILED", "The local OpenCode server did not become ready. Check the local OpenCode log.")
+
+    def _launch_startup_locked(self, generation: int) -> None:
+        if self._startup_thread and self._startup_thread.is_alive():
+            self._state = "starting"
+            self._restart_after_current = True
+            return
+        self._startup_cancelled.clear()
+        self._state = "starting"
+        self._startup_attempts = 0
+        thread = threading.Thread(target=self._startup_worker, args=(generation,),
+                                  name="dexter-opencode-startup", daemon=True)
+        self._startup_thread = thread
+        thread.start()
+
+    def _startup_worker(self, generation: int) -> None:
+        try:
+            adapter = self.adapter()
+            health = adapter.health(timeout=self.HEALTH_PROBE_TIMEOUT_SECONDS)
+            if not health.healthy:
+                raise OpenCodeError("OPENCODE_UNAVAILABLE", "OpenCode reported that the server is not healthy.")
+            agents, models = self._discover_startup_metadata(adapter)
+            primary_agents = [item for item in agents if item["mode"] in {"primary", "all"}]
+            agent = next((item for item in primary_agents if item["id"] == self.agent_id), None)
+            default_model = select_preferred_model(models)
+            endpoint = self.configured_endpoint()
+            snapshot = {
+                "connected": bool(agent),
+                "state": "connected" if agent else "agent_unavailable",
+                "version": health.version,
+                "agent_id": self.agent_id,
+                "agent": agent,
+                "agents": primary_agents,
+                "models": models,
+                "default_model": default_model,
+                "preferred_model_available": default_model is not None,
+                "managed": self._managed,
+                "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "local"),
+                "endpoint": endpoint,
+                "message": None if agent else f"The configured OpenCode agent '{self.agent_id}' is not available as a primary agent.",
+                "retryable": not bool(agent),
+            }
+            if not agent:
+                snapshot["error_code"] = "OPENCODE_AGENT_UNAVAILABLE"
+            logger.info("OpenCode startup validation complete state=%s agent=%s models=%s managed=%s",
+                        snapshot["state"], self.agent_id, len(models), self._managed)
+            with self._state_lock:
+                if generation == self._generation:
+                    self._version = health.version
+                    self._state = snapshot["state"]
+                    self._status_snapshot = snapshot
+                    self._last_error = snapshot.get("error_code")
+        except OpenCodeError as exc:
+            if exc.code != "OPENCODE_START_CANCELLED":
+                logger.info("OpenCode startup did not complete code=%s attempts=%s", exc.code, self._startup_attempts)
+            with self._state_lock:
+                if generation == self._generation and exc.code != "OPENCODE_START_CANCELLED":
+                    self._last_error = exc.code
+                    self._state = "unavailable"
+                    self._status_snapshot = self._unavailable_status(exc.code, str(exc))
+        except Exception as exc:
+            logger.warning("OpenCode discovery failed type=%s", type(exc).__name__)
+            with self._state_lock:
+                if generation == self._generation:
+                    self._last_error = "OPENCODE_UNAVAILABLE"
+                    self._state = "unavailable"
+                    self._status_snapshot = self._unavailable_status(
+                        "OPENCODE_UNAVAILABLE", "OpenCode could not be reached. Retry the connection."
+                    )
+        finally:
+            with self._state_lock:
+                if self._startup_thread is threading.current_thread():
+                    self._startup_thread = None
+                restart = self._restart_after_current and self._state == "starting"
+                if restart:
+                    self._restart_after_current = False
+                    self._launch_startup_locked(self._generation)
+
+    def _record_startup_attempt(self, attempt: int) -> None:
+        with self._state_lock:
+            self._startup_attempts = attempt
+
+    def _discover_startup_metadata(self, adapter: OpenCodeAdapter) -> tuple[list[dict], list[dict]]:
+        last_error: OpenCodeError | None = None
+        for attempt in range(1, self.STARTUP_METADATA_ATTEMPTS + 1):
+            if self._startup_cancelled.is_set():
+                raise OpenCodeError("OPENCODE_START_CANCELLED", "OpenCode startup was cancelled.")
+            try:
+                agents = adapter.agents(timeout=self.STARTUP_METADATA_TIMEOUT_SECONDS)
+                models = adapter.models(timeout=self.STARTUP_METADATA_TIMEOUT_SECONDS)
+                return agents, models
+            except OpenCodeError as exc:
+                last_error = exc
+                logger.debug("OpenCode metadata validation failed attempt=%s code=%s", attempt, exc.code)
+                if exc.code not in {"OPENCODE_UNAVAILABLE", "OPENCODE_TIMEOUT", "OPENCODE_PROVIDER_FAILED"}:
+                    raise
+                if attempt < self.STARTUP_METADATA_ATTEMPTS:
+                    self._startup_cancelled.wait(min(0.25 * (2 ** (attempt - 1)), 1.0))
+        assert last_error is not None
+        raise last_error
+
+    def _starting_status(self) -> dict:
+        endpoint = self.configured_endpoint()
+        return {
+            "connected": False,
+            "state": "starting",
+            "version": self._version,
+            "agent_id": self.agent_id,
+            "agent": None,
+            "agents": [],
+            "models": [],
+            "default_model": None,
+            "preferred_model_available": False,
+            "managed": self._managed,
+            "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "automatic"),
+            "endpoint": endpoint,
+            "message": "Starting and checking the local OpenCode service…",
+            "retryable": False,
+            "attempts": self._startup_attempts,
+        }
+
+    def _unavailable_status(self, code: str, message: str) -> dict:
+        endpoint = self.configured_endpoint()
+        return {
+            "connected": False,
+            "state": "unavailable",
+            "version": self._version,
+            "agent_id": self.agent_id,
+            "agent": None,
+            "agents": [],
+            "models": [],
+            "default_model": None,
+            "preferred_model_available": False,
+            "managed": self._managed,
+            "endpoint_mode": "external" if endpoint else ("managed" if self._managed else "automatic"),
+            "endpoint": endpoint,
+            "message": message,
+            "error_code": code,
+            "retryable": True,
+            "attempts": self._startup_attempts,
+        }
 
     def _workspace_directory(self) -> str:
         path = self.paths.temporary / "opencode-workspace"

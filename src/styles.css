@@ -471,6 +471,7 @@ kbd { font: 10px var(--mono); color: #7d8382; margin-left: auto; border: 1px sol
 .ask-status-dot,.ask-context-mark { width:6px; height:6px; flex:0 0 6px; border-radius:50%; background:#646c68; }
 .ask-status-dot.online,.ask-context-mark { background:#51b878; box-shadow:0 0 7px #51b87855; }
 .ask-status-dot.offline { background:#df8079; box-shadow:0 0 7px #df807955; }
+.ask-status-dot.connecting { background:#e0b64d; box-shadow:0 0 7px #e0b64d55; }
 .ask-toolbar-button,.ask-small-action { display:grid; place-items:center; width:24px; height:24px; border:1px solid transparent; border-radius:4px; background:transparent; color:#919995; cursor:pointer; }
 .ask-toolbar-button:hover,.ask-small-action:hover { color:#efc44c; border-color:#4b4127; background:#211f19; }
 .ask-small-action:disabled { opacity:.4; cursor:not-allowed; }

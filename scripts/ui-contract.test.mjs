@@ -151,6 +151,15 @@ test('Ask Dexter selects versioned workspace context without table records', () 
   assert.match(askPanel, /api\.askSend\(/)
 })
 
+test('Ask Dexter exposes automatic OpenCode startup and polls until readiness is resolved', () => {
+  assert.match(askPanel, /status\?\.state !== 'starting'/)
+  assert.match(askPanel, /api\.askStatus\(\)/)
+  assert.match(askPanel, /Starting local OpenCode…/)
+  assert.match(askPanel, /Retry connection/)
+  assert.match(api, /attempts\?: number/)
+  assert.match(styles, /ask-status-dot\.connecting/)
+})
+
 test('Synthetic Studio exposes reviewed DEV publication and bounded generation preview', async () => {
   const studio = await readFile(new URL('../src/SyntheticStudio.tsx', import.meta.url), 'utf8')
   const syntheticApi = await readFile(new URL('../backend/src/dexter/api/app.py', import.meta.url), 'utf8')

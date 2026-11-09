@@ -15,7 +15,7 @@ const connection = { configured: true, status: 'connected', category: null, deta
 const clone = (value) => structuredClone(value)
 
 export function workflowFixture() {
-  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, extraTables: 0, syntheticFailureAt: null, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1', syntheticTargetMode: 'managed_delta', syntheticExistingTable: 'ledger' }
+  const state = { requests: [], failure: null, transient: false, reviewDrift: false, rekey: false, extraTables: 0, syntheticFailureAt: null, previewDelay: 0, reviewDelay: 0, schemaReviewDelay: 0, currentOperation: null, polls: 0, draft: null, schemaPreflightFailure: false, schemaExtraProd: false, schemaNormalizeTransport: false, schemaPhysical: null, schemaRequireFeatures: [], schemaRecreationBlocked: false, currentTableId: 'table-1', syntheticTargetMode: 'managed_delta', syntheticExistingTable: 'ledger', askStatusCalls: 0, askStartingPolls: 0 }
   const currentIdentity = () => ({ ...identity, table_id: state.currentTableId })
   const freshDraft = () => {
     const baseline = state.schemaPhysical ?? devSchema
@@ -38,6 +38,13 @@ export function workflowFixture() {
     }
     if (path === '/api/health') return send({ status: 'ok' })
     if (path === '/api/ready') return send({ status: 'ready', storage: 'sqlite-wal' })
+    if (path === '/api/ask/status') {
+      const call = ++state.askStatusCalls
+      if (call <= state.askStartingPolls) return send({ connected: false, state: 'starting', agent_id: 'build', agent: null, agents: [], models: [], default_model: null, preferred_model_available: false, managed: true, endpoint_mode: 'managed', endpoint: null, message: 'Starting and checking the local OpenCode service…', retryable: false, attempts: call })
+      const model = { provider_id: 'openai', provider_name: 'OpenAI', id: 'gpt-6-luna', name: 'GPT-6 Luna', variants: [], reasoning: true }
+      return send({ connected: true, state: 'connected', version: 'fixture', agent_id: 'build', agent: { id: 'build', mode: 'primary' }, agents: [{ id: 'build', mode: 'primary' }], models: [model], default_model: model, preferred_model_available: true, managed: true, endpoint_mode: 'managed', endpoint: null, message: null })
+    }
+    if (path === '/api/ask/conversations') return send({ items: [], active_conversation_id: null })
     if (path.startsWith('/api/connections')) return send({ databricks: { dev: { ...connection, profile: 'DEV' }, prod: { ...connection, profile: 'PROD' } }, databricks_profiles: { items: ['DEV', 'PROD'] }, purview: { ...connection, configured: false, status: 'unavailable' } })
     if (path === '/api/operations') return send([])
     if (path.endsWith('/logs')) return send({ items: [] })
